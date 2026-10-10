@@ -60,23 +60,25 @@ pub fn shell_quote(arg: String) -> String {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum AccError {
     /// The harness can't do this headlessly, or ACC doesn't support it yet.
-    #[error("{message}")]
-    Unsupported { message: String },
+    // Fields are not called `message`: Kotlin errors extend Throwable,
+    // whose `message` property they would clash with.
+    #[error("{reason}")]
+    Unsupported { reason: String },
     #[error("no session is active yet")]
     NotStarted,
     #[error("unknown permission request {request_id}")]
     UnknownRequest { request_id: String },
     #[error("unknown option value {value}")]
     InvalidOption { value: String },
-    #[error("invalid argument: {message}")]
-    InvalidArgument { message: String },
+    #[error("invalid argument: {reason}")]
+    InvalidArgument { reason: String },
 }
 
 impl From<DriverError> for AccError {
     fn from(e: DriverError) -> Self {
         match e {
             DriverError::Unsupported { .. } => Self::Unsupported {
-                message: e.to_string(),
+                reason: e.to_string(),
             },
             DriverError::NotStarted => Self::NotStarted,
             DriverError::UnknownRequest(request_id) => Self::UnknownRequest { request_id },
@@ -152,7 +154,7 @@ impl Session {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
         if !tag_ok {
             return Err(AccError::InvalidArgument {
-                message: format!("client tag {tag:?} must be [A-Za-z0-9_-]+"),
+                reason: format!("client tag {tag:?} must be [A-Za-z0-9_-]+"),
             });
         }
         let opening = match config.opening {
@@ -257,7 +259,7 @@ impl TranscriptObserver {
     pub fn new(harness: Harness) -> Result<Self, AccError> {
         let h: acc_core::Harness = harness.into();
         let inner = core_session::TranscriptObserver::new(h).ok_or_else(|| AccError::Unsupported {
-            message: format!("ACC doesn't read {} transcripts", h.display_name()),
+            reason: format!("ACC doesn't read {} transcripts", h.display_name()),
         })?;
         Ok(Self {
             inner: Mutex::new(inner),
@@ -291,7 +293,7 @@ impl DetachedSession {
     #[uniffi::constructor]
     pub fn new(id: String) -> Result<Self, AccError> {
         let dir = SessionDir::new(&id).ok_or_else(|| AccError::InvalidArgument {
-            message: format!("session id {id:?} must be [A-Za-z0-9_-]{{1,64}}"),
+            reason: format!("session id {id:?} must be [A-Za-z0-9_-]{{1,64}}"),
         })?;
         Ok(Self { dir })
     }
