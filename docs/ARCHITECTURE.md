@@ -81,6 +81,23 @@ Both also expose `TranscriptObserver` (follow a Claude, Codex or pi transcript),
 (the daemonless scripts below), `Osc7501Scanner` and `shell_quote`. CI replays a recorded Claude
 session through the real library from Swift (macOS), Kotlin (JVM), Python and Node.
 
+`acc-ffi` also carries the SSH transport (`acc-ssh`), so a phone app needs nothing else to drive a
+host end to end. These calls do I/O and are `async` in Swift and `suspend` in Kotlin; they run on a
+tokio runtime the library starts on first use (UniFFI's `tokio` support).
+
+- `SshHost(config)`: password, private key or SSH agent; host keys pinned by fingerprint, read from
+  `known_hosts`, or accepted for trust on first use (`hostKeyFingerprint()`). `connect`,
+  `reconnect` (on returning to the foreground), `disconnect`, `exec`.
+- `launchSession` / `attachSession` → `RemoteSession`: the core `Session` on a detached session
+  (`nextEvents`, `send`, `stop`, `state`, `commands`, `options`). `listSessions`, `removeSession`.
+- `listPanes`, `locatePane(pid)`, `spawnPane`, `paneSession` → `PaneSession`: a harness TUI in a
+  tmux, zellij, screen or Rex pane (`nextEvents`, `send`, `sendInput`, `capture`, `exit`, `kill`).
+
+Errors are typed (`Timeout` and `Disconnected` mean calling again retries; `HostKeyRejected` carries
+the fingerprint to show). Kotlin needs `kotlinx-coroutines-core` for the suspend calls. A Rust test
+drives this surface against a real sshd and tmux; the Swift, Kotlin and Python smoke tests call it
+through the generated bindings.
+
 ## Daemonless sessions
 
 `acc_core::detached` generates host-side shell scripts: the harness runs under `nohup` with stdin on

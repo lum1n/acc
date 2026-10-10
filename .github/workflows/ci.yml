@@ -70,7 +70,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y openssh-server tmux
-      - run: cargo test -p acc-ssh
+      - run: cargo test -p acc-ssh -p acc-ffi
 
   ios:
     runs-on: macos-latest
@@ -125,9 +125,11 @@ jobs:
       - name: Kotlin smoke test (JVM, same bindings as Android)
         run: |
           curl -fsSL -o jna.jar https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.17.0/jna-5.17.0.jar
+          # The generated async (suspend) calls need kotlinx.coroutines.
+          curl -fsSL -o coroutines.jar https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.10.2/kotlinx-coroutines-core-jvm-1.10.2.jar
           kotlinc crates/acc-ffi/tests/smoke.kt bindings/kotlin/uniffi/acc_ffi/acc_ffi.kt \
-            -cp jna.jar -include-runtime -d target/kotlin-smoke.jar
-          java -Djna.library.path=target/release -cp target/kotlin-smoke.jar:jna.jar SmokeKt "$PWD"
+            -cp jna.jar:coroutines.jar -include-runtime -d target/kotlin-smoke.jar
+          java -Djna.library.path=target/release -cp target/kotlin-smoke.jar:jna.jar:coroutines.jar SmokeKt "$PWD"
       - name: Python smoke test (exercises every FFI call)
         run: |
           cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \

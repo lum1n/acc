@@ -12,7 +12,9 @@ The Swift and Kotlin bindings are generated from the same library metadata,
 so this exercises the exact FFI calls and type conversions they use.
 """
 
+import asyncio
 import pathlib
+import socket
 import sys
 
 sys.path.insert(0, sys.argv[1])
@@ -77,7 +79,47 @@ def main() -> None:
 
     detached = acc.DetachedSession("s1")
     assert "mkfifo" in detached.launch_script(spec, "/tmp")
+    asyncio.run(ssh_calls())
     print(f"ok: {len(events)} events through the FFI")
+
+
+async def ssh_calls() -> None:
+    """The async SSH surface: a refused connection and a rejected input
+    both come back as typed errors through the foreign future."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        closed_port = s.getsockname()[1]
+    host = acc.SshHost(
+        acc.SshConfig(
+            host="127.0.0.1",
+            port=closed_port,
+            user="nobody",
+            auth=acc.SshAuth.PASSWORD(password="x"),
+            host_key=acc.HostKeyCheck.ACCEPT_ANY(),
+            connect_timeout_ms=2_000,
+            keepalive_interval_ms=None,
+            keepalive_max=None,
+        )
+    )
+    try:
+        await host.connect()
+        raise AssertionError("expected a connection error")
+    except (acc.AccError.Ssh, acc.AccError.Disconnected, acc.AccError.Timeout):
+        pass
+    assert host.connections() == 0 and host.host_key_fingerprint() is None
+
+    pane = host.pane_session(
+        acc.PaneRef(multiplexer=acc.Multiplexer.TMUX, server="", session=None, pane="%0"),
+        acc.Harness.CLAUDE,
+    )
+    assert pane.pane().pane == "%0" and pane.state() is None
+    try:
+        await pane.send_input([acc.PaneInput.KEYS(keys=[acc.PaneKey.CTRL(letter="12")])])
+        raise AssertionError("expected an invalid argument")
+    except acc.AccError.InvalidArgument:
+        pass
+    await pane.stop_watching()
+    await host.disconnect()
 
 
 main()

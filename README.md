@@ -17,7 +17,7 @@ POSIX tools.
 |---|---|
 | `crates/acc-core` | Sans-IO core: harness catalogue, session state model, event stream, commands/options, driver trait, NDJSON and OSC 7501 parsers, detached-session scripts, multiplexer detection |
 | `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections |
-| `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`) |
+| `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`), including SSH sessions and multiplexer panes |
 | `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node |
 | `crates/acc-cli` | `acc` command-line tool for hosts and spikes |
 
@@ -56,6 +56,22 @@ channel.onData { bytes in
     for event in got.events { ui.apply(event) }
 }
 channel.write(try session.send(command: .prompt(text: "hi")))
+```
+
+Or let the library do the SSH too (pure Rust, nothing installed on the host). Sessions survive the
+phone dropping off the network or being suspended, and any client can rejoin them:
+
+```swift
+let host = try SshHost(config: SshConfig(host: "devbox", port: 22, user: "me",
+    auth: .privateKey(key: pem, passphrase: nil), hostKey: .fingerprints(fingerprints: [pinned])))
+let session = try await host.launchSession(id: "s1", config: SessionConfig(
+    harness: .claude, cwd: "/home/me/project", opening: .new))
+try await session.send(command: .prompt(text: "hi"))
+while true { for event in try await session.nextEvents() { ui.apply(event) } }
+
+// A Claude Code the user started in tmux: read its dialogs, answer them.
+let pane = host.paneSession(pane: info.pane, harness: .claude)   // from listPanes / locatePane
+try await pane.send(command: .answerPermission(requestId: id, optionId: "1"))
 ```
 
 ## Try it by hand
