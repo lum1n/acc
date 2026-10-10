@@ -103,12 +103,14 @@ impl PiDriver {
                 OptionDef {
                     id: OptionId::Model,
                     values: vec![],
+                    labels: Vec::new(),
                     current: None,
                     apply: Apply::NextTurn,
                 },
                 OptionDef {
                     id: OptionId::Effort,
                     values: vec![],
+                    labels: Vec::new(),
                     current: None,
                     apply: Apply::NextTurn,
                 },

@@ -1,0 +1,30 @@
+
+✻ Sautéed for 4s · done 4:34 PM
+
+❯ Run exactly this shell command: mkdir -p
+  /home/claude/scr/work/some/fairly/long/nested/d
+  irectory/path/here
+
+  Creating nested directory path
+  ⎿  $ mkdir -p /home/claude/scr/work/some/fairly/
+     long/nested/directory/path/here
+
+──────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you —
+ choose "switch to auto mode" below
+ Create nested directory path
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ mkdir -p /home/claude/scr/work/some/fairly/long/
+ nested/directory/path/here
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to
+      /home/claude/scr/work/some/fairly/long/neste
+      d/directory/path from this project
+   3. Yes, and switch to auto mode · auto mode
+      handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

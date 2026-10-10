@@ -86,6 +86,51 @@ pub enum Apply {
 pub struct OptionDef {
     pub id: OptionId,
     pub values: Vec<String>,
+    /// Display names for `values`, in the same order, where the harness gives
+    /// them (Copilot's modes are URLs, named `Agent`, `Plan`, ...). Empty when
+    /// the values are their own names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     pub current: Option<String>,
     pub apply: Apply,
+}
+
+impl OptionDef {
+    /// The display name of `value`: its label when the harness named it.
+    /// Otherwise an empty parameter list is dropped (Cursor reports its
+    /// automatic model as `default[]`).
+    pub fn label<'a>(&'a self, value: &'a str) -> &'a str {
+        self.values
+            .iter()
+            .position(|v| v == value)
+            .and_then(|i| self.labels.get(i))
+            .map_or_else(|| value.strip_suffix("[]").unwrap_or(value), String::as_str)
+    }
+
+    /// The display name of the current value.
+    pub fn current_label(&self) -> Option<&str> {
+        self.current.as_deref().map(|c| self.label(c))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_name_values() {
+        let mut def = OptionDef {
+            id: OptionId::Mode,
+            values: vec!["https://x#agent".into(), "https://x#plan".into()],
+            labels: vec!["Agent".into(), "Plan".into()],
+            current: Some("https://x#plan".into()),
+            apply: Apply::Live,
+        };
+        assert_eq!(def.current_label(), Some("Plan"));
+        assert_eq!(def.label("other"), "other");
+        def.labels.clear();
+        def.current = Some("default[]".into());
+        assert_eq!(def.current_label(), Some("default"));
+        assert_eq!(def.label("gpt-5[effort=high]"), "gpt-5[effort=high]");
+    }
 }

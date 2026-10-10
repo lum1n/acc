@@ -38,6 +38,24 @@ cargo run -q -p acc-cli -- script status s1 | ssh host sh
 cargo build -p acc-ffi --release
 cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \
   generate --library target/release/libacc_ffi.so --language swift --language kotlin --out-dir bindings
+
+# JS bindings (browser: --target web)
+cargo build -p acc-wasm --release --target wasm32-unknown-unknown
+wasm-bindgen --target nodejs --out-dir bindings/node target/wasm32-unknown-unknown/release/acc_wasm.wasm
+```
+
+From Swift, a session is a few calls; the app moves the bytes (see `docs/ARCHITECTURE.md`, Bindings):
+
+```swift
+let session = try Session(config: SessionConfig(harness: .claude, cwd: "/home/me/project", opening: .new))
+channel.exec(session.launchSpec())            // your SSH channel, pipe or pane
+channel.write(session.start())
+channel.onData { bytes in
+    let got = session.receive(bytes: bytes, nowMs: nowMs())
+    channel.write(got.transmit)
+    for event in got.events { ui.apply(event) }
+}
+channel.write(try session.send(command: .prompt(text: "hi")))
 ```
 
 ## Try it by hand
@@ -92,6 +110,16 @@ acc script mux tmux - - capture %3 | sh                # what the pane shows now
 acc script mux tmux - - type %3 "fix the tests" | sh   # type a prompt and press Enter
 acc script mux zellij - - list | sh                    # zellij: panes of every session
 acc script mux zellij <session> - type terminal_1 "fix the tests" | sh
+```
+
+**Read the screen and answer dialogs.** For sessions ACC didn't start, some state only shows on
+screen: Claude Code's permission and question dialogs, and pi's busy spinner before pi 1.x.
+`acc decode screen <claude|pi>` reads a captured pane and prints its state and any open dialog
+with its numbered options; `keys` presses the one you pick (or `escape` to deny):
+
+```sh
+acc script mux tmux - - capture %3 | sh | acc decode screen claude
+acc script mux tmux - - keys %3 1 | sh                  # "1. Yes"
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and the decisions behind it.

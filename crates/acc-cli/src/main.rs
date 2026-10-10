@@ -12,7 +12,7 @@ use std::process::{Command, ExitCode};
 use acc_core::Harness;
 use acc_core::detached::SessionDir;
 use acc_core::driver::Driver as _;
-use acc_core::multiplexer::{self, Multiplexer, PaneRef, Target, tui};
+use acc_core::multiplexer::{self, Input, Key, Multiplexer, PaneRef, Target, screen_match, tui};
 use acc_core::osc7501::Scanner;
 use acc_core::pi::{PiDriver, Transcript};
 
@@ -37,9 +37,14 @@ usage:
   acc script mux <tmux|zellij|screen|rex> <server|-> <session|-> list
   acc script mux <mux> <server> <session|-> capture|watch <pane>
   acc script mux <mux> <server> <session|-> type <pane> <text>
-                                        multiplexer commands (`type` submits text with Enter)
+  acc script mux <mux> <server> <session|-> keys <pane> <key>...
+                                        multiplexer commands (`type` submits text with Enter;
+                                        keys: enter, escape, tab, up, down, left, right,
+                                        backspace, c-<letter>, or one character such as 1)
   acc decode pi|pi-transcript|claude-transcript|codex-rollout
                                         read harness output or a session file on stdin, print events
+  acc decode screen <claude|pi>         read a captured pane on stdin, print its state and any
+                                        open dialog as JSON (`null` when not recognized)
 ";
 
 fn main() -> ExitCode {
@@ -67,6 +72,7 @@ fn main() -> ExitCode {
         },
         ["ssh-sessions", dest, rest @ ..] => or_usage(remote::sessions(dest, rest)),
         ["script", rest @ ..] => script(rest),
+        ["decode", "screen", harness] => or_usage(parse_harness(harness).and_then(decode_screen)),
         ["decode", kind] => decode(kind),
         _ => {
             eprint!("{USAGE}");
@@ -221,12 +227,56 @@ fn mux(args: &[&str]) -> ExitCode {
                 print(b.send(&pane(p), &input));
             }
         }
+        ["keys", p, keys @ ..] if !keys.is_empty() => {
+            let keys: Result<Vec<Key>, String> = keys.iter().map(|k| parse_key(k)).collect();
+            match keys {
+                Ok(keys) => print(b.send(&pane(p), &Input::Keys(keys))),
+                Err(e) => return or_usage(Err(e)),
+            }
+        }
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
     }
     ExitCode::SUCCESS
+}
+
+fn parse_key(name: &str) -> Result<Key, String> {
+    let mut chars = name.chars();
+    Ok(
+        match (name.to_ascii_lowercase().as_str(), chars.next(), chars.next()) {
+            ("enter", ..) => Key::Enter,
+            ("escape" | "esc", ..) => Key::Escape,
+            ("tab", ..) => Key::Tab,
+            ("backspace", ..) => Key::Backspace,
+            ("up", ..) => Key::Up,
+            ("down", ..) => Key::Down,
+            ("left", ..) => Key::Left,
+            ("right", ..) => Key::Right,
+            (n, ..) if n.len() == 3 && n.starts_with("c-") && n.as_bytes()[2].is_ascii_lowercase() => {
+                Key::Ctrl(char::from(n.as_bytes()[2]))
+            }
+            (_, Some(c), None) if !c.is_control() => Key::Char(c),
+            _ => return Err(format!("unknown key {name:?}")),
+        },
+    )
+}
+
+fn decode_screen(harness: Harness) -> Result<ExitCode, String> {
+    if !screen_match::supported(harness) {
+        return Err(format!("can't read {}'s screen yet", harness.display_name()));
+    }
+    let mut screen = String::new();
+    std::io::stdin()
+        .read_to_string(&mut screen)
+        .map_err(|e| e.to_string())?;
+    let read = screen_match::read(harness, &screen);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&read).map_err(|e| e.to_string())?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// stdin bytes as a heredoc body. The heredoc adds the final newline itself;

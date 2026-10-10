@@ -99,6 +99,16 @@ impl ConfigOption {
         }
     }
 
+    /// Display names, only when one differs from its value.
+    fn labels(&self) -> Vec<String> {
+        match &self.value {
+            ConfigValue::Select { choices, .. } if choices.iter().any(|(v, l)| v != l) => {
+                choices.iter().map(|(_, l)| l.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn current(&self) -> String {
         match &self.value {
             ConfigValue::Select { current, .. } => current.clone(),
@@ -119,6 +129,8 @@ impl ConfigOption {
 pub(crate) struct Legacy {
     pub current: String,
     pub available: Vec<String>,
+    /// Display names for `available`, empty when none differs from its id.
+    pub names: Vec<String>,
 }
 
 impl Legacy {
@@ -133,15 +145,24 @@ impl Legacy {
     }
 
     fn parse(v: &Value, current: &str, list: &str, key: &str) -> Option<Self> {
+        let (available, mut names): (Vec<String>, Vec<String>) = v
+            .get(list)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                let id = m.get(key).and_then(Value::as_str)?;
+                let name = m.get("name").and_then(Value::as_str).unwrap_or(id);
+                Some((id.to_owned(), name.to_owned()))
+            })
+            .unzip();
+        if available == names {
+            names.clear();
+        }
         Some(Self {
             current: v.get(current)?.as_str()?.to_owned(),
-            available: v
-                .get(list)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|m| m.get(key).and_then(Value::as_str).map(str::to_owned))
-                .collect(),
+            available,
+            names,
         })
     }
 }
@@ -227,6 +248,7 @@ impl OptionState {
             self.defs.push(OptionDef {
                 id,
                 values: opt.values(),
+                labels: opt.labels(),
                 current: Some(opt.current()),
                 apply,
             });
@@ -261,6 +283,7 @@ impl OptionState {
             self.defs.push(OptionDef {
                 id,
                 values: l.available.clone(),
+                labels: l.names.clone(),
                 current: Some(l.current.clone()),
                 apply,
             });
@@ -271,6 +294,7 @@ impl OptionState {
             self.defs.push(OptionDef {
                 id: OptionId::Model,
                 values: Vec::new(),
+                labels: Vec::new(),
                 current: self.spawn_model.clone(),
                 apply: Apply::Restart,
             });

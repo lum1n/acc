@@ -857,18 +857,21 @@ impl ClaudeDriver {
             OptionDef {
                 id: OptionId::Model,
                 values: model_values,
+                labels: Vec::new(),
                 current: model_current,
                 apply: Apply::Live,
             },
             OptionDef {
                 id: OptionId::Effort,
                 values: efforts,
+                labels: Vec::new(),
                 current: effort,
                 apply: Apply::Live,
             },
             OptionDef {
                 id: OptionId::Permission,
                 values: modes,
+                labels: Vec::new(),
                 current: permission,
                 apply: Apply::Live,
             },

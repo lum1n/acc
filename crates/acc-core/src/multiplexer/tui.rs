@@ -4,7 +4,7 @@
 //! pane like the user would. This is per harness, and only covers what each
 //! TUI does reliably from its prompt: submitting text, interrupting, built-in
 //! slash commands and exiting. Answering approval dialogs needs the rendered
-//! screen and is left to per-harness screen matching.
+//! screen: see [`super::screen_match`].
 //!
 //! pi is covered fully (checked against pi 1.1.0's keybindings and slash
 //! commands). Other harnesses get prompts and the commands whose keys are
@@ -76,9 +76,10 @@ pub fn inputs(harness: Harness, cmd: &Command) -> Result<Vec<Input>, DriverError
                 value,
             },
         ) => slash(with_arg("model", value)),
+        // Picking an option depends on the dialog on screen right now.
         (_, Command::AnswerPermission { .. }) => Err(unsupported(
             harness,
-            "answering dialogs without reading the screen",
+            "answering dialogs without the screen (use screen_match::answer)",
         )),
         (h, Command::Interrupt) => Err(unsupported(h, "interrupt from a pane")),
         (h, _) => Err(unsupported(h, "this command from a pane")),

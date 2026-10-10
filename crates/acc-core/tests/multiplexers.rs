@@ -14,7 +14,8 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use acc_core::multiplexer::{
-    Backend, Exec, Input, Key, Multiplexer, PaneObserver, PaneRef, Program, Target, tmux, zellij,
+    Backend, Exec, Input, Key, Multiplexer, PaneObserver, PaneRef, Program, Target, screen_match, tmux,
+    zellij,
 };
 use acc_core::state::{BlockKind, RunState};
 
@@ -117,8 +118,12 @@ impl Drop for Env {
 }
 
 /// Polls `check` until it returns true or the timeout passes.
-fn eventually(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
+fn eventually(what: &str, check: impl FnMut() -> bool) {
+    eventually_within(TIMEOUT, what, check);
+}
+
+fn eventually_within(timeout: Duration, what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if check() {
             return;
@@ -357,19 +362,22 @@ fn tmux_lists_servers_script_runs() {
     let _ = env.run(&tmux::list_servers());
 }
 
-/// Co-drives a real pi TUI in tmux: launch it with the TUI launcher, see its
-/// OSC 7501 reports through control mode, prompt it with typed keys.
+/// Co-drives a real pi TUI in tmux: launch it with the TUI launcher, follow
+/// its state, prompt it with typed keys. pi 1.x reports OSC 7501 through
+/// control mode; older pi (0.82) sends none, so the screen is read too and
+/// either source passes.
 ///
-/// Needs `pi` on PATH and `ACC_PI_HOME` naming a HOME whose
-/// `.pi/agent/models.json` selects a working model (a local fake
+/// Needs `pi` on PATH (or `ACC_PI` naming it) and `ACC_PI_HOME` naming a HOME
+/// whose `.pi/agent/models.json` selects a working model (a local fake
 /// OpenAI-compatible server is enough), so it is ignored by default:
-/// `ACC_PI_HOME=... cargo test -p acc-core --test multiplexers -- --ignored`.
+/// `ACC_PI_HOME=... cargo test -p acc-core --test multiplexers -- --ignored pi`.
 #[test]
 #[ignore = "needs pi and a configured model"]
 fn pi_tui_in_tmux() {
     use acc_core::Harness;
     use acc_core::command::Command as AccCommand;
     use acc_core::multiplexer::tui;
+    use acc_core::state::StateSource;
 
     let pi_home = std::env::var("ACC_PI_HOME").expect("ACC_PI_HOME");
     let env = Env::new("pi");
@@ -386,6 +394,9 @@ fn pi_tui_in_tmux() {
         session: Some("pi".into()),
     };
     let mut program = tui::launch(Harness::Pi, None).unwrap();
+    if let Ok(pi) = std::env::var("ACC_PI") {
+        program.program = pi;
+    }
     program.env.push(("HOME".into(), pi_home));
     // Without network pi's startup waits on tool downloads (fd, rg) and
     // ignores Enter until they give up.
@@ -396,26 +407,37 @@ fn pi_tui_in_tmux() {
 
     let mut parser = tmux::ControlParser::new();
     let mut observer = PaneObserver::new();
-    let mut states = Vec::new();
-    let mut drain = |states: &mut Vec<RunState>| {
+    let mut screen = screen_match::ScreenObserver::new(Harness::Pi);
+    let mut states: Vec<(StateSource, RunState)> = Vec::new();
+    let mut drain = |states: &mut Vec<(StateSource, RunState)>| {
+        let mut output = false;
         while let Ok(chunk) = rx.try_recv() {
             for ev in parser.feed(&chunk) {
                 if let tmux::ControlEvent::Output { pane: p, bytes } = ev
                     && p == pane.pane
                 {
+                    output = true;
                     states.extend(
                         observer
                             .feed(&bytes, 0)
                             .into_iter()
-                            .filter_map(|u| u.state.map(|s| s.state)),
+                            .filter_map(|u| u.state.map(|s| (s.source, s.state))),
                     );
                 }
             }
         }
+        // Control mode has raw bytes, not the screen: capture after output.
+        if output || states.is_empty() {
+            for ev in screen.feed(&env.run(&b.capture(&pane, false)), 0) {
+                if let acc_core::Event::StateChanged(s) = ev {
+                    states.push((s.source, s.state));
+                }
+            }
+        }
     };
-    eventually("pi to report idle", || {
+    eventually("pi to show idle", || {
         drain(&mut states);
-        states.contains(&RunState::Idle)
+        states.iter().any(|(_, s)| *s == RunState::Idle)
     });
     for input in tui::inputs(
         Harness::Pi,
@@ -427,10 +449,16 @@ fn pi_tui_in_tmux() {
     {
         env.run(&b.send(&pane, &input));
     }
-    eventually("pi to report working then done", || {
+    eventually("pi to work, then finish", || {
         drain(&mut states);
-        let w = states.iter().position(|s| matches!(s, RunState::Working { .. }));
-        w.is_some_and(|w| states[w..].contains(&RunState::Done))
+        let w = states
+            .iter()
+            .position(|(_, s)| matches!(s, RunState::Working { .. }));
+        w.is_some_and(|w| {
+            states[w..]
+                .iter()
+                .any(|(_, s)| matches!(s, RunState::Done | RunState::Idle))
+        })
     });
     eprintln!("pi states: {states:?}");
     for input in tui::exit_inputs(Harness::Pi).unwrap() {
@@ -439,4 +467,186 @@ fn pi_tui_in_tmux() {
     let _ = child.kill();
     let _ = child.wait();
     let _ = env.sh(&format!("tmux -S {sock} kill-server")).output();
+}
+
+/// Starts a background multiplexer server for the live harness tests and
+/// returns its target plus the script that stops it.
+fn live_server(env: &Env, m: Multiplexer) -> (Target, String) {
+    let b = acc_core::multiplexer::backend(m);
+    let target = match m {
+        Multiplexer::Tmux => {
+            let sock = env.home.join("sock").to_str().unwrap().to_owned();
+            env.run(&Exec {
+                script: format!("tmux -S {sock} new-session -d -s live -x 120 -y 40 sh"),
+                stdin: vec![],
+            });
+            Target {
+                multiplexer: m,
+                server: sock,
+                session: Some("live".into()),
+            }
+        }
+        Multiplexer::Zellij => {
+            let session = format!("acc-live-{}", std::process::id());
+            env.run(&Exec {
+                script: format!("zellij attach --create-background {session}"),
+                stdin: vec![],
+            });
+            let target = Target {
+                multiplexer: m,
+                server: session.clone(),
+                session: Some(session),
+            };
+            eventually("zellij session to list panes", || {
+                let mut c = env.sh(&b.list_panes(&target).script);
+                c.stderr(Stdio::null());
+                c.output()
+                    .ok()
+                    .and_then(|o| b.parse_panes(&target, &String::from_utf8_lossy(&o.stdout)).ok())
+                    .is_some_and(|p| !p.is_empty())
+            });
+            target
+        }
+        _ => unreachable!("live tests cover tmux and zellij"),
+    };
+    let stop = match m {
+        Multiplexer::Tmux => format!("tmux -S {} kill-server", target.server),
+        _ => format!(
+            "zellij kill-session {s}; zellij delete-session --force {s}",
+            s = target.server
+        ),
+    };
+    (target, stop)
+}
+
+/// Runs a real Claude Code TUI in a pane and answers its dialogs from the
+/// screen alone: the folder trust dialog (unnumbered), then a Bash permission
+/// dialog (numbered), as ACC must for a session it didn't start.
+///
+/// Needs `claude` on PATH and `ACC_CLAUDE_HOME` naming a throwaway HOME where
+/// it is signed in (the test trusts a temp folder there), so it is ignored:
+/// `ACC_CLAUDE_HOME=... cargo test -p acc-core --test multiplexers -- --ignored claude`.
+fn claude_dialogs_in(m: Multiplexer) {
+    use acc_core::Harness;
+    use acc_core::command::Command as AccCommand;
+    use acc_core::multiplexer::tui;
+    use acc_core::state::BlockKind;
+
+    let home = std::env::var("ACC_CLAUDE_HOME").expect("ACC_CLAUDE_HOME");
+    let env = Env::new(&format!("claude-{m:?}"));
+    let work = env.home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let (target, stop) = live_server(&env, m);
+    let b = acc_core::multiplexer::backend(m);
+    // A Claude Code parent's session variables would leak into the child.
+    let program = Program {
+        program: "env".into(),
+        args: [
+            "-u",
+            "CLAUDE_CODE_SESSION_ID",
+            "-u",
+            "CLAUDE_CODE_REMOTE_SESSION_ID",
+            "-u",
+            "CLAUDECODE",
+            "-u",
+            "CLAUDE_CODE_ENTRYPOINT",
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain([format!("HOME={home}")])
+        .chain(["claude", "--permission-mode", "default"].map(String::from))
+        .collect(),
+        env: vec![],
+    };
+    let out = env.run(&b.spawn(&target, &program, work.to_str().unwrap(), "acc-claude"));
+    let pane = b.parse_spawned(&target, "acc-claude", &out).unwrap();
+
+    let mut observer = screen_match::ScreenObserver::new(Harness::Claude);
+    let mut screen = String::new();
+    let mut events = Vec::new();
+    let mut poll = |screen: &mut String, events: &mut Vec<acc_core::Event>| {
+        *screen = env.run(&b.capture(&pane, false));
+        events.extend(observer.feed(screen, 0));
+        observer.open_dialog().map(str::to_owned)
+    };
+    let answer = |screen: &str, id: &str, option: &str| {
+        // A dialog drawn on the first frame ignores keys until Claude reads input.
+        std::thread::sleep(Duration::from_secs(1));
+        for input in screen_match::answer(Harness::Claude, screen, id, option).unwrap() {
+            env.run(&b.send(&pane, &input));
+        }
+    };
+    let long = Duration::from_secs(90);
+
+    // A fresh HOME asks to trust the folder first (or the theme, onboarding).
+    let mut dialog = None;
+    eventually_within(long, "Claude's prompt or trust dialog", || {
+        dialog = poll(&mut screen, &mut events);
+        if dialog.is_none() && screen.contains("Press Enter to continue") {
+            env.run(&b.send(&pane, &Input::Keys(vec![Key::Enter])));
+        }
+        dialog.is_some() || screen_match::read(Harness::Claude, &screen).is_some()
+    });
+    let trust = screen_match::read(Harness::Claude, &screen)
+        .and_then(|r| r.dialog)
+        .filter(|d| d.title.starts_with("Accessing workspace"));
+    if let (Some(id), Some(_)) = (dialog, trust) {
+        answer(&screen, &id, "2");
+    }
+    eventually_within(long, "Claude's idle prompt", || {
+        poll(&mut screen, &mut events);
+        screen_match::read(Harness::Claude, &screen).map(|r| r.state) == Some(RunState::Idle)
+    });
+
+    // Claude draws its prompt before it finishes starting up.
+    std::thread::sleep(Duration::from_secs(2));
+    let file = work.join("acc-made-this");
+    let prompt = format!(
+        "Run this shell command and nothing else: touch {}",
+        file.display()
+    );
+    for input in tui::inputs(Harness::Claude, &AccCommand::Prompt { text: prompt }).unwrap() {
+        env.run(&b.send(&pane, &input));
+    }
+    let mut id = None;
+    eventually_within(long, "a Bash permission dialog", || {
+        id = poll(&mut screen, &mut events);
+        id.is_some()
+    });
+    let read = screen_match::read(Harness::Claude, &screen).unwrap();
+    let dialog = read.dialog.unwrap();
+    assert_eq!(dialog.kind, BlockKind::Permission, "{screen}");
+    assert_eq!(dialog.options[0].label, "Yes", "{screen}");
+    answer(&screen, &dialog.id, "1");
+    eventually_within(long, "the command to run and Claude to go idle", || {
+        poll(&mut screen, &mut events);
+        file.exists() && screen_match::read(Harness::Claude, &screen).map(|r| r.state) == Some(RunState::Idle)
+    });
+    assert!(
+        events.iter().any(
+            |e| matches!(e, acc_core::Event::PermissionResolved { request_id } if *request_id == dialog.id)
+        ),
+        "{events:?}"
+    );
+
+    for input in tui::exit_inputs(Harness::Claude).unwrap() {
+        env.run(&b.send(&pane, &input));
+    }
+    let _ = env.sh(&stop).output();
+}
+
+#[test]
+#[ignore = "needs claude and a signed-in HOME"]
+fn claude_dialogs_in_tmux() {
+    if available("tmux") {
+        claude_dialogs_in(Multiplexer::Tmux);
+    }
+}
+
+#[test]
+#[ignore = "needs claude and a signed-in HOME"]
+fn claude_dialogs_in_zellij() {
+    if available("zellij") {
+        claude_dialogs_in(Multiplexer::Zellij);
+    }
 }
