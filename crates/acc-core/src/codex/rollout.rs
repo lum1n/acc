@@ -6,6 +6,8 @@
 //! usage with nothing installed on the host, and tells ACC when the thread is
 //! at a safe point to take over with `thread/resume`.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::event::{Event, Quota, QuotaWindow, Usage};
@@ -44,6 +46,7 @@ pub struct Observer {
     framer: LineFramer,
     started: bool,
     state: Option<RunState>,
+    pending_tools: HashSet<String>,
 }
 
 impl Default for Observer {
@@ -58,6 +61,7 @@ impl Observer {
             framer: LineFramer::new(wire::MAX_FRAME),
             started: false,
             state: None,
+            pending_tools: HashSet::new(),
         }
     }
 
@@ -65,12 +69,19 @@ impl Observer {
         self.state.as_ref()
     }
 
+    /// Tool calls with no output yet. Codex 0.145 records no approval event
+    /// in the rollout, so a live process with an outstanding call that stays
+    /// quiet is most likely waiting on an approval prompt.
+    pub fn pending_tools(&self) -> usize {
+        self.pending_tools.len()
+    }
+
     /// True between turns: closing the TUI and resuming loses nothing.
     pub fn at_safe_point(&self) -> bool {
         matches!(
             self.state,
             Some(RunState::Done | RunState::Idle | RunState::Error)
-        )
+        ) && self.pending_tools.is_empty()
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
@@ -98,12 +109,34 @@ impl Observer {
                     });
                 }
             }
+            Some("response_item") => {
+                let call = owned(&p, "call_id");
+                match (str_at(&p, "type"), call) {
+                    (Some("function_call" | "custom_tool_call" | "local_shell_call"), Some(id)) => {
+                        self.pending_tools.insert(id);
+                    }
+                    (Some("function_call_output" | "custom_tool_call_output"), Some(id)) => {
+                        self.pending_tools.remove(&id);
+                    }
+                    _ => {}
+                }
+            }
             Some("event_msg") => match str_at(&p, "type") {
-                Some("task_started" | "user_message" | "exec_command_begin" | "patch_apply_begin") => {
+                Some("task_started" | "user_message") => {
+                    self.pending_tools.clear();
                     self.set(RunState::Working { progress: None }, out);
                 }
-                Some("task_complete") => self.set(RunState::Done, out),
-                Some("turn_aborted") => self.set(RunState::Idle, out),
+                Some("exec_command_begin" | "patch_apply_begin") => {
+                    self.set(RunState::Working { progress: None }, out);
+                }
+                Some("task_complete") => {
+                    self.pending_tools.clear();
+                    self.set(RunState::Done, out);
+                }
+                Some("turn_aborted") => {
+                    self.pending_tools.clear();
+                    self.set(RunState::Idle, out);
+                }
                 Some("error") => self.set(RunState::Error, out),
                 Some("exec_approval_request" | "apply_patch_approval_request" | "request_permissions") => {
                     self.set(
@@ -193,6 +226,29 @@ mod tests {
         assert!(matches!(&events[0],
             Event::SessionStarted { native_id, .. } if native_id == "01a125bb-467b-7971-9643-70534831e6ee"));
         assert_eq!(o.state(), Some(&RunState::Idle));
+        assert!(o.at_safe_point());
+    }
+
+    /// Codex 0.145 waiting on an approval: the rollout ends at the call.
+    #[test]
+    fn outstanding_tool_call_is_pending() {
+        let mut o = Observer::new();
+        o.feed(concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#, "\n",
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec"}}"#, "\n",
+        ).as_bytes());
+        assert_eq!(o.pending_tools(), 1);
+        assert!(!o.at_safe_point());
+        o.feed(
+            concat!(
+                r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+        assert_eq!(o.pending_tools(), 0);
         assert!(o.at_safe_point());
     }
 
