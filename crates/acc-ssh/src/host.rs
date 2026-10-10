@@ -228,16 +228,17 @@ impl Host {
         }
     }
 
-    async fn conn(&self) -> Result<Conn> {
+    /// The current connection, dialing one if needed; `true` if it was just dialed.
+    async fn conn(&self) -> Result<(Conn, bool)> {
         let mut slot = self.conn.lock().await;
         if let Some(conn) = slot.as_ref().filter(|c| !c.is_closed()) {
-            return Ok(conn.clone());
+            return Ok((conn.clone(), false));
         }
         *slot = None;
         let conn = Arc::new(self.dial().await?);
         self.dials.fetch_add(1, Ordering::Relaxed);
         *slot = Some(conn.clone());
-        Ok(conn)
+        Ok((conn, true))
     }
 
     /// Forgets `conn` if it is still the current one, so the next call redials.
@@ -296,28 +297,35 @@ impl Host {
         Ok(handle)
     }
 
+    /// Opens a channel running `script`. A connection that died unnoticed
+    /// (the network changed, the app was suspended) fails before the script
+    /// starts, so that is retried once on a fresh connection.
     async fn channel(&self, script: &str) -> Result<Channel<client::Msg>> {
-        let conn = self.conn().await?;
-        let open = async {
-            let ch = conn.channel_open_session().await?;
-            ch.exec(true, ssh_command(script)).await?;
-            Ok::<_, russh::Error>(ch)
-        };
-        match timeout(self.config.connect_timeout, open).await {
-            Ok(Ok(ch)) => Ok(ch),
-            Ok(Err(e)) => {
-                self.discard(&conn).await;
-                Err(match e {
-                    russh::Error::SendError | russh::Error::Disconnect | russh::Error::IO(_) => {
-                        Error::Disconnected
+        loop {
+            let (conn, fresh) = self.conn().await?;
+            let open = async {
+                let ch = conn.channel_open_session().await?;
+                ch.exec(true, ssh_command(script)).await?;
+                Ok::<_, russh::Error>(ch)
+            };
+            match timeout(self.config.connect_timeout, open).await {
+                Ok(Ok(ch)) => return Ok(ch),
+                Ok(Err(e)) => {
+                    self.discard(&conn).await;
+                    match e {
+                        russh::Error::SendError | russh::Error::Disconnect | russh::Error::IO(_)
+                            if !fresh => {}
+                        russh::Error::SendError | russh::Error::Disconnect | russh::Error::IO(_) => {
+                            return Err(Error::Disconnected);
+                        }
+                        e => return Err(e.into()),
                     }
-                    e => e.into(),
-                })
-            }
-            Err(_) => {
-                // A half-dead connection: don't wait for keepalives to notice.
-                self.discard(&conn).await;
-                Err(Error::Timeout)
+                }
+                Err(_) => {
+                    // A half-dead connection: don't wait for keepalives to notice.
+                    self.discard(&conn).await;
+                    return Err(Error::Timeout);
+                }
             }
         }
     }

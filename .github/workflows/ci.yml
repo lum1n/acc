@@ -56,19 +56,20 @@ jobs:
           tmux -V; screen -v || true; zellij --version
       - run: cargo test -p acc-core --test multiplexers
 
-  # Drives a real OpenSSH server through a proxy that drops connections.
+  # Drives a real OpenSSH server (and tmux behind it) through a proxy that drops connections.
   ssh:
     runs-on: ubuntu-latest
     env:
       ACC_REQUIRE_SSHD: "1"
+      ACC_REQUIRE_MUX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
-      - name: Install OpenSSH server
+      - name: Install OpenSSH server and tmux
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-server
+          sudo apt-get install -y openssh-server tmux
       - run: cargo test -p acc-ssh
 
   ios:

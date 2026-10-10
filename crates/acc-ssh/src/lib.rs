@@ -16,6 +16,10 @@
 //!   harness, merged state) on top of a [`Detached`], turning commands into
 //!   writes and log bytes into events.
 //!
+//!
+//! Beside these, [`pane`] drives harness TUIs running in tmux, zellij, screen
+//! or Rex panes on the host, with the host's own multiplexer binary.
+//!
 //! The harness never notices the client leaving: it keeps running detached
 //! on the host, approvals wait for an answer, and any client that reconnects
 //! (the same phone later, or the desktop) picks up from its offset. See
@@ -27,11 +31,13 @@ mod agent;
 mod detached;
 mod error;
 mod host;
+pub mod pane;
 mod session;
 
 pub use detached::{Detached, Read, Retry, list};
 pub use error::Error;
 pub use host::{AgentSocket, Auth, Host, HostKeyCheck, Output, SshConfig, Stream, StreamMsg};
+pub use pane::Pane;
 pub use session::Session;
 
 /// Re-exported so callers can name session listings and statuses.

@@ -112,7 +112,17 @@ it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). 
   itself and stamping state with the clock. A second client attaches from offset 0 and replays the
   session into a fresh core.
 
-CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session.
+`acc_ssh::pane` runs the multiplexer commands below over the same `Host`: list, locate (from a
+harness PID's environment), spawn and kill panes, and `Pane`, which co-drives a harness TUI. `Pane`
+turns commands into keystrokes (permission answers keyed from the dialog on screen at that moment),
+and its `next_events` streams the multiplexer's watch output for OSC 7501 states, reads the screen
+when the pane draws (at most every `Pacing::min_gap`, at least every `Pacing::idle`), reopens the
+watch after a dropped connection, and reports `Exited` once the pane is gone. A channel that fails
+to open on a connection that died unnoticed is retried once on a fresh one, since the script never
+started; anything that may have run (a keystroke) is never repeated.
+
+CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session, with
+tmux behind it for `Pane`.
 
 **Takeover** of a session ACC didn't start: find the process, map it to the harness's session id,
 wait for the turn to end (or force), close the TUI, resume headless detached, auto-continue if a turn

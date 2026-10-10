@@ -28,6 +28,9 @@ pub enum Error {
     NotRunning(String),
     #[error("remote script failed (exit {code:?}): {stderr}")]
     Remote { code: Option<u32>, stderr: String },
+    /// A multiplexer can't do this, or printed something unexpected.
+    #[error("multiplexer: {0}")]
+    Mux(String),
     #[error(transparent)]
     Driver(#[from] DriverError),
 }
