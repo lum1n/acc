@@ -19,6 +19,8 @@
 //! - [`detached`]: shell scripts for daemonless, disconnect-proof sessions.
 //! - [`multiplexer`]: locating harnesses inside tmux, zellij, screen and Rex.
 //! - [`acp`]: the Agent Client Protocol driver (Cursor, Copilot, opencode).
+//! - [`session`]: a driver picked by harness, with timestamps and merged state;
+//!   what the Swift, Kotlin and JS bindings wrap.
 
 pub mod claude;
 pub mod codex;
@@ -33,6 +35,7 @@ pub mod multiplexer;
 pub mod ndjson;
 pub mod osc7501;
 pub mod pi;
+pub mod session;
 pub mod shell;
 pub mod state;
 mod wire;
