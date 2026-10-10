@@ -81,4 +81,14 @@ acc script mux zellij - - list | sh                    # zellij: panes of every 
 acc script mux zellij <session> - type terminal_1 "fix the tests" | sh
 ```
 
+**Read the screen and answer dialogs.** For sessions ACC didn't start, some state only shows on
+screen: Claude Code's permission and question dialogs, and pi's busy spinner before pi 1.x.
+`acc decode screen <claude|pi>` reads a captured pane and prints its state and any open dialog
+with its numbered options; `keys` presses the one you pick (or `escape` to deny):
+
+```sh
+acc script mux tmux - - capture %3 | sh | acc decode screen claude
+acc script mux tmux - - keys %3 1 | sh                  # "1. Yes"
+```
+
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and the decisions behind it.

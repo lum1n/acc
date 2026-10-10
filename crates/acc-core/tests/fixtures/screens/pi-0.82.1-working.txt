@@ -1,0 +1,30 @@
+fd not found. Offline mode enabled, skipping download.
+
+ pi v0.82.1
+ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+
+ Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys
+ on` to ~/.tmux.conf and restart tmux.
+
+
+ say hi
+
+
+ Hello from
+
+ ⠧ Working...
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/claude/scr
+0.0%/128k (auto)                                                                         (fake) fake
+
+
+
+
+

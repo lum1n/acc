@@ -380,7 +380,14 @@ impl Printer {
         }
         match event {
             Event::SessionStarted { native_id, model, .. } => {
-                let model = model.as_deref().map(|m| format!(" ({m})")).unwrap_or_default();
+                let label = |m: &str| {
+                    let def = driver.options().iter().find(|o| o.id == OptionId::Model);
+                    def.map_or(m, |d| d.label(m)).to_owned()
+                };
+                let model = model
+                    .as_deref()
+                    .map(|m| format!(" ({})", label(m)))
+                    .unwrap_or_default();
                 self.line(&format!("● session {native_id}{model}"));
                 self.line(&format!(
                     "  resume later with: acc run {} --resume {native_id}",
@@ -480,7 +487,7 @@ impl Printer {
                     .iter()
                     .filter_map(|o| {
                         let id = format!("{:?}", o.id).to_lowercase();
-                        Some(format!("{id}={}", o.current.as_deref()?))
+                        Some(format!("{id}={}", o.current_label()?))
                     })
                     .collect();
                 if !current.is_empty() {

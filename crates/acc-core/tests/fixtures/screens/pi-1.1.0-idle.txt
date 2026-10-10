@@ -1,0 +1,30 @@
+   (https://github.com/HyeokjaeLee)).
+ - Fixed explicitly configured Amazon Bedrock profiles being overridden by ambient AWS access keys.
+   See Amazon Bedrock
+   (https://github.com/earendil-works/pi/blob/v0.83.0/packages/coding-agent/docs/providers.md#amazo
+   n-bedrock) (#7176 (https://github.com/earendil-works/pi/pull/7176) by @christianbasch
+   (https://github.com/christianbasch)).
+ - Fixed inherited image fallback paths overflowing narrow terminals, shortened home-directory
+   paths, and made absolute paths clickable when terminal hyperlinks are available (#7262
+   (https://github.com/earendil-works/pi/pull/7262)).
+ - Fixed inherited OpenAI-compatible tool calls losing their function arguments when malformed
+   deltas also contain an empty custom object (#7288
+   (https://github.com/earendil-works/pi/pull/7288) by @sunnyyoung
+   (https://github.com/sunnyyoung)).
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys
+ on` to ~/.tmux.conf and restart tmux.
+
+
+ say hi
+
+
+ Hello from the fake model.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/claude/scr
+↑10 ↓5 0.0%/128k (auto)                                                                  (fake) fake
