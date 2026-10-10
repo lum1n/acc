@@ -16,7 +16,7 @@ use acc_core::acp::{AcpConfig, AcpDriver, Start};
 use acc_core::claude::{ClaudeConfig, ClaudeDriver};
 use acc_core::codex::{CodexConfig, CodexDriver};
 use acc_core::command::{Command, OptionId};
-use acc_core::driver::Driver;
+use acc_core::driver::{Driver, DriverError};
 use acc_core::event::ItemKind;
 use acc_core::pi::PiDriver;
 use acc_core::state::RunState;
@@ -172,6 +172,9 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
     // A prompt is in flight until its turn completes; stdin EOF waits for it.
     let mut busy = false;
     let mut eof = false;
+    // Commands typed (or piped) before the harness has a session wait here
+    // and are sent once `SessionStarted` arrives.
+    let mut queued: Vec<Command> = Vec::new();
     loop {
         let input = if agent_in.is_some() {
             rx.recv().map_err(|e| e.to_string())?
@@ -187,7 +190,9 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
         };
         match input {
             Input::Agent(bytes) => {
+                let mut started = false;
                 for mut event in driver.on_output(&bytes) {
+                    started |= matches!(event, Event::SessionStarted { .. });
                     // The driver has no clock; stamp state on receipt.
                     if let Event::StateChanged(state) = &mut event {
                         state.observed_at_ms = now_ms();
@@ -198,14 +203,20 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
                     out.event(&event, driver.as_ref());
                 }
                 write(&mut agent_in, &driver.poll_transmit())?;
+                if started {
+                    for cmd in std::mem::take(&mut queued) {
+                        send(driver.as_mut(), cmd, &mut agent_in, &mut queued)?;
+                    }
+                }
             }
             Input::AgentClosed => break,
             Input::User(line) => {
                 if let Some(cmd) = parse_line(&line, driver.as_ref(), &out) {
                     busy |= matches!(cmd, Command::Prompt { .. } | Command::Invoke { .. });
-                    match driver.command(cmd) {
-                        Ok(bytes) => write(&mut agent_in, &bytes)?,
-                        Err(e) => eprintln!("acc: {e}"),
+                    if queued.is_empty() {
+                        send(driver.as_mut(), cmd, &mut agent_in, &mut queued)?;
+                    } else {
+                        queued.push(cmd);
                     }
                 }
             }
@@ -218,6 +229,26 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
     let status = child.wait().map_err(|e| e.to_string())?;
     out.event(&Event::Exited { code: status.code() }, driver.as_ref());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Sends a command, or queues it when the harness has no session yet.
+fn send(
+    driver: &mut dyn Driver,
+    cmd: Command,
+    agent_in: &mut Option<ChildStdin>,
+    queued: &mut Vec<Command>,
+) -> Result<(), String> {
+    match driver.command(cmd.clone()) {
+        Ok(bytes) => write(agent_in, &bytes),
+        Err(DriverError::NotStarted) => {
+            queued.push(cmd);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("acc: {e}");
+            Ok(())
+        }
+    }
 }
 
 fn write(w: &mut Option<ChildStdin>, bytes: &[u8]) -> Result<(), String> {

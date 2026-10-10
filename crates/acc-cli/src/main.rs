@@ -32,7 +32,8 @@ usage:
   acc script mux <mux> <server> <session|-> capture|watch <pane>
   acc script mux <mux> <server> <session|-> type <pane> <text>
                                         multiplexer commands (`type` submits text with Enter)
-  acc decode pi|pi-transcript           read pi RPC output or a pi session file on stdin, print events
+  acc decode pi|pi-transcript|claude-transcript|codex-rollout
+                                        read harness output or a session file on stdin, print events
 ";
 
 fn main() -> ExitCode {
@@ -187,17 +188,27 @@ fn mux(args: &[&str]) -> ExitCode {
         if e.stdin.is_empty() {
             println!("{}", e.script);
         } else {
-            println!(
-                "{} <<'ACC_EOF'\n{}\nACC_EOF",
-                e.script,
-                String::from_utf8_lossy(&e.stdin)
-            );
+            println!("{} <<'ACC_EOF'\n{}\nACC_EOF", e.script, heredoc_body(&e.stdin));
         }
     };
     match rest {
         ["list"] => print(b.list_panes(&target)),
         ["capture", p] => print(b.capture(&pane(p), true)),
-        ["watch", p] => print(b.watch(&pane(p)).exec),
+        ["watch", p] => {
+            let e = b.watch(&pane(p)).exec;
+            if e.stdin.is_empty() {
+                print(e);
+            } else {
+                // Watches that read stdin (tmux control mode) end when it
+                // closes, so feed the setup through a FIFO this script holds
+                // open until the watch exits.
+                println!(
+                    "d=$(mktemp -d) && mkfifo \"$d/in\" || exit 1\n{} <\"$d/in\" &\nexec 3>\"$d/in\"\nrm -rf \"$d\"\ncat >&3 <<'ACC_EOF'\n{}\nACC_EOF\nwait $!",
+                    e.script,
+                    heredoc_body(&e.stdin)
+                );
+            }
+        }
         ["type", p, text] => {
             for input in tui::submit(text) {
                 print(b.send(&pane(p), &input));
@@ -211,6 +222,12 @@ fn mux(args: &[&str]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// stdin bytes as a heredoc body. The heredoc adds the final newline itself;
+/// a doubled one would be an empty line, which detaches a tmux control client.
+fn heredoc_body(stdin: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(stdin.strip_suffix(b"\n").unwrap_or(stdin))
+}
+
 type Decoder = dyn FnMut(&[u8]) -> Vec<acc_core::Event>;
 
 fn decode(kind: &str) -> ExitCode {
@@ -221,6 +238,14 @@ fn decode(kind: &str) -> ExitCode {
         }
         "pi-transcript" => {
             let mut t = Transcript::new();
+            Box::new(move |b| t.feed(b))
+        }
+        "claude-transcript" => {
+            let mut t = acc_core::claude::transcript::Observer::new();
+            Box::new(move |b| t.feed(b))
+        }
+        "codex-rollout" => {
+            let mut t = acc_core::codex::rollout::Observer::new();
             Box::new(move |b| t.feed(b))
         }
         _ => {

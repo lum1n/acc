@@ -1079,7 +1079,8 @@ fn local_command_output(text: &str) -> Option<&str> {
     )
 }
 
-/// Claude reports window utilization as a fraction (0.23 = 23%). (verify)
+/// Claude reports window utilization as a fraction (0.23 = 23%; checked
+/// against Claude Code 2.1.296).
 fn fraction_to_percent(f: f64) -> f64 {
     (f * 100.0).clamp(0.0, 100.0)
 }
