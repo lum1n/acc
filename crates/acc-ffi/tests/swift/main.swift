@@ -1,7 +1,7 @@
 // Drives a recorded Claude Code session through the real library from Swift.
-// Built and run on macOS by CI (see .github/workflows/ci.yml, job `ios`):
+// Top-level code needs the file to be named main.swift. Built and run on macOS by CI (see .github/workflows/ci.yml, job `ios`):
 //
-//   swiftc smoke.swift acc_ffi.swift -I bindings/swift \
+//   swiftc main.swift acc_ffi.swift -I bindings/swift \
 //     -Xcc -fmodule-map-file=bindings/swift/acc_ffiFFI.modulemap \
 //     -L target/release -lacc_ffi -o smoke && ./smoke <repo root>
 

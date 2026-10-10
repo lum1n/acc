@@ -78,7 +78,7 @@ jobs:
             -Xcc -fmodule-map-file=acc_ffiFFI.modulemap acc_ffi.swift
       - name: Swift smoke test (recorded Claude session through the library)
         run: |
-          swiftc crates/acc-ffi/tests/smoke.swift bindings/swift/acc_ffi.swift -I bindings/swift \
+          swiftc crates/acc-ffi/tests/swift/main.swift bindings/swift/acc_ffi.swift -I bindings/swift \
             -Xcc -fmodule-map-file=bindings/swift/acc_ffiFFI.modulemap \
             -L target/release -lacc_ffi -o target/swift-smoke
           DYLD_LIBRARY_PATH=target/release target/swift-smoke "$PWD"
