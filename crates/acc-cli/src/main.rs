@@ -9,7 +9,10 @@ use std::process::{Command, ExitCode};
 
 use acc_core::Harness;
 use acc_core::detached::SessionDir;
+use acc_core::driver::Driver as _;
+use acc_core::multiplexer::{self, Multiplexer, PaneRef, Target, tui};
 use acc_core::osc7501::Scanner;
+use acc_core::pi::{PiDriver, Transcript};
 
 const USAGE: &str = "\
 usage:
@@ -22,6 +25,11 @@ usage:
   acc script attach <id> [offset]
   acc script input <id>
   acc script status <id>                print a host-side shell script (pipe to `ssh host sh`)
+  acc script mux <tmux|zellij|screen|rex> <server|-> <session|-> list
+  acc script mux <mux> <server> <session|-> capture|watch <pane>
+  acc script mux <mux> <server> <session|-> type <pane> <text>
+                                        multiplexer commands (`type` submits text with Enter)
+  acc decode pi|pi-transcript           read pi RPC output or a pi session file on stdin, print events
 ";
 
 fn main() -> ExitCode {
@@ -30,6 +38,7 @@ fn main() -> ExitCode {
     match args.as_slice() {
         ["harnesses"] => harnesses(),
         ["osc7501"] => osc(),
+        ["script", "mux", rest @ ..] => mux(rest),
         ["acp", harness, rest @ ..] => match parse_harness(harness).and_then(|h| {
             if h.native_acp() {
                 acp::run(h, rest)
@@ -44,6 +53,7 @@ fn main() -> ExitCode {
             }
         },
         ["script", rest @ ..] => script(rest),
+        ["decode", kind] => decode(kind),
         _ => {
             eprint!("{USAGE}");
             ExitCode::from(2)
@@ -128,4 +138,100 @@ fn parse_harness(s: &str) -> Result<Harness, String> {
         .into_iter()
         .find(|h| h.id() == s || h.program() == s || format!("{h:?}").eq_ignore_ascii_case(s))
         .ok_or_else(|| format!("unknown harness {s:?}"))
+}
+
+fn mux(args: &[&str]) -> ExitCode {
+    let [m, server, session, rest @ ..] = args else {
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let m = match *m {
+        "tmux" => Multiplexer::Tmux,
+        "zellij" => Multiplexer::Zellij,
+        "screen" => Multiplexer::Screen,
+        "rex" => Multiplexer::Rex,
+        other => {
+            eprintln!("acc: unknown multiplexer {other:?}");
+            return ExitCode::from(2);
+        }
+    };
+    let b = multiplexer::backend(m);
+    let target = Target {
+        multiplexer: m,
+        server: Some((*server).to_owned())
+            .filter(|s| s != "-")
+            .unwrap_or_default(),
+        session: Some((*session).to_owned()).filter(|s| s != "-"),
+    };
+    let pane = |p: &str| PaneRef {
+        multiplexer: m,
+        server: target.server.clone(),
+        session: target.session.clone(),
+        pane: p.to_owned(),
+    };
+    // Inputs carried on stdin are shown as a heredoc so the output stays one script.
+    let print = |e: multiplexer::Exec| {
+        if e.stdin.is_empty() {
+            println!("{}", e.script);
+        } else {
+            println!(
+                "{} <<'ACC_EOF'\n{}\nACC_EOF",
+                e.script,
+                String::from_utf8_lossy(&e.stdin)
+            );
+        }
+    };
+    match rest {
+        ["list"] => print(b.list_panes(&target)),
+        ["capture", p] => print(b.capture(&pane(p), true)),
+        ["watch", p] => print(b.watch(&pane(p)).exec),
+        ["type", p, text] => {
+            for input in tui::submit(text) {
+                print(b.send(&pane(p), &input));
+            }
+        }
+        _ => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+type Decoder = dyn FnMut(&[u8]) -> Vec<acc_core::Event>;
+
+fn decode(kind: &str) -> ExitCode {
+    let mut feed: Box<Decoder> = match kind {
+        "pi" => {
+            let mut d = PiDriver::new();
+            Box::new(move |b| d.on_output(b))
+        }
+        "pi-transcript" => {
+            let mut t = Transcript::new();
+            Box::new(move |b| t.feed(b))
+        }
+        _ => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => return ExitCode::SUCCESS,
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("acc: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for ev in feed(&buf[..n]) {
+            let line = serde_json::to_string(&ev).unwrap_or_default();
+            if writeln!(stdout, "{line}").is_err() {
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 }
