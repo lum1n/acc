@@ -25,8 +25,8 @@ POSIX tools.
 ```sh
 cargo test --workspace
 
-# Which harnesses are installed here?
-cargo run -p acc-cli -- harnesses
+# What can ACC drive on this machine?
+cargo run -q -p acc-cli -- doctor
 
 # Start Claude Code detached on a host, nothing installed there:
 cargo run -q -p acc-cli -- script launch claude s1 ~/project | ssh host sh
@@ -37,6 +37,48 @@ cargo run -q -p acc-cli -- script status s1 | ssh host sh
 cargo build -p acc-ffi --release
 cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \
   generate --library target/release/libacc_ffi.so --language swift --language kotlin --out-dir bindings
+```
+
+## Try it by hand
+
+Everything below runs in a plain terminal. Install the CLI once:
+
+```sh
+cargo install --path crates/acc-cli    # puts `acc` in ~/.cargo/bin
+acc doctor                             # harnesses, multiplexers and session stores found here
+```
+
+**Drive a harness.** `acc run <harness> [dir]` starts it headlessly through its ACC driver
+(`claude`, `codex`, `pi`, `cursor`, `copilot`, `opencode`). Type prompts; events print as
+readable lines (`--json` prints the raw event stream). `:help` lists the commands: `:answer allow`
+for a permission prompt, `:interrupt`, `:compact`, `:set model <m>`, `:commands`, `:options`.
+Ctrl-D ends the session after the current turn.
+
+```sh
+acc run claude ~/project
+echo "Reply with: hello from acc" | acc run claude .    # one-shot smoke test
+acc run codex . --model gpt-5.5 --json
+```
+
+**Resume or take over a session.** `acc sessions <claude|codex|pi>` lists recent sessions with
+the command that resumes each one. Quit the harness's own TUI first, then resume it headlessly
+(Claude resumes per project, so run it from the session's directory):
+
+```sh
+acc sessions claude
+acc run claude . --resume <session-id>
+```
+
+**Inside tmux, zellij or screen.** Leave the harness running in its pane and drive it from any
+other terminal; each `acc script mux` command prints a shell script, so pipe it to `sh` (or to
+`ssh host sh` for a remote machine):
+
+```sh
+acc script mux tmux - - list | sh                      # find the harness's pane, e.g. %3
+acc script mux tmux - - capture %3 | sh                # what the pane shows now
+acc script mux tmux - - type %3 "fix the tests" | sh   # type a prompt and press Enter
+acc script mux zellij - - list | sh                    # zellij: panes of every session
+acc script mux zellij <session> - type terminal_1 "fix the tests" | sh
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and the decisions behind it.
