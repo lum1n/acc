@@ -37,6 +37,24 @@ cargo run -q -p acc-cli -- script status s1 | ssh host sh
 cargo build -p acc-ffi --release
 cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \
   generate --library target/release/libacc_ffi.so --language swift --language kotlin --out-dir bindings
+
+# JS bindings (browser: --target web)
+cargo build -p acc-wasm --release --target wasm32-unknown-unknown
+wasm-bindgen --target nodejs --out-dir bindings/node target/wasm32-unknown-unknown/release/acc_wasm.wasm
+```
+
+From Swift, a session is a few calls; the app moves the bytes (see `docs/ARCHITECTURE.md`, Bindings):
+
+```swift
+let session = try Session(config: SessionConfig(harness: .claude, cwd: "/home/me/project", opening: .new))
+channel.exec(session.launchSpec())            // your SSH channel, pipe or pane
+channel.write(session.start())
+channel.onData { bytes in
+    let got = session.receive(bytes: bytes, nowMs: nowMs())
+    channel.write(got.transmit)
+    for event in got.events { ui.apply(event) }
+}
+channel.write(try session.send(command: .prompt(text: "hi")))
 ```
 
 ## Try it by hand

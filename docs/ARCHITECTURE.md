@@ -58,6 +58,29 @@ client (or a reconnect) adopt a running agent from its log, reading other client
 `acc acp <harness> <cwd>` drives one locally for spikes. Recorded Copilot 1.0.95 and opencode 1.18.35
 sessions under `crates/acc-core/tests/fixtures/acp` are replayed in CI.
 
+## Bindings
+
+`acc_core::session::Session` is what every binding wraps: it picks the driver for a harness
+(`SessionConfig { harness, cwd, opening: New | Resume | Attach, model, client_tag }`), stamps state
+changes with the caller's clock, merges state from other sources (`observe`, e.g. OSC 7501 from a
+pane) and remembers the harness's session id. It stays sans-IO, so the app owns the transport:
+
+```
+spawn launch_spec() on the host  →  write start()
+for each chunk read:  receive(bytes, now_ms) → { events, transmit }  →  write transmit
+for each UI action:   send(command) → bytes  →  write them
+on EOF:               exited(code, now_ms)
+```
+
+| Binding | Crate | Types |
+|---|---|---|
+| Swift, Kotlin | `acc-ffi` (UniFFI 0.32) | Typed records and enums mirroring the core; harness-native payloads as JSON strings (`extensions_json`, `payload_json`). `Event.UsageUpdated` / `QuotaUpdated` are the core's `Usage` / `Quota` events. |
+| JS (browser, Node) | `acc-wasm` (wasm-bindgen) | Plain objects in the core's serde shape (snake_case, `type`-tagged), so they match `acc run --json`; bytes are `Uint8Array`; TypeScript declarations ship in the generated `.d.ts`. |
+
+Both also expose `TranscriptObserver` (follow a Claude, Codex or pi transcript), `DetachedSession`
+(the daemonless scripts below), `Osc7501Scanner` and `shell_quote`. CI replays a recorded Claude
+session through the real library from Swift (macOS), Kotlin (JVM), Python and Node.
+
 ## Daemonless sessions
 
 `acc_core::detached` generates host-side shell scripts: the harness runs under `nohup` with stdin on

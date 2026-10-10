@@ -76,6 +76,12 @@ jobs:
           cd bindings/swift
           swiftc -parse-as-library -typecheck -I . \
             -Xcc -fmodule-map-file=acc_ffiFFI.modulemap acc_ffi.swift
+      - name: Swift smoke test (recorded Claude session through the library)
+        run: |
+          swiftc crates/acc-ffi/tests/smoke.swift bindings/swift/acc_ffi.swift -I bindings/swift \
+            -Xcc -fmodule-map-file=bindings/swift/acc_ffiFFI.modulemap \
+            -L target/release -lacc_ffi -o target/swift-smoke
+          DYLD_LIBRARY_PATH=target/release target/swift-smoke "$PWD"
 
   android:
     runs-on: ubuntu-latest
@@ -97,6 +103,18 @@ jobs:
           cargo build -p acc-ffi --release
           cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \
             generate --library target/release/libacc_ffi.so --language kotlin --no-format --out-dir bindings/kotlin
+      - name: Kotlin smoke test (JVM, same bindings as Android)
+        run: |
+          curl -fsSL -o jna.jar https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.17.0/jna-5.17.0.jar
+          kotlinc crates/acc-ffi/tests/smoke.kt bindings/kotlin/uniffi/acc_ffi/acc_ffi.kt \
+            -cp jna.jar -include-runtime -d target/kotlin-smoke.jar
+          java -Djna.library.path=target/release -cp target/kotlin-smoke.jar:jna.jar SmokeKt "$PWD"
+      - name: Python smoke test (exercises every FFI call)
+        run: |
+          cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \
+            generate --library target/release/libacc_ffi.so --language python --out-dir bindings/python
+          cp target/release/libacc_ffi.so bindings/python/
+          python3 crates/acc-ffi/tests/smoke.py bindings/python
 
   wasm:
     runs-on: ubuntu-latest
@@ -107,5 +125,14 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p acc-wasm --release --target wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          # Must match the wasm-bindgen version in Cargo.lock.
+          tool: wasm-bindgen@0.2.129
+      - name: Node smoke test (recorded Claude session through wasm)
+        run: |
+          wasm-bindgen --target nodejs --out-dir bindings/node \
+            target/wasm32-unknown-unknown/release/acc_wasm.wasm
+          node crates/acc-wasm/tests/smoke.mjs bindings/node
       - name: Core must not depend on host-only code
         run: cargo build -p acc-core --target wasm32-unknown-unknown
