@@ -98,7 +98,7 @@ fn ready_copilot() -> AcpDriver {
             init_result(json!({ "loadSession": true })),
         )],
     );
-    let new = one(&d.take_outgoing());
+    let new = one(&d.poll_transmit());
     feed(
         &mut d,
         &[
@@ -130,7 +130,7 @@ fn handshake_opens_a_new_session() {
         &[result("acc-0", init_result(json!({ "loadSession": true })))],
     );
     assert!(events.is_empty());
-    let new = one(&d.take_outgoing());
+    let new = one(&d.poll_transmit());
     assert_eq!(new["method"], "session/new");
     assert_eq!(new["params"]["cwd"], "/home/v/proj");
     assert_eq!(new["params"]["mcpServers"], json!([]));
@@ -169,7 +169,6 @@ fn handshake_opens_a_new_session() {
 #[test]
 fn a_full_turn_with_a_permission_prompt() {
     let mut d = ready_copilot();
-    d.set_now(1_000);
     let prompt = one(&d
         .command(Command::Prompt {
             text: "fix the build".into(),
@@ -214,7 +213,7 @@ fn a_full_turn_with_a_permission_prompt() {
         unreachable!()
     };
     assert_eq!(s.source, StateSource::Native);
-    assert_eq!(s.observed_at_ms, 1_000);
+    assert_eq!(s.observed_at_ms, 0);
 
     let kinds: Vec<_> = events
         .iter()
@@ -364,7 +363,7 @@ fn resume_loads_and_replays_history_quietly() {
         &mut d,
         &[result("acc-0", init_result(json!({ "loadSession": true })))],
     );
-    let load = one(&d.take_outgoing());
+    let load = one(&d.poll_transmit());
     assert_eq!(load["method"], "session/load");
     assert_eq!(load["params"]["sessionId"], "s9");
 
@@ -440,7 +439,7 @@ fn resume_falls_back_to_session_resume_or_fails() {
             init_result(json!({ "sessionCapabilities": { "resume": {} } })),
         )],
     );
-    assert_eq!(one(&d.take_outgoing())["method"], "session/resume");
+    assert_eq!(one(&d.poll_transmit())["method"], "session/resume");
 
     let mut d = driver(
         Harness::Opencode,
@@ -451,7 +450,7 @@ fn resume_falls_back_to_session_resume_or_fails() {
     d.handshake();
     let events = feed(&mut d, &[result("acc-0", init_result(json!({})))]);
     assert_eq!(states(&events), [RunState::Error]);
-    assert!(d.take_outgoing().is_empty());
+    assert!(d.poll_transmit().is_empty());
 }
 
 #[test]
@@ -472,7 +471,7 @@ fn auth_required_blocks_until_authenticated() {
     let mut d = driver(Harness::Copilot, Start::New);
     d.handshake();
     feed(&mut d, &[result("acc-0", init_result(json!({})))]);
-    let new = one(&d.take_outgoing());
+    let new = one(&d.poll_transmit());
     let events = feed(
         &mut d,
         &[
@@ -496,7 +495,7 @@ fn auth_required_blocks_until_authenticated() {
     let auth = one(&d.authenticate("copilot-login"));
     assert_eq!(auth["params"]["methodId"], "copilot-login");
     feed(&mut d, &[result(auth["id"].clone(), json!({}))]);
-    assert_eq!(one(&d.take_outgoing())["method"], "session/new");
+    assert_eq!(one(&d.poll_transmit())["method"], "session/new");
 }
 
 #[test]
@@ -538,7 +537,7 @@ fn unserved_agent_requests_get_an_error_reply() {
                   "params": { "sessionId": "s1", "path": "/etc/passwd" } })],
     );
     assert!(matches!(&events[0], Event::Native { kind, .. } if kind == "fs/read_text_file"));
-    let reply = one(&d.take_outgoing());
+    let reply = one(&d.poll_transmit());
     assert_eq!(reply["id"], 3);
     assert_eq!(reply["error"]["code"], -32601);
 }
@@ -766,4 +765,66 @@ fn launch_specs() {
         ("opencode", ["acp".to_owned()].as_slice())
     );
     assert_eq!(oc.protocol, Protocol::Acp);
+}
+
+#[test]
+fn invoke_notice_and_resolved_permissions() {
+    let mut d = ready_copilot();
+    let r = one(&d
+        .command(Command::Invoke {
+            name: "/review".into(),
+            args: "main".into(),
+        })
+        .expect("invoke"));
+    assert_eq!(r["params"]["prompt"][0]["text"], "/review main");
+    assert_eq!(
+        one(&d
+            .command(Command::Invoke {
+                name: "interrupt".into(),
+                args: String::new()
+            })
+            .expect("interrupt"))["method"],
+        "session/cancel"
+    );
+    assert!(matches!(
+        d.command(Command::Invoke {
+            name: "nope".into(),
+            args: String::new()
+        }),
+        Err(DriverError::InvalidOption(_))
+    ));
+    assert_eq!(d.command(Command::Refresh).expect("refresh"), Vec::<u8>::new());
+
+    let events = feed(
+        &mut d,
+        &[
+            update(
+                "s1",
+                json!({ "sessionUpdate": "notice", "severity": "warning", "title": "Rate limited" }),
+            ),
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "session/request_permission", "params": {
+                "sessionId": "s1", "toolCall": { "toolCallId": "t2", "title": "edit" },
+                "options": [{ "optionId": "allow_once", "name": "Allow", "kind": "allow_once" }] } }),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t2", "status": "in_progress" }),
+            ),
+        ],
+    );
+    assert_eq!(
+        events[0],
+        Event::Notice {
+            message: "Rate limited".into()
+        }
+    );
+    assert!(events.contains(&Event::PermissionResolved {
+        request_id: "9".into()
+    }));
+    assert!(matches!(
+        d.command(Command::AnswerPermission {
+            request_id: "9".into(),
+            option_id: "allow_once".into()
+        }),
+        Err(DriverError::UnknownRequest(_))
+    ));
 }

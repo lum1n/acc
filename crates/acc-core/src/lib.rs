@@ -13,17 +13,18 @@
 //! - [`event`]: the normalized event stream every driver produces.
 //! - [`command`]: canonical commands and harness options.
 //! - [`driver`]: the sans-IO driver trait.
-//! - [`acp`]: the Agent Client Protocol driver (Cursor, Copilot, opencode).
 //! - [`ndjson`], [`osc7501`]: incremental parsers used by drivers and terminals.
 //! - [`detached`]: shell scripts for daemonless, disconnect-proof sessions.
 //! - [`multiplexer`]: locating harnesses inside tmux, zellij, screen and Rex.
+//! - [`acp`]: the Agent Client Protocol driver (Cursor, Copilot, opencode).
 
-pub mod acp;
 pub mod command;
 pub mod detached;
 pub mod driver;
 pub mod event;
 pub mod harness;
+// Harness drivers.
+pub mod acp;
 pub mod multiplexer;
 pub mod ndjson;
 pub mod osc7501;

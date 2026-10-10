@@ -153,7 +153,6 @@ pub struct AcpDriver {
     item_seq: u64,
 
     state: Option<(RunState, Option<String>)>,
-    now_ms: u64,
 }
 
 impl AcpDriver {
@@ -188,16 +187,9 @@ impl AcpDriver {
             open_tools: BTreeSet::new(),
             item_seq: 0,
             state: None,
-            now_ms: 0,
         };
         d.rebuild_commands();
         d
-    }
-
-    /// Sets the clock used to stamp state changes (the core has no clock).
-    /// Transports call it before [`Driver::on_output`].
-    pub fn set_now(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
     }
 
     /// The agent's id for the active session, once known.
@@ -535,7 +527,9 @@ impl AcpDriver {
                 extensions: Value::Null,
             });
         }
-        self.permissions.clear();
+        for request_id in std::mem::take(&mut self.permissions).into_keys() {
+            out.push(Event::PermissionResolved { request_id });
+        }
     }
 
     fn on_turn_end(&mut self, r: &Value, out: &mut Vec<Event>) {
@@ -723,6 +717,12 @@ impl AcpDriver {
                 }
                 out.push(native(kind, update));
             }
+            "notice" => {
+                let title = update.get("title").and_then(Value::as_str).unwrap_or("");
+                out.push(Event::Notice {
+                    message: title.to_owned(),
+                });
+            }
             _ => out.push(native(kind, update)),
         }
     }
@@ -828,8 +828,16 @@ impl AcpDriver {
         };
         // Progress on a tool call means its permission was answered,
         // possibly by another client sharing this agent.
-        self.permissions
-            .retain(|_, w| w.tool_call_id.as_deref() != Some(id));
+        let answered: Vec<String> = self
+            .permissions
+            .iter()
+            .filter(|(_, w)| w.tool_call_id.as_deref() == Some(id))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for request_id in answered {
+            self.permissions.remove(&request_id);
+            out.push(Event::PermissionResolved { request_id });
+        }
         self.working(out);
         if !self.open_tools.contains(id) {
             self.start_tool(id.to_owned(), update, out);
@@ -862,7 +870,8 @@ impl AcpDriver {
             state,
             message,
             source: StateSource::Native,
-            observed_at_ms: self.now_ms,
+            // Drivers have no clock; the session layer stamps it on receipt.
+            observed_at_ms: 0,
         }));
     }
 
@@ -946,7 +955,7 @@ impl Driver for AcpDriver {
         out
     }
 
-    fn take_outgoing(&mut self) -> Vec<u8> {
+    fn poll_transmit(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.outgoing)
     }
 
@@ -995,6 +1004,10 @@ impl Driver for AcpDriver {
             Command::Rename { name } => self.slash(&["rename"], &name, "rename"),
             Command::Review => self.slash(&["review"], "", "review"),
             Command::Shell { .. } => Err(self.unsupported("shell commands")),
+            Command::Invoke { name, args } => self.invoke(&name, &args),
+            // ACP agents push commands, options and usage as they change;
+            // there is nothing to ask for.
+            Command::Refresh => Ok(Vec::new()),
             Command::SetOption { id, value } => self.set_option(id, value),
             Command::AnswerPermission {
                 request_id,
@@ -1006,7 +1019,7 @@ impl Driver for AcpDriver {
                     .ok_or_else(|| DriverError::UnknownRequest(request_id.clone()))?;
                 if !wait.option_ids.is_empty() && !wait.option_ids.contains(&option_id) {
                     self.permissions.insert(request_id.clone(), wait);
-                    return Err(DriverError::UnknownRequest(format!("{request_id}/{option_id}")));
+                    return Err(DriverError::InvalidOption(option_id));
                 }
                 // The state leaves `blocked` on the agent's next update.
                 self.answer_permission(
@@ -1028,6 +1041,26 @@ impl Driver for AcpDriver {
 }
 
 impl AcpDriver {
+    /// Runs a palette entry: ACC's own entries map to their commands, the
+    /// agent's are sent as `/name args` prompt text.
+    fn invoke(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let name = name.trim_start_matches('/');
+        match name {
+            "interrupt" => self.command(Command::Interrupt),
+            "new" => self.command(Command::New),
+            "fork" => self.command(Command::Fork),
+            _ if self.harness_commands.iter().any(|c| c.name == name) => {
+                let text = if args.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {args}")
+                };
+                self.prompt_text(text)
+            }
+            _ => Err(DriverError::InvalidOption(name.to_owned())),
+        }
+    }
+
     fn set_option(&mut self, id: OptionId, value: String) -> Result<Vec<u8>, DriverError> {
         let route = self
             .opts

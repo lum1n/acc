@@ -54,13 +54,13 @@ fn replay_as_launcher(harness: Harness, out_log: &str) -> (Vec<Event>, Vec<u8>) 
             for ev in d.on_output(piece) {
                 match &ev {
                     Event::SessionStarted { .. } => {
-                        written.extend(d.take_outgoing());
+                        written.extend(d.poll_transmit());
                         written.extend(d.command(Command::Prompt { text: PROMPT.into() }).unwrap());
                     }
                     Event::PermissionRequested {
                         request_id, options, ..
                     } => {
-                        written.extend(d.take_outgoing());
+                        written.extend(d.poll_transmit());
                         written.extend(
                             d.command(Command::AnswerPermission {
                                 request_id: request_id.clone(),
@@ -73,7 +73,7 @@ fn replay_as_launcher(harness: Harness, out_log: &str) -> (Vec<Event>, Vec<u8>) 
                 }
                 events.push(ev);
             }
-            written.extend(d.take_outgoing());
+            written.extend(d.poll_transmit());
         }
     }
     (events, written)
@@ -176,7 +176,7 @@ fn attach_replays_another_clients_log() {
         assert_eq!(states(&events).last(), Some(&RunState::Done), "{harness:?}");
         assert_eq!(events.last(), Some(&Event::TurnCompleted), "{harness:?}");
         assert!(
-            d.take_outgoing().is_empty(),
+            d.poll_transmit().is_empty(),
             "an attached client only listens until asked"
         );
         // The permission was answered by the other client; nothing is pending here.

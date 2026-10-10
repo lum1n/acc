@@ -85,12 +85,15 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
     for input in rx {
         match input {
             Input::Agent(bytes) => {
-                driver.set_now(now_ms());
-                for event in driver.on_output(&bytes) {
+                for mut event in driver.on_output(&bytes) {
+                    // The driver has no clock; stamp state on receipt.
+                    if let acc_core::Event::StateChanged(state) = &mut event {
+                        state.observed_at_ms = now_ms();
+                    }
                     let line = serde_json::to_string(&event).unwrap_or_default();
                     writeln!(stdout, "{line}").map_err(|e| e.to_string())?;
                 }
-                write(&driver.take_outgoing()).map_err(|e| e.to_string())?;
+                write(&driver.poll_transmit()).map_err(|e| e.to_string())?;
             }
             Input::AgentClosed => break,
             Input::User(line) => {

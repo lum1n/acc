@@ -49,7 +49,7 @@ versions. Unknown events are kept as `Event::Unrecognized`, never fatal.
 
 `acc_core::acp::AcpDriver` speaks ACP protocol version 1 (`@agentclientprotocol/sdk` 1.8.0). It
 sends `initialize`, then opens the session itself (`session/new`, or `session/load` / `session/resume`
-for takeover), so transports write `Driver::take_outgoing()` after every `on_output`. Options come from
+for takeover), so transports write `Driver::poll_transmit()` after every `on_output`. Options come from
 the agent's `configOptions` (categories `model`, `mode`, `thought_level`, Copilot's `allow_all`), with the
 legacy `modes`/`models` fields and `session/set_mode`/`session/set_model` as fallback. Cursor's model is a
 spawn flag (`agent --model X acp`), reported as `Apply::Restart`. Slash commands are prompt text, taken
