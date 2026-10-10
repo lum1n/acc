@@ -44,7 +44,21 @@ pub enum Event {
         title: String,
         options: Vec<PermissionOption>,
     },
+    /// A pending request was answered (possibly by another client) or withdrawn.
+    PermissionResolved {
+        request_id: String,
+    },
     Usage(Usage),
+    /// Quota or rate-limit state, only where the harness reports it itself.
+    Quota(Quota),
+    /// The command palette changed; read it again with `Driver::commands`.
+    CommandsChanged,
+    /// Options or their current values changed; read them with `Driver::options`.
+    OptionsChanged,
+    /// Informational text from the harness: warnings, command output, notices.
+    Notice {
+        message: String,
+    },
     TurnCompleted,
     Exited {
         code: Option<i32>,
@@ -82,4 +96,27 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
     pub context_used: Option<u64>,
     pub context_window: Option<u64>,
+}
+
+/// A harness-reported quota snapshot. ACC never fetches quota itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Quota {
+    /// Account the harness reports the quota for, so sessions on one plan share a bar.
+    pub account: Option<String>,
+    pub plan: Option<String>,
+    pub windows: Vec<QuotaWindow>,
+}
+
+/// One rate-limit window, such as Claude's five-hour or Codex's primary window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct QuotaWindow {
+    /// The harness's own name for the window (`five_hour`, `primary`, ...).
+    pub id: String,
+    /// 0–100.
+    pub used_percent: Option<f64>,
+    pub window_minutes: Option<u64>,
+    /// Seconds since the Unix epoch.
+    pub resets_at: Option<u64>,
+    /// Harness status such as `allowed`, `allowed_warning` or `rejected`.
+    pub status: Option<String>,
 }
