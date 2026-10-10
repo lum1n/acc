@@ -57,7 +57,24 @@ session.
 wait for the turn to end (or force), close the TUI, resume headless detached, auto-continue if a turn
 was interrupted. Inside a multiplexer ACC can also co-drive the TUI via the multiplexer's CLI.
 
-## State
+## Multiplexers
+
+`acc_core::multiplexer` drives harnesses running inside tmux, zellij, screen and Rex with the host's
+own binary over SSH exec channels. A `Backend` per multiplexer builds the commands (list panes,
+capture, send text/paste/keys, spawn, kill, watch) and parses their output; nothing is installed.
+
+| | Watch stream | OSC 7501 |
+|---|---|---|
+| tmux 3.2+ | control mode (`tmux -C attach -f ignore-size`), raw `%output` bytes | reports sent without the probe (pi with `PI_PROGRAM_STATUS=1`) |
+| zellij 0.44+ | `zellij subscribe -f json`, rendered lines | no |
+| screen 4.01+ | window log tailed with `tail -F` (best effort) | as tmux |
+| Rex | `rex events --json`, native program-status records | yes, for every harness that emits it |
+
+`multiplexer::tui` turns ACC commands into keystrokes for co-driving a harness TUI in its pane (pi
+fully; prompts, interrupt and common slash commands for Claude and Codex). Approval dialogs in a
+pane still need per-harness screen matching. The Rex backend follows Rex's docs and is unverified
+until Rex ships a server outside the macOS app. Tests drive real tmux, zellij and screen in CI.
+
 
 `RunState` uses OSC 7501's vocabulary (idle, working, blocked{permission,question,auth}, done,
 error) plus `exited`. Observations are ranked by source (`Native` > `Osc7501` > `Transcript` >
