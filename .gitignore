@@ -1,0 +1,4 @@
+/target
+/bindings
+*.swp
+.DS_Store
