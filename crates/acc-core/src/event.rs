@@ -33,6 +33,12 @@ pub enum Event {
         id: ItemId,
         text: String,
     },
+    /// An item changed (status, content, diff) without finishing yet.
+    ItemUpdated {
+        id: ItemId,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        extensions: Value,
+    },
     ItemCompleted {
         id: ItemId,
         #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -45,6 +51,17 @@ pub enum Event {
         options: Vec<PermissionOption>,
     },
     Usage(Usage),
+    /// The command palette changed; read it again with `Driver::commands`.
+    CommandsChanged,
+    /// Options or their allowed values changed; read them with `Driver::options`.
+    OptionsChanged,
+    /// A harness-native update with no common shape yet (plans, notices,
+    /// session titles, extension notifications), passed through for UIs.
+    Native {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        payload: Value,
+    },
     TurnCompleted,
     Exited {
         code: Option<i32>,

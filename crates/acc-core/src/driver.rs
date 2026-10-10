@@ -35,6 +35,14 @@ pub trait Driver: Send {
     /// Feed bytes read from the harness; returns events in order.
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event>;
 
+    /// Bytes the driver needs written that no command asked for: follow-up
+    /// handshake steps (ACP `session/new` after `initialize`) and replies to
+    /// requests from the harness. Transports call this after every
+    /// [`Driver::on_output`] and write whatever it returns. Empty by default.
+    fn take_outgoing(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+
     /// Turn a command into bytes to write to the harness.
     fn command(&mut self, cmd: Command) -> Result<Vec<u8>, DriverError>;
 

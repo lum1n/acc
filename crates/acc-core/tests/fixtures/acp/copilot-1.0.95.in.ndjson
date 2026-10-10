@@ -1,0 +1,4 @@
+{"id":"acc-0","jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"session":{"configOptions":{"boolean":{}}},"terminal":false},"clientInfo":{"name":"acc","title":"Agent Control Core","version":"0.1.0"},"protocolVersion":1}}
+{"id":"acc-1","jsonrpc":"2.0","method":"session/new","params":{"cwd":"/home/v/proj","mcpServers":[]}}
+{"id":"acc-2","jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"Run echo acc-live-test","type":"text"}],"sessionId":"f19e5967-9fcd-479c-bd96-5d9104555862"}}
+{"id":0,"jsonrpc":"2.0","result":{"outcome":{"optionId":"allow_once","outcome":"selected"}}}

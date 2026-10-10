@@ -45,6 +45,19 @@ every protocol is tested by replaying recorded sessions.
 Drivers pin the harness versions they support and fall back to ACP or observe-only for unknown
 versions. Unknown events are kept as `Event::Unrecognized`, never fatal.
 
+### ACP driver (Cursor, Copilot, opencode)
+
+`acc_core::acp::AcpDriver` speaks ACP protocol version 1 (`@agentclientprotocol/sdk` 1.8.0). It
+sends `initialize`, then opens the session itself (`session/new`, or `session/load` / `session/resume`
+for takeover), so transports write `Driver::take_outgoing()` after every `on_output`. Options come from
+the agent's `configOptions` (categories `model`, `mode`, `thought_level`, Copilot's `allow_all`), with the
+legacy `modes`/`models` fields and `session/set_mode`/`session/set_model` as fallback. Cursor's model is a
+spawn flag (`agent --model X acp`), reported as `Apply::Restart`. Slash commands are prompt text, taken
+from `available_commands_update`. Request ids carry a per-client tag, and `Start::Attach` lets a second
+client (or a reconnect) adopt a running agent from its log, reading other clients' responses by shape.
+`acc acp <harness> <cwd>` drives one locally for spikes. Recorded Copilot 1.0.95 and opencode 1.18.35
+sessions under `crates/acc-core/tests/fixtures/acp` are replayed in CI.
+
 ## Daemonless sessions
 
 `acc_core::detached` generates host-side shell scripts: the harness runs under `nohup` with stdin on
