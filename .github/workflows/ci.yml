@@ -56,6 +56,21 @@ jobs:
           tmux -V; screen -v || true; zellij --version
       - run: cargo test -p acc-core --test multiplexers
 
+  # Drives a real OpenSSH server through a proxy that drops connections.
+  ssh:
+    runs-on: ubuntu-latest
+    env:
+      ACC_REQUIRE_SSHD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenSSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+      - run: cargo test -p acc-ssh
+
   ios:
     runs-on: macos-latest
     steps:
@@ -66,6 +81,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p acc-ffi --release --target aarch64-apple-ios
       - run: cargo build -p acc-ffi --release --target aarch64-apple-ios-sim
+      - name: SSH transport builds for iOS
+        run: cargo build -p acc-ssh --release --target aarch64-apple-ios
       - name: Generate Swift bindings
         run: |
           cargo build -p acc-ffi --release
@@ -92,6 +109,7 @@ jobs:
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           cargo ndk -t arm64-v8a -t x86_64 -o jniLibs build -p acc-ffi --release
+          cargo ndk -t arm64-v8a -t x86_64 build -p acc-ssh --release
       - name: Generate Kotlin bindings
         run: |
           cargo build -p acc-ffi --release

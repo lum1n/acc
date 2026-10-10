@@ -3,6 +3,7 @@
 //! exactly what the mobile client does over an SSH exec channel.
 
 mod doctor;
+mod remote;
 mod run;
 
 use std::io::{Read as _, Write as _};
@@ -21,6 +22,11 @@ usage:
   acc run <harness> [cwd] [--resume ID] [--model M] [--program PATH] [--json]
                                         drive a harness headlessly (claude, codex, pi, cursor,
                                         copilot, opencode); type prompts or :help on stdin
+      [--ssh [user@]host[:port] [--identity KEY] [--insecure] [--attach ID]]
+                                        run it detached on a host over SSH, nothing installed
+                                        there; end stdin to detach, --attach to rejoin
+  acc ssh-sessions [user@]host[:port] [--identity KEY] [--insecure] [--stop ID]... [--prune]
+                                        detached sessions on a host; stop one, remove ended ones
   acc sessions <claude|codex|pi> [N]    recent sessions on this machine, with resume commands
   acc harnesses                         detect installed harnesses and versions
   acc osc7501                           read terminal bytes on stdin, print OSC 7501 messages as JSON
@@ -59,6 +65,7 @@ fn main() -> ExitCode {
             (Err(e), _) => or_usage(Err(e)),
             _ => or_usage(Err(USAGE.to_owned())),
         },
+        ["ssh-sessions", dest, rest @ ..] => or_usage(remote::sessions(dest, rest)),
         ["script", rest @ ..] => script(rest),
         ["decode", kind] => decode(kind),
         _ => {

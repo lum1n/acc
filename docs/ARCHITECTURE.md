@@ -21,8 +21,8 @@
  │ detached (FIFO + log scripts)    shell (quoting)                  │
  └──────────────┬──────────────────────────────┬────────────────────┘
                 │ bytes                        │ bytes
-   transports (outside the core): local process · SSH exec channel ·
-   detached FIFO/log · multiplexer pane (tmux control mode, zellij, screen, Rex)
+   transports (outside the core): local process · acc-ssh (SSH exec channel
+   to a detached FIFO/log) · multiplexer pane (tmux control mode, zellij, screen, Rex)
                 │
    bindings: acc-ffi (Swift, Kotlin) · acc-wasm (JS) · acc-cli
 ```
@@ -65,6 +65,27 @@ a FIFO opened read-write (no EOF when a client leaves) and stdout appended to `o
 attach with `tail -c +OFFSET -f` and write through a `mkdir` lock (FIFO writes are only atomic up to
 512 bytes on macOS). Disconnects lose nothing, and several clients (desktop and phone) can share one
 session.
+
+### SSH transport (`acc-ssh`)
+
+`acc-ssh` runs those scripts over SSH with [russh](https://docs.rs/russh) (pure Rust, ring crypto, so
+it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). Three layers:
+
+- `Host`: one connection, dialed lazily and redialed whenever it has dropped. Every script goes
+  through `sh -c`, whatever the login shell (bash, zsh, fish), and launches pick up the `PATH` of the
+  user's interactive login shell so nvm and Homebrew installs are found. Host keys are pinned by
+  SHA-256 fingerprint, read from `known_hosts`, or accepted for trust on first use.
+- `Detached`: the bytes of one session. Reads track the exact log offset and resume there after any
+  reconnect, so nothing is lost or repeated. The follower sends a one-byte heartbeat on stderr every
+  second; a stream silent for longer than `Retry::stall` (a socket iOS froze in the background) is
+  redialed rather than waited out. Writes are uploaded whole into a staging file before they reach the
+  FIFO (a dropped upload never leaves half a JSON line) and carry an id, so a retry after a lost
+  acknowledgement is not delivered twice. When the harness exits, readers drain the log and report
+  the exit code.
+- `Session`: a `Driver` on a `Detached`: `send(Command)` and `next_events()`, writing the driver's
+  `poll_transmit` replies itself. A second client attaches from offset 0 and replays the session.
+
+CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session.
 
 **Takeover** of a session ACC didn't start: find the process, map it to the harness's session id,
 wait for the turn to end (or force), close the TUI, resume headless detached, auto-continue if a turn

@@ -5,10 +5,14 @@
 //! `Command`. Events print as readable lines, or as NDJSON with `--json`.
 //! When stdin ends, ACC waits for the running turn, closes the harness's
 //! stdin and exits, so `echo hi | acc run claude` is a one-shot smoke test.
+//!
+//! With `--ssh`, the harness runs detached on that host instead (see
+//! [`crate::remote`]); ending stdin detaches and leaves it running, and
+//! `--attach` rejoins it later from any machine.
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::process::{ChildStdin, Command as Proc, ExitCode, Stdio};
+use std::process::{Child, ChildStdin, Command as Proc, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -18,6 +22,7 @@ use acc_core::codex::{CodexConfig, CodexDriver};
 use acc_core::command::{Command, OptionId};
 use acc_core::driver::{Driver, DriverError};
 use acc_core::event::ItemKind;
+use acc_core::harness::LaunchSpec;
 use acc_core::pi::PiDriver;
 use acc_core::state::RunState;
 use acc_core::{Event, Harness};
@@ -32,9 +37,12 @@ type a prompt, or one of:
   {\"type\": ...}                      any acc_core Command as JSON
 end input (Ctrl-D) to finish after the current turn";
 
-enum Input {
+pub enum Input {
     Agent(Vec<u8>),
-    AgentClosed,
+    /// The harness's output ended. Remote sessions know the exit code.
+    AgentClosed(Option<Option<i32>>),
+    /// A rejoined session's replay reached the present.
+    CaughtUp,
     User(String),
     UserClosed,
 }
@@ -45,6 +53,8 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
     let mut model = None;
     let mut program = None;
     let mut json = false;
+    let mut ssh = crate::remote::Options::default();
+    let mut attach = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -57,12 +67,36 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
             "--model" => model = Some(value()?),
             "--program" => program = Some(value()?),
             "--json" => json = true,
+            "--ssh" => ssh.dest = value()?,
+            "--identity" => ssh.identity = Some(value()?),
+            "--insecure" => ssh.insecure = true,
+            "--attach" => attach = Some(value()?),
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag:?}")),
             dir => dir.clone_into(&mut cwd),
         }
     }
-    let cwd = std::fs::canonicalize(&cwd).map_err(|e| format!("{cwd}: {e}"))?;
-    let cwd_str = cwd.to_string_lossy().into_owned();
+    let remote = if ssh.dest.is_empty() {
+        if attach.is_some() {
+            return Err("--attach needs --ssh".into());
+        }
+        None
+    } else {
+        Some(crate::remote::Remote::connect(&ssh)?)
+    };
+    // A rejoined session runs where it was started.
+    let rejoin = match (&remote, &attach) {
+        (Some(r), Some(id)) => Some(r.find(id)?),
+        _ => None,
+    };
+    let replay = rejoin.as_ref().map_or(0, |l| l.log_bytes);
+    let cwd_str = match (&remote, rejoin.and_then(|l| l.spec)) {
+        (Some(_), Some(s)) => s.cwd,
+        (Some(r), None) => r.resolve_cwd(&cwd)?,
+        (None, _) => std::fs::canonicalize(&cwd)
+            .map_err(|e| format!("{cwd}: {e}"))?
+            .to_string_lossy()
+            .into_owned(),
+    };
 
     let (mut driver, spec): (Box<dyn Driver>, _) = match harness {
         Harness::Claude => {
@@ -90,9 +124,11 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
             (Box::new(d), spec)
         }
         Harness::Cursor | Harness::Copilot | Harness::Opencode => {
-            let start = match resume.clone() {
-                Some(session_id) => Start::Resume { session_id },
-                None => Start::New,
+            let start = match (&attach, resume.clone()) {
+                // Adopt the running agent from its log instead of opening a session.
+                (Some(_), _) => Start::Attach,
+                (None, Some(session_id)) => Start::Resume { session_id },
+                (None, None) => Start::New,
             };
             let mut cfg = AcpConfig::new(&cwd_str, start);
             cfg.model = model.take();
@@ -103,45 +139,23 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
         }
     };
 
-    let program = program.unwrap_or(spec.program.clone());
-    let mut proc = Proc::new(&program);
-    // Started from inside Claude Code (its Bash tool, `!`), a child Claude
-    // would otherwise adopt the parent's session id.
-    for var in ["CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_REMOTE_SESSION_ID"] {
-        proc.env_remove(var);
-    }
-    let mut child = proc
-        .args(&spec.args)
-        .envs(spec.env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "spawn {program}: {e} (is {} installed? try `acc doctor`)",
-                harness.display_name()
-            )
-        })?;
-    let mut agent_in = Some(child.stdin.take().ok_or("no stdin")?);
-    let mut agent_out = child.stdout.take().ok_or("no stdout")?;
-
     let (tx, rx) = mpsc::channel();
-    let agent_tx = tx.clone();
-    std::thread::spawn(move || {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match agent_out.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if agent_tx.send(Input::Agent(buf[..n].to_vec())).is_err() {
-                        break;
-                    }
-                }
+    let mut link = match remote {
+        Some(r) => {
+            let mut spec = spec;
+            if let Some(p) = program {
+                spec.program = p;
             }
+            Link::Remote(r.start(&spec, &cwd_str, attach.as_deref(), replay, tx.clone())?)
         }
-        let _ = agent_tx.send(Input::AgentClosed);
-    });
+        None => spawn_local(
+            harness,
+            program.unwrap_or(spec.program.clone()),
+            &spec,
+            &cwd_str,
+            tx.clone(),
+        )?,
+    };
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -154,31 +168,41 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
 
     let mut out = Printer::new(harness, json);
     if !json {
+        let verb = if attach.is_some() {
+            "attached to"
+        } else {
+            "started"
+        };
         eprintln!(
-            "acc: started {} in {cwd_str}; :help for commands",
+            "acc: {verb} {} in {cwd_str}; :help for commands",
             harness.display_name()
         );
     }
-    write(&mut agent_in, &driver.handshake())?;
+    // A session being rejoined already had its handshake.
+    if attach.is_none() {
+        link.write(&driver.handshake())?;
+    }
     if let Some(m) = model.filter(|_| harness == Harness::Pi) {
         let cmd = Command::SetOption {
             id: OptionId::Model,
             value: m,
         };
         let bytes = driver.command(cmd).map_err(|e| e.to_string())?;
-        write(&mut agent_in, &bytes)?;
+        link.write(&bytes)?;
     }
 
     // A prompt is in flight until its turn completes; stdin EOF waits for it.
-    let mut busy = false;
+    // While a rejoined session replays its history, input waits for it.
+    let mut busy = attach.is_some();
     let mut eof = false;
     // Commands typed (or piped) before the harness has a session wait here
     // and are sent once `SessionStarted` arrives.
     let mut queued: Vec<Command> = Vec::new();
+    let mut exit = None;
     loop {
-        let input = if agent_in.is_some() {
+        let input = if link.is_open() {
             rx.recv().map_err(|e| e.to_string())?
-        } else {
+        } else if let Link::Local { child, .. } = &mut link {
             // Stdin is closed; give the harness a moment to exit on its own.
             match rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(input) => input,
@@ -187,6 +211,8 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
                     break;
                 }
             }
+        } else {
+            break;
         };
         match input {
             Input::Agent(bytes) => {
@@ -202,44 +228,138 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
                     }
                     out.event(&event, driver.as_ref());
                 }
-                write(&mut agent_in, &driver.poll_transmit())?;
+                link.write(&driver.poll_transmit())?;
                 if started {
                     for cmd in std::mem::take(&mut queued) {
-                        send(driver.as_mut(), cmd, &mut agent_in, &mut queued)?;
+                        send(driver.as_mut(), cmd, &mut link, &mut queued)?;
                     }
                 }
             }
-            Input::AgentClosed => break,
+            Input::AgentClosed(code) => {
+                exit = code;
+                break;
+            }
             Input::User(line) => {
                 if let Some(cmd) = parse_line(&line, driver.as_ref(), &out) {
                     busy |= matches!(cmd, Command::Prompt { .. } | Command::Invoke { .. });
                     if queued.is_empty() {
-                        send(driver.as_mut(), cmd, &mut agent_in, &mut queued)?;
+                        send(driver.as_mut(), cmd, &mut link, &mut queued)?;
                     } else {
                         queued.push(cmd);
                     }
                 }
             }
             Input::UserClosed => eof = true,
+            Input::CaughtUp => busy = false,
         }
         if eof && !busy {
-            agent_in = None;
+            link.close();
         }
     }
-    let status = child.wait().map_err(|e| e.to_string())?;
-    out.event(&Event::Exited { code: status.code() }, driver.as_ref());
+    let code = match (&mut link, exit) {
+        (Link::Local { child, .. }, _) => Some(child.wait().map_err(|e| e.to_string())?.code()),
+        (Link::Remote(_), code) => code,
+    };
+    match (code, &link) {
+        (Some(code), _) => out.event(&Event::Exited { code }, driver.as_ref()),
+        (None, Link::Remote(r)) => eprintln!(
+            "acc: detached; {} keeps running on the host. Rejoin with: acc run {} --ssh {} --attach {}",
+            harness.display_name(),
+            crate::doctor::name(harness),
+            ssh.dest,
+            r.id()
+        ),
+        (None, Link::Local { .. }) => {}
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Where the harness runs.
+enum Link {
+    Local { child: Child, stdin: Option<ChildStdin> },
+    Remote(crate::remote::Link),
+}
+
+impl Link {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Link::Local { stdin, .. } => write(stdin, bytes),
+            Link::Remote(r) if !bytes.is_empty() => r.write(bytes),
+            Link::Remote(_) => Ok(()),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        match self {
+            Link::Local { stdin, .. } => stdin.is_some(),
+            Link::Remote(r) => r.is_open(),
+        }
+    }
+
+    /// Local: closes the harness's stdin so it exits. Remote: detaches.
+    fn close(&mut self) {
+        match self {
+            Link::Local { stdin, .. } => *stdin = None,
+            Link::Remote(r) => r.detach(),
+        }
+    }
+}
+
+/// Starts the harness as a local child process forwarding its output to `tx`.
+fn spawn_local(
+    harness: Harness,
+    program: String,
+    spec: &LaunchSpec,
+    cwd: &str,
+    tx: mpsc::Sender<Input>,
+) -> Result<Link, String> {
+    let mut proc = Proc::new(&program);
+    // Started from inside Claude Code (its Bash tool, `!`), a child Claude
+    // would otherwise adopt the parent's session id.
+    for var in ["CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_REMOTE_SESSION_ID"] {
+        proc.env_remove(var);
+    }
+    let mut child = proc
+        .args(&spec.args)
+        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "spawn {program}: {e} (is {} installed? try `acc doctor`)",
+                harness.display_name()
+            )
+        })?;
+    let stdin = Some(child.stdin.take().ok_or("no stdin")?);
+    let mut agent_out = child.stdout.take().ok_or("no stdout")?;
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match agent_out.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(Input::Agent(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(Input::AgentClosed(None));
+    });
+    Ok(Link::Local { child, stdin })
 }
 
 /// Sends a command, or queues it when the harness has no session yet.
 fn send(
     driver: &mut dyn Driver,
     cmd: Command,
-    agent_in: &mut Option<ChildStdin>,
+    link: &mut Link,
     queued: &mut Vec<Command>,
 ) -> Result<(), String> {
     match driver.command(cmd.clone()) {
-        Ok(bytes) => write(agent_in, &bytes),
+        Ok(bytes) => link.write(&bytes),
         Err(DriverError::NotStarted) => {
             queued.push(cmd);
             Ok(())

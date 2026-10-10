@@ -16,6 +16,7 @@ POSIX tools.
 | Crate | What it is |
 |---|---|
 | `crates/acc-core` | Sans-IO core: harness catalogue, session state model, event stream, commands/options, driver trait, NDJSON and OSC 7501 parsers, detached-session scripts, multiplexer detection |
+| `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections |
 | `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`) |
 | `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node |
 | `crates/acc-cli` | `acc` command-line tool for hosts and spikes |
@@ -58,6 +59,18 @@ Ctrl-D ends the session after the current turn.
 acc run claude ~/project
 echo "Reply with: hello from acc" | acc run claude .    # one-shot smoke test
 acc run codex . --model gpt-5.5 --json
+```
+
+**On another machine, over SSH.** Add `--ssh [user@]host[:port]` and the harness runs detached
+on that host, with nothing installed there. Ending input (Ctrl-D) or losing the connection leaves
+it running; `--attach` rejoins it from any machine and replays what you missed. Keys come from
+`~/.ssh` (or `--identity`), host keys are checked against `~/.ssh/known_hosts`.
+
+```sh
+acc run claude ~/project --ssh me@devbox            # prints the id to rejoin with
+acc ssh-sessions me@devbox                          # detached sessions on that host
+acc run claude --ssh me@devbox --attach <id>        # rejoin, from the laptop or anywhere
+acc ssh-sessions me@devbox --stop <id> --prune      # stop one, clean up ended ones
 ```
 
 **Resume or take over a session.** `acc sessions <claude|codex|pi>` lists recent sessions with
