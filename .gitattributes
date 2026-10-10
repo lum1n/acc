@@ -1,0 +1,2 @@
+# Recorded protocol sessions are byte-exact; keep LF on every platform.
+*.ndjson text eol=lf

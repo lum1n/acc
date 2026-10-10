@@ -7,6 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Commands ACC offers on every harness, whatever the harness supports headlessly.
+///
+/// `Invoke` runs a palette entry from `Driver::commands` by name with free-form
+/// arguments; `Refresh` asks the harness for fresh usage, quota, commands and options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
@@ -20,6 +23,8 @@ pub enum Command {
     Shell { command: String },
     SetOption { id: OptionId, value: String },
     AnswerPermission { request_id: String, option_id: String },
+    Invoke { name: String, args: String },
+    Refresh,
 }
 
 /// How a slash command reaches the harness.
