@@ -97,7 +97,9 @@ it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). 
 - `Host`: one connection, dialed lazily and redialed whenever it has dropped. Every script goes
   through `sh -c`, whatever the login shell (bash, zsh, fish), and launches pick up the `PATH` of the
   user's interactive login shell so nvm and Homebrew installs are found. Host keys are pinned by
-  SHA-256 fingerprint, read from `known_hosts`, or accepted for trust on first use.
+  SHA-256 fingerprint, read from `known_hosts`, or accepted for trust on first use. Logins use a
+  password, a private key, or an SSH agent (keys and certificates, tried in the agent's order; the
+  agent is reached again on every redial).
 - `Detached`: the bytes of one session. Reads track the exact log offset and resume there after any
   reconnect, so nothing is lost or repeated. The follower sends a one-byte heartbeat on stderr every
   second; a stream silent for longer than `Retry::stall` (a socket iOS froze in the background) is

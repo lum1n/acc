@@ -17,7 +17,8 @@ use acc_core::Event;
 use acc_core::command::Command as AccCommand;
 use acc_core::harness::{Harness, LaunchSpec, Protocol};
 use acc_ssh::{
-    Auth, Detached, Error, Host, HostKeyCheck, Read, Retry, Session, SessionConfig, SshConfig, Status,
+    AgentSocket, Auth, Detached, Error, Host, HostKeyCheck, Read, Retry, Session, SessionConfig, SshConfig,
+    Status,
 };
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -184,6 +185,10 @@ fn next(f: Fault) -> u32 {
 }
 
 fn host(sshd: &Sshd, port: u16, check: HostKeyCheck) -> Arc<Host> {
+    host_with(port, check, Auth::key(&sshd.key, None).expect("key"))
+}
+
+fn host_with(port: u16, check: HostKeyCheck, auth: Auth) -> Arc<Host> {
     let user = std::env::var("USER")
         .ok()
         .or_else(|| {
@@ -191,7 +196,7 @@ fn host(sshd: &Sshd, port: u16, check: HostKeyCheck) -> Arc<Host> {
             Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
         })
         .expect("user");
-    let mut config = SshConfig::new("127.0.0.1", user, Auth::key(&sshd.key, None).expect("key"), check);
+    let mut config = SshConfig::new("127.0.0.1", user, auth, check);
     config.port = port;
     config.connect_timeout = Duration::from_secs(5);
     Arc::new(Host::new(config))
@@ -263,6 +268,83 @@ async fn rejects_unknown_host_keys() {
         h.host_key_fingerprint().as_deref(),
         Some(sshd.fingerprint.as_str())
     );
+}
+
+/// An `ssh-agent` on its own socket, killed on drop.
+struct Agent {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Agent {
+    fn start(dir: &Path) -> Self {
+        let socket = dir.join("agent.sock");
+        let child = Command::new(find("ssh-agent").expect("ssh-agent"))
+            .arg("-D")
+            .arg("-a")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn ssh-agent");
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Self { child, socket }
+    }
+
+    fn add(&self, key: &Path) {
+        let ok = Command::new(find("ssh-add").expect("ssh-add"))
+            .arg(key)
+            .env("SSH_AUTH_SOCK", &self.socket)
+            .stderr(Stdio::null())
+            .status()
+            .expect("ssh-add")
+            .success();
+        assert!(ok, "ssh-add {}", key.display());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticates_with_ssh_agent() {
+    let Some(sshd) = start_sshd("agent") else { return };
+    let agent = Agent::start(&sshd.dir);
+    let check = || HostKeyCheck::Fingerprints(vec![sshd.fingerprint.clone()]);
+    let via_agent = |socket: &Path| {
+        host_with(
+            sshd.port,
+            check(),
+            Auth::Agent(AgentSocket::Path(socket.to_owned())),
+        )
+    };
+
+    // An empty agent has nothing to offer.
+    match via_agent(&agent.socket).connect().await {
+        Err(Error::Auth { .. }) => {}
+        other => panic!("expected an auth error, got {other:?}"),
+    }
+    // A missing agent is its own error, not a rejection by the host.
+    match via_agent(&sshd.dir.join("no-agent.sock")).connect().await {
+        Err(Error::Agent(_)) => {}
+        other => panic!("expected an agent error, got {other:?}"),
+    }
+
+    // The host rejects the first key and accepts the second.
+    keygen(&sshd.dir.join("other"));
+    agent.add(&sshd.dir.join("other"));
+    agent.add(&sshd.dir.join("user"));
+    let h = via_agent(&agent.socket);
+    let out = h.exec("echo ok", b"").await.expect("exec").ok().expect("exit 0");
+    assert_eq!(out.stdout_str(), "ok\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -20,6 +20,20 @@ pub enum Auth {
     Password(String),
     /// A decoded private key (see [`Auth::key`]).
     Key(Arc<PrivateKey>),
+    /// The keys and certificates held by an SSH agent (OpenSSH's
+    /// `ssh-agent`, 1Password, Secretive, gpg-agent...), tried in the
+    /// agent's order. The private keys never leave the agent.
+    Agent(AgentSocket),
+}
+
+/// Where to find the SSH agent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AgentSocket {
+    /// `$SSH_AUTH_SOCK` on Unix; OpenSSH's `\\.\pipe\openssh-ssh-agent` on Windows.
+    #[default]
+    Env,
+    /// A Unix socket path, or a named pipe on Windows.
+    Path(std::path::PathBuf),
 }
 
 impl Auth {
@@ -36,6 +50,7 @@ impl fmt::Debug for Auth {
         match self {
             Auth::Password(_) => f.write_str("Password(..)"),
             Auth::Key(k) => write!(f, "Key({})", k.algorithm()),
+            Auth::Agent(socket) => write!(f, "Agent({socket:?})"),
         }
     }
 }
@@ -262,19 +277,20 @@ impl Host {
             Ok(r) => r?,
         };
         let auth = async {
-            match &c.auth {
-                Auth::Password(p) => handle.authenticate_password(&c.user, p).await,
+            Ok::<_, Error>(match &c.auth {
+                Auth::Password(p) => handle.authenticate_password(&c.user, p).await?.success(),
                 Auth::Key(key) => {
                     let hash = handle.best_supported_rsa_hash().await?.flatten();
                     let key = PrivateKeyWithHashAlg::new(key.clone(), hash);
-                    handle.authenticate_publickey(&c.user, key).await
+                    handle.authenticate_publickey(&c.user, key).await?.success()
                 }
-            }
+                Auth::Agent(socket) => crate::agent::authenticate(&mut handle, &c.user, socket).await?,
+            })
         };
-        let auth = timeout(c.connect_timeout, auth)
+        let ok = timeout(c.connect_timeout, auth)
             .await
             .map_err(|_| Error::Timeout)??;
-        if !auth.success() {
+        if !ok {
             return Err(Error::Auth { user: c.user.clone() });
         }
         Ok(handle)

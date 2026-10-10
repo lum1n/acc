@@ -82,7 +82,8 @@ acc run codex . --model gpt-5.5 --json
 **On another machine, over SSH.** Add `--ssh [user@]host[:port]` and the harness runs detached
 on that host, with nothing installed there. Ending input (Ctrl-D) or losing the connection leaves
 it running; `--attach` rejoins it from any machine and replays what you missed. Keys come from
-`~/.ssh` (or `--identity`), host keys are checked against `~/.ssh/known_hosts`.
+the running ssh-agent (`SSH_AUTH_SOCK`), else `~/.ssh`; `--identity` names a key file. Host keys
+are checked against `~/.ssh/known_hosts`.
 
 ```sh
 acc run claude ~/project --ssh me@devbox            # prints the id to rejoin with

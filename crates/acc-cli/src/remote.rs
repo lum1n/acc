@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use acc_core::harness::LaunchSpec;
-use acc_ssh::{Auth, Detached, Host, HostKeyCheck, Read, SshConfig};
+use acc_ssh::{AgentSocket, Auth, Detached, Host, HostKeyCheck, Read, SshConfig};
 use tokio::runtime::Runtime;
 
 use crate::run::Input;
@@ -207,6 +207,10 @@ fn auth(identity: Option<&str>, home: &std::path::Path) -> Result<Auth, String> 
     if let Ok(p) = std::env::var("ACC_SSH_PASSWORD") {
         return Ok(Auth::Password(p));
     }
+    // Like ssh: a running agent is used unless a key file is named.
+    if identity.is_none() && std::env::var_os("SSH_AUTH_SOCK").is_some() {
+        return Ok(Auth::Agent(AgentSocket::Env));
+    }
     let passphrase = std::env::var("ACC_SSH_PASSPHRASE").ok();
     let candidates: Vec<PathBuf> = match identity {
         Some(p) => vec![PathBuf::from(p)],
@@ -218,11 +222,11 @@ fn auth(identity: Option<&str>, home: &std::path::Path) -> Result<Auth, String> 
     };
     let path = candidates
         .first()
-        .ok_or("no key in ~/.ssh (pass --identity, or set ACC_SSH_PASSWORD)")?;
+        .ok_or("no ssh-agent and no key in ~/.ssh (pass --identity, or set ACC_SSH_PASSWORD)")?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     Auth::key(&text, passphrase.as_deref()).map_err(|e| {
         format!(
-            "{}: {e} (encrypted keys need ACC_SSH_PASSPHRASE; ssh-agent is not supported yet)",
+            "{}: {e} (encrypted keys need ACC_SSH_PASSPHRASE, or add the key to ssh-agent)",
             path.display()
         )
     })

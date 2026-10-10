@@ -14,6 +14,9 @@ pub enum Error {
     /// The host presented a key that [`crate::HostKeyCheck`] doesn't trust.
     #[error("untrusted host key {fingerprint}")]
     HostKey { fingerprint: String },
+    /// The SSH agent couldn't be reached or failed to sign.
+    #[error("ssh-agent: {0}")]
+    Agent(String),
     #[error("invalid private key: {0}")]
     Key(String),
     #[error("invalid argument: {0}")]
