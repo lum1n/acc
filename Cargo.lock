@@ -38,7 +38,6 @@ version = "0.1.0"
 dependencies = [
  "acc-core",
  "russh",
- "serde_json",
  "thiserror",
  "tokio",
 ]

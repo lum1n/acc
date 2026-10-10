@@ -10,7 +10,7 @@
 use crate::acp::{AcpConfig, AcpDriver, Start};
 use crate::claude::{self, ClaudeConfig, ClaudeDriver};
 use crate::codex::{self, CodexConfig, CodexDriver};
-use crate::command::{Command, CommandEntry, OptionDef};
+use crate::command::{Command, CommandEntry, OptionDef, OptionId};
 use crate::driver::{Driver, DriverError};
 use crate::event::Event;
 use crate::harness::{Harness, LaunchSpec};
@@ -77,6 +77,9 @@ pub struct Session {
     tracker: StateTracker,
     native_id: Option<String>,
     launch: LaunchSpec,
+    /// A model to select over the protocol at start, for harnesses whose
+    /// launch command doesn't take one (pi).
+    start_model: Option<String>,
 }
 
 impl Session {
@@ -92,6 +95,7 @@ impl Session {
             Opening::Resume { native_id } => Some(native_id.clone()),
             _ => None,
         };
+        let mut start_model = None;
         let (driver, launch) = match harness {
             Harness::Claude => {
                 let d = ClaudeDriver::new(ClaudeConfig {
@@ -114,6 +118,7 @@ impl Session {
             Harness::Pi => {
                 let d = PiDriver::with_id_prefix(&client_tag);
                 let spec = d.launch(resume.as_deref());
+                start_model = model;
                 (AnyDriver::Pi(d), spec)
             }
             Harness::Cursor | Harness::Copilot | Harness::Opencode => {
@@ -138,6 +143,7 @@ impl Session {
             opening,
             tracker: StateTracker::new(DEFAULT_STALE_AFTER_MS),
             launch,
+            start_model,
         }
     }
 
@@ -150,8 +156,8 @@ impl Session {
         &self.launch
     }
 
-    /// Bytes to write once the process is running (handshake and session
-    /// open). Empty when attaching. Call once.
+    /// Bytes to write once the process is running (handshake, session open
+    /// and, for pi, the configured model). Empty when attaching. Call once.
     pub fn start(&mut self) -> Vec<u8> {
         if self.opening == Opening::Attach {
             return Vec::new();
@@ -159,6 +165,16 @@ impl Session {
         let d = self.driver.get_mut();
         let mut out = d.handshake();
         out.extend(d.poll_transmit());
+        if let Some(model) = self.start_model.take() {
+            // pi takes `provider/model`; anything else stays on pi's default.
+            let set = Command::SetOption {
+                id: OptionId::Model,
+                value: model,
+            };
+            if let Ok(bytes) = d.command(set) {
+                out.extend(bytes);
+            }
+        }
         out
     }
 
@@ -363,6 +379,15 @@ mod tests {
         assert!(matches!(events.last(), Some(Event::Exited { code: Some(1) })));
         assert_eq!(s.state().map(|st| &st.state), Some(&RunState::Exited));
         assert_eq!(s.state().map(|st| st.observed_at_ms), Some(7));
+    }
+
+    #[test]
+    fn pi_selects_the_configured_model_at_start() {
+        let mut cfg = SessionConfig::new(Harness::Pi, "/tmp");
+        cfg.model = Some("anthropic/claude-x".into());
+        let start = String::from_utf8(Session::new(cfg).start()).expect("utf8");
+        assert!(start.contains(r#""type":"set_model""#), "{start}");
+        assert!(start.contains(r#""modelId":"claude-x""#), "{start}");
     }
 
     #[test]

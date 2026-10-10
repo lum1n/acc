@@ -14,11 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acc_core::Event;
-use acc_core::command::{Command as AccCommand, CommandEntry, OptionDef};
-use acc_core::driver::{Driver, DriverError};
+use acc_core::command::Command as AccCommand;
 use acc_core::harness::{Harness, LaunchSpec, Protocol};
-use acc_core::ndjson::{Frame, LineFramer};
-use acc_ssh::{Auth, Detached, Error, Host, HostKeyCheck, Read, Retry, Session, SshConfig, Status};
+use acc_ssh::{
+    Auth, Detached, Error, Host, HostKeyCheck, Read, Retry, Session, SessionConfig, SshConfig, Status,
+};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -335,72 +335,48 @@ async fn detached_session_survives_dropped_connections() {
     d.remove().await.expect("remove");
 }
 
-/// Answers each `{"prompt": ...}` line with an `{"echo": ...}` line, so a
-/// shell `sed` can stand in for a harness.
-struct EchoDriver {
-    lines: LineFramer,
-}
-
-impl EchoDriver {
-    fn boxed() -> Box<dyn Driver> {
-        Box::new(Self {
-            lines: LineFramer::new(1 << 20),
-        })
+/// Stands in for Claude Code: replays a recorded session up to its
+/// permission request, waits for the answer on stdin (logging every input
+/// line to `inlog`), then replays the rest.
+fn fake_claude(inlog: &Path) -> LaunchSpec {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../acc-core/tests/fixtures/claude/permission-deny.ndjson");
+    let script = r#"head -n 20 "$1"
+while IFS= read -r l; do printf '%s\n' "$l" >> "$2"; case $l in *ef3cff2f*) break;; esac; done
+tail -n +21 "$1"
+exec cat >> "$2""#;
+    LaunchSpec {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            script.into(),
+            "sh".into(),
+            fixture.display().to_string(),
+            inlog.display().to_string(),
+        ],
+        env: vec![],
+        protocol: Protocol::ClaudeStreamJson,
     }
 }
 
-impl Driver for EchoDriver {
-    fn harness(&self) -> Harness {
-        Harness::Pi
-    }
-
-    fn launch(&self, _resume: Option<&str>) -> LaunchSpec {
-        LaunchSpec {
-            program: "sed".into(),
-            args: vec!["-u".into(), "s/prompt/echo/".into()],
-            env: vec![],
-            protocol: Protocol::PiRpc,
+/// Reads events until one matches `stop`, returning all of them.
+async fn events_until(s: &Session, stop: impl Fn(&Event) -> bool) -> Vec<Event> {
+    let mut seen = Vec::new();
+    loop {
+        let got = timeout(Duration::from_secs(20), s.next_events())
+            .await
+            .expect("timed out")
+            .expect("events");
+        let done = got.iter().any(&stop);
+        seen.extend(got);
+        if done {
+            return seen;
         }
-    }
-
-    fn handshake(&mut self) -> Vec<u8> {
-        b"{\"prompt\":\"hello\"}\n".to_vec()
-    }
-
-    fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
-        self.lines
-            .feed(bytes)
-            .into_iter()
-            .filter_map(|f| match f {
-                Frame::Line(message) => Some(Event::Notice { message }),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn command(&mut self, cmd: AccCommand) -> Result<Vec<u8>, DriverError> {
-        match cmd {
-            AccCommand::Prompt { text } => {
-                Ok(format!("{{\"prompt\":{}}}\n", serde_json::json!(text)).into_bytes())
-            }
-            _ => Err(DriverError::Unsupported {
-                harness: Harness::Pi,
-                what: "anything but prompts",
-            }),
-        }
-    }
-
-    fn commands(&self) -> &[CommandEntry] {
-        &[]
-    }
-
-    fn options(&self) -> &[OptionDef] {
-        &[]
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_drives_a_driver_across_reconnects() {
+async fn session_drives_a_harness_across_reconnects() {
     let Some(sshd) = start_sshd("session") else { return };
     let proxy = Proxy::start(sshd.port).await;
     let h = host(
@@ -409,43 +385,68 @@ async fn session_drives_a_driver_across_reconnects() {
         HostKeyCheck::Fingerprints(vec![sshd.fingerprint.clone()]),
     );
     let id = unique("session");
-    let s = Session::launch(h.clone(), &id, EchoDriver::boxed(), "/tmp", None)
+    let inlog = sshd.dir.join("claude-stdin");
+    let config = SessionConfig::new(Harness::Claude, "/tmp");
+    let mut core = acc_core::session::Session::new(config.clone());
+    let pipe = Detached::launch(h.clone(), &id, &fake_claude(&inlog), "/tmp")
         .await
-        .expect("launch");
-    let next = || async {
-        timeout(Duration::from_secs(20), s.next_events())
-            .await
-            .expect("timed out")
-            .expect("events")
+        .expect("launch")
+        .with_retry(retry());
+    pipe.write(&core.start()).await.expect("handshake");
+    let s = Session::from_parts(pipe, core);
+
+    let seen = events_until(&s, |e| matches!(e, Event::PermissionRequested { .. })).await;
+    let Some(Event::PermissionRequested {
+        request_id, options, ..
+    }) = seen.last()
+    else {
+        panic!("no permission request in {seen:?}");
     };
-    let notice = |text: &str| Event::Notice { message: text.into() };
-    assert_eq!(next().await, vec![notice("{\"echo\":\"hello\"}")]);
+    assert_eq!(
+        s.native_id().as_deref(),
+        Some("5f3c1a52-8a3e-4c1e-9d47-2b6f0e9a7c11")
+    );
+    assert!(!s.commands().is_empty(), "command palette from the handshake");
+    let state = s.state().expect("state");
+    assert!(state.observed_at_ms > 0, "state is stamped with the clock");
 
-    s.send(AccCommand::Prompt { text: "a b".into() })
-        .await
-        .expect("send");
-    assert_eq!(next().await, vec![notice("{\"echo\":\"a b\"}")]);
-
+    // The phone loses its network just before the user answers.
     proxy.cut();
-    s.send(AccCommand::Prompt { text: "after".into() })
-        .await
-        .expect("send after cut");
-    assert_eq!(next().await, vec![notice("{\"echo\":\"after\"}")]);
+    let deny = options
+        .iter()
+        .find(|o| o.id.contains("deny") || o.id.contains("reject"))
+        .expect("deny option");
+    s.send(AccCommand::AnswerPermission {
+        request_id: request_id.clone(),
+        option_id: deny.id.clone(),
+    })
+    .await
+    .expect("answer after cut");
+    events_until(&s, |e| matches!(e, Event::TurnCompleted)).await;
 
-    // A second client replays the whole session into a fresh driver.
-    let other = Session::attach(h.clone(), &id, EchoDriver::boxed(), 0).expect("attach");
-    let mut seen = Vec::new();
-    while seen.len() < 3 {
-        seen.extend(
-            timeout(Duration::from_secs(20), other.next_events())
-                .await
-                .expect("timed out")
-                .expect("events"),
-        );
-    }
-    assert_eq!(seen[2], notice("{\"echo\":\"after\"}"));
+    // A second client replays the whole session into a fresh core.
+    let other = Session::attach(h.clone(), &id, config, 0).expect("attach");
+    let replay = events_until(&other, |e| matches!(e, Event::TurnCompleted)).await;
+    assert!(
+        replay
+            .iter()
+            .any(|e| matches!(e, Event::PermissionRequested { .. }))
+    );
+    assert_eq!(other.native_id(), s.native_id());
 
     s.pipe().stop().await.expect("stop");
-    assert!(matches!(next().await.as_slice(), [Event::Exited { .. }]));
+    let exit = events_until(&s, |e| matches!(e, Event::Exited { .. })).await;
+    assert!(
+        exit.iter()
+            .any(|e| matches!(e, Event::StateChanged(st) if st.state == acc_core::RunState::Exited))
+    );
+    // Later reads only repeat the exit.
+    let again = s.next_events().await.expect("events");
+    assert!(matches!(again.as_slice(), [Event::Exited { .. }]), "{again:?}");
+
+    // The answer reached the harness exactly once, after the handshake.
+    let input = std::fs::read_to_string(&inlog).expect("stdin log");
+    assert!(input.contains("\"initialize\""), "{input}");
+    assert_eq!(input.matches(request_id.as_str()).count(), 1, "{input}");
     s.pipe().remove().await.expect("remove");
 }

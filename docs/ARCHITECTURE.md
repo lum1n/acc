@@ -105,8 +105,10 @@ it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). 
   FIFO (a dropped upload never leaves half a JSON line) and carry an id, so a retry after a lost
   acknowledgement is not delivered twice. When the harness exits, readers drain the log and report
   the exit code.
-- `Session`: a `Driver` on a `Detached`: `send(Command)` and `next_events()`, writing the driver's
-  `poll_transmit` replies itself. A second client attaches from offset 0 and replays the session.
+- `Session`: the core's `acc_core::session::Session` (driver picked by harness, merged state, native
+  session id) on a `Detached`: `send(Command)` and `next_events()`, writing the driver's replies
+  itself and stamping state with the clock. A second client attaches from offset 0 and replays the
+  session into a fresh core.
 
 CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session.
 

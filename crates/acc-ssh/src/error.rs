@@ -16,6 +16,8 @@ pub enum Error {
     HostKey { fingerprint: String },
     #[error("invalid private key: {0}")]
     Key(String),
+    #[error("invalid argument: {0}")]
+    Invalid(&'static str),
     #[error("invalid session id {0:?}")]
     InvalidId(String),
     /// The session's harness is not running (it exited, or never started).
