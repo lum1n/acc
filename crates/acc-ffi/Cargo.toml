@@ -1,0 +1,27 @@
+[package]
+name = "acc-ffi"
+description = "UniFFI bindings (Swift, Kotlin) for acc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "acc_ffi"
+
+[[bin]]
+# Generates Swift/Kotlin sources: `cargo run -p acc-ffi --bin uniffi-bindgen -- generate ...`
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+acc-core.workspace = true
+uniffi.workspace = true
+
+[lints]
+workspace = true
