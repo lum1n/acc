@@ -19,11 +19,14 @@
 //! | [`screen`] | window log tailed with `tail -F` | yes |
 //! | [`rex`] | `rex events --json`, [`rex::parse_event`] | no, but native program status |
 //!
-//! Raw byte streams go through a [`PaneObserver`] for OSC 7501 state. Harness
+//! Raw byte streams go through a [`PaneObserver`] for OSC 7501 state; rendered
+//! screens (captures, zellij viewports) through a [`screen_match::ScreenObserver`]
+//! for what only shows on screen, such as Claude's permission dialogs. Harness
 //! keystrokes for co-driving a TUI live in [`tui`].
 
 pub mod rex;
 pub mod screen;
+pub mod screen_match;
 pub mod tmux;
 pub mod tui;
 pub mod zellij;

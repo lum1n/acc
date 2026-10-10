@@ -802,24 +802,28 @@ impl CodexDriver {
             OptionDef {
                 id: OptionId::Model,
                 values: models,
+                labels: Vec::new(),
                 current: model,
                 apply: Apply::NextTurn,
             },
             OptionDef {
                 id: OptionId::Effort,
                 values: efforts,
+                labels: Vec::new(),
                 current: effort,
                 apply: Apply::NextTurn,
             },
             OptionDef {
                 id: OptionId::Mode,
                 values: self.modes.clone(),
+                labels: Vec::new(),
                 current: mode,
                 apply: Apply::NextTurn,
             },
             OptionDef {
                 id: OptionId::Permission,
                 values: self.profiles.clone(),
+                labels: Vec::new(),
                 current: permission,
                 apply: Apply::NextTurn,
             },

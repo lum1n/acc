@@ -149,6 +149,9 @@ fn recorded_options_and_commands() {
     assert_eq!(perm.current.as_deref(), Some("off"));
     let mode = d.options().iter().find(|o| o.id == OptionId::Mode).unwrap();
     assert_eq!(mode.values.len(), 3);
+    // Copilot's mode values are URLs; show their names.
+    assert!(mode.current.as_deref().unwrap().starts_with("https://"));
+    assert_eq!(mode.current_label(), Some("Agent"));
     assert!(d.commands().iter().any(|c| c.name == "compact"));
     assert_eq!(d.auth_methods()[0].0, "copilot-login");
 
