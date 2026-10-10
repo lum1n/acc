@@ -2,7 +2,8 @@
 //! real hosts. Scripts it prints can be piped to `ssh host sh`, which is
 //! exactly what the mobile client does over an SSH exec channel.
 
-mod acp;
+mod doctor;
+mod run;
 
 use std::io::{Read as _, Write as _};
 use std::process::{Command, ExitCode};
@@ -16,10 +17,12 @@ use acc_core::pi::{PiDriver, Transcript};
 
 const USAGE: &str = "\
 usage:
+  acc doctor                            installed harnesses, multiplexers and session stores
+  acc run <harness> [cwd] [--resume ID] [--model M] [--program PATH] [--json]
+                                        drive a harness headlessly (claude, codex, pi, cursor,
+                                        copilot, opencode); type prompts or :help on stdin
+  acc sessions <claude|codex|pi> [N]    recent sessions on this machine, with resume commands
   acc harnesses                         detect installed harnesses and versions
-  acc acp <harness> <cwd> [--resume ID] [--model M] [--program PATH]
-                                        drive an ACP harness (cursor, copilot, opencode);
-                                        stdin lines are JSON commands or prompt text
   acc osc7501                           read terminal bytes on stdin, print OSC 7501 messages as JSON
   acc script launch <harness> <id> <cwd> [resume-id]
   acc script attach <id> [offset]
@@ -39,18 +42,21 @@ fn main() -> ExitCode {
         ["harnesses"] => harnesses(),
         ["osc7501"] => osc(),
         ["script", "mux", rest @ ..] => mux(rest),
-        ["acp", harness, rest @ ..] => match parse_harness(harness).and_then(|h| {
+        ["doctor"] => doctor::doctor(),
+        ["run", harness, rest @ ..] => or_usage(parse_harness(harness).and_then(|h| run::run(h, rest))),
+        // `acc acp` predates `acc run` and is kept for ACP harnesses.
+        ["acp", harness, rest @ ..] => or_usage(parse_harness(harness).and_then(|h| {
             if h.native_acp() {
-                acp::run(h, rest)
+                run::run(h, rest)
             } else {
                 Err(format!("{} has no native ACP server", h.display_name()))
             }
-        }) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("acc: {e}");
-                ExitCode::from(2)
-            }
+        })),
+        ["sessions", harness, rest @ ..] => match (parse_harness(harness), rest) {
+            (Ok(h), []) => doctor::sessions(h, 20),
+            (Ok(h), [n]) if n.parse::<usize>().is_ok() => doctor::sessions(h, n.parse().unwrap_or(20)),
+            (Err(e), _) => or_usage(Err(e)),
+            _ => or_usage(Err(USAGE.to_owned())),
         },
         ["script", rest @ ..] => script(rest),
         ["decode", kind] => decode(kind),
@@ -59,6 +65,13 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn or_usage(r: Result<ExitCode, String>) -> ExitCode {
+    r.unwrap_or_else(|e| {
+        eprintln!("acc: {e}");
+        ExitCode::from(2)
+    })
 }
 
 fn harnesses() -> ExitCode {
