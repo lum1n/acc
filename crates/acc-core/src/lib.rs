@@ -14,21 +14,28 @@
 //! - [`command`]: canonical commands and harness options.
 //! - [`driver`]: the sans-IO driver trait.
 //! - [`pi`]: the pi driver (`--mode rpc`) and pi transcript reader.
+//! - [`claude`], [`codex`]: drivers for Claude Code stream-json and Codex app-server.
 //! - [`ndjson`], [`osc7501`]: incremental parsers used by drivers and terminals.
 //! - [`detached`]: shell scripts for daemonless, disconnect-proof sessions.
 //! - [`multiplexer`]: locating harnesses inside tmux, zellij, screen and Rex.
+//! - [`acp`]: the Agent Client Protocol driver (Cursor, Copilot, opencode).
 
+pub mod claude;
+pub mod codex;
 pub mod command;
 pub mod detached;
 pub mod driver;
 pub mod event;
 pub mod harness;
+// Harness drivers.
+pub mod acp;
 pub mod multiplexer;
 pub mod ndjson;
 pub mod osc7501;
 pub mod pi;
 pub mod shell;
 pub mod state;
+mod wire;
 
 pub use event::Event;
 pub use harness::Harness;

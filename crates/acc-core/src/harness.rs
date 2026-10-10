@@ -120,11 +120,22 @@ impl Harness {
                     "--output-format",
                     "stream-json",
                     "--verbose",
+                    // Stream text as it is generated, echo prompts so every
+                    // attached client sees them, and route permission prompts
+                    // to ACC as `can_use_tool` control requests.
+                    "--include-partial-messages",
+                    "--replay-user-messages",
+                    "--permission-prompt-tool",
+                    "stdio",
                 ]);
                 if let Some(id) = resume {
                     a.extend(s(&["--resume", id]));
                 }
-                (a, vec![])
+                // Authoritative idle/running/requires_action frames.
+                (
+                    a,
+                    vec![("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into())],
+                )
             }
             Harness::Codex => (s(&["app-server"]), vec![]),
             Harness::Cursor => (s(&["acp"]), vec![]),

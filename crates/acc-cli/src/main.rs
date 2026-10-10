@@ -2,6 +2,8 @@
 //! real hosts. Scripts it prints can be piped to `ssh host sh`, which is
 //! exactly what the mobile client does over an SSH exec channel.
 
+mod acp;
+
 use std::io::{Read as _, Write as _};
 use std::process::{Command, ExitCode};
 
@@ -15,6 +17,9 @@ use acc_core::pi::{PiDriver, Transcript};
 const USAGE: &str = "\
 usage:
   acc harnesses                         detect installed harnesses and versions
+  acc acp <harness> <cwd> [--resume ID] [--model M] [--program PATH]
+                                        drive an ACP harness (cursor, copilot, opencode);
+                                        stdin lines are JSON commands or prompt text
   acc osc7501                           read terminal bytes on stdin, print OSC 7501 messages as JSON
   acc script launch <harness> <id> <cwd> [resume-id]
   acc script attach <id> [offset]
@@ -34,6 +39,19 @@ fn main() -> ExitCode {
         ["harnesses"] => harnesses(),
         ["osc7501"] => osc(),
         ["script", "mux", rest @ ..] => mux(rest),
+        ["acp", harness, rest @ ..] => match parse_harness(harness).and_then(|h| {
+            if h.native_acp() {
+                acp::run(h, rest)
+            } else {
+                Err(format!("{} has no native ACP server", h.display_name()))
+            }
+        }) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("acc: {e}");
+                ExitCode::from(2)
+            }
+        },
         ["script", rest @ ..] => script(rest),
         ["decode", kind] => decode(kind),
         _ => {

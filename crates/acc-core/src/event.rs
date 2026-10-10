@@ -33,6 +33,12 @@ pub enum Event {
         id: ItemId,
         text: String,
     },
+    /// An item changed (status, content, diff) without finishing yet.
+    ItemUpdated {
+        id: ItemId,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        extensions: Value,
+    },
     ItemCompleted {
         id: ItemId,
         #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -66,6 +72,13 @@ pub enum Event {
     /// A frame the driver didn't understand. Kept for debugging and forward-compat.
     Unrecognized {
         raw: String,
+    },
+    /// A harness-native update with no common shape yet (plans, session
+    /// titles, extension notifications), passed through for UIs.
+    Native {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        payload: Value,
     },
 }
 
