@@ -1,11 +1,16 @@
 //! UniFFI surface of acc-core for Swift (iOS/macOS) and Kotlin (Android/JVM).
 //!
-//! Transport-agnostic by design: a [`Session`] turns harness bytes into
-//! events and commands into bytes, and the app moves those bytes over
-//! whatever it has (an SSH channel, a local pipe, a multiplexer pane).
-//! Objects wrap core state behind a `Mutex`, so they can be shared across
-//! threads; calls are short and never block on I/O. Panics are caught by
-//! UniFFI and surfaced as errors instead of crashing the app.
+//! Two ways in:
+//! - Sans-IO: a [`Session`] turns harness bytes into events and commands into
+//!   bytes, and the app moves those bytes over whatever it has. These calls
+//!   are short and never block on I/O.
+//! - With the SSH transport built in ([`remote`]): an [`SshHost`] launches and
+//!   rejoins detached sessions ([`RemoteSession`]) and co-drives harness TUIs
+//!   in tmux, zellij, screen or Rex panes ([`PaneSession`]). These calls are
+//!   `async`/`suspend` and survive dropped connections.
+//!
+//! Objects can be shared across threads. Panics are caught by UniFFI and
+//! surfaced as errors instead of crashing the app.
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -14,8 +19,10 @@ use acc_core::driver::DriverError;
 use acc_core::osc7501::{self, Osc7501};
 use acc_core::session as core_session;
 
+mod remote;
 mod types;
 
+pub use remote::*;
 pub use types::*;
 
 uniffi::setup_scaffolding!();
@@ -72,6 +79,28 @@ pub enum AccError {
     InvalidOption { value: String },
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
+    /// No answer from the host in time. Calling again retries.
+    #[error("timed out talking to the host")]
+    Timeout,
+    /// The connection dropped. Calling again redials.
+    #[error("the connection to the host was lost")]
+    Disconnected,
+    #[error("the host rejected the credentials for {user}")]
+    AuthRejected { user: String },
+    /// The host's key isn't trusted; show the fingerprint to the user.
+    #[error("untrusted host key {fingerprint}")]
+    HostKeyRejected { fingerprint: String },
+    #[error("ssh-agent: {reason}")]
+    Agent { reason: String },
+    #[error("ssh: {reason}")]
+    Ssh { reason: String },
+    /// The detached session's harness is not running.
+    #[error("no harness is running in session {session_id}")]
+    NotRunning { session_id: String },
+    #[error("remote script failed (exit {exit_code:?}): {stderr}")]
+    Remote { exit_code: Option<u32>, stderr: String },
+    #[error("multiplexer: {reason}")]
+    Multiplexer { reason: String },
 }
 
 impl From<DriverError> for AccError {
@@ -124,6 +153,31 @@ pub struct SessionConfig {
     pub client_tag: Option<String>,
 }
 
+fn core_session_config(config: SessionConfig) -> Result<core_session::SessionConfig, AccError> {
+    let tag = config.client_tag.unwrap_or_else(|| "acc".to_owned());
+    let tag_ok = !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !tag_ok {
+        return Err(AccError::InvalidArgument {
+            reason: format!("client tag {tag:?} must be [A-Za-z0-9_-]+"),
+        });
+    }
+    let opening = match config.opening {
+        Opening::New => core_session::Opening::New,
+        Opening::Resume { native_id } => core_session::Opening::Resume { native_id },
+        Opening::Attach => core_session::Opening::Attach,
+    };
+    Ok(core_session::SessionConfig {
+        harness: config.harness.into(),
+        cwd: config.cwd,
+        opening,
+        model: config.model,
+        client_tag: tag,
+    })
+}
+
 /// What one chunk of harness output produced.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Received {
@@ -147,30 +201,8 @@ pub struct Session {
 impl Session {
     #[uniffi::constructor]
     pub fn new(config: SessionConfig) -> Result<Self, AccError> {
-        let tag = config.client_tag.unwrap_or_else(|| "acc".to_owned());
-        let tag_ok = !tag.is_empty()
-            && tag
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-        if !tag_ok {
-            return Err(AccError::InvalidArgument {
-                reason: format!("client tag {tag:?} must be [A-Za-z0-9_-]+"),
-            });
-        }
-        let opening = match config.opening {
-            Opening::New => core_session::Opening::New,
-            Opening::Resume { native_id } => core_session::Opening::Resume { native_id },
-            Opening::Attach => core_session::Opening::Attach,
-        };
-        let session = core_session::Session::new(core_session::SessionConfig {
-            harness: config.harness.into(),
-            cwd: config.cwd,
-            opening,
-            model: config.model,
-            client_tag: tag,
-        });
         Ok(Self {
-            inner: Mutex::new(session),
+            inner: Mutex::new(core_session::Session::new(core_session_config(config)?)),
         })
     }
 

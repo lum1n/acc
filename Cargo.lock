@@ -27,8 +27,10 @@ name = "acc-ffi"
 version = "0.1.0"
 dependencies = [
  "acc-core",
+ "acc-ssh",
  "serde_json",
  "thiserror",
+ "tokio",
  "uniffi",
 ]
 
@@ -38,7 +40,6 @@ version = "0.1.0"
 dependencies = [
  "acc-core",
  "russh",
- "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -180,6 +181,19 @@ dependencies = [
  "serde_derive",
  "unicode-ident",
  "winnow",
+]
+
+[[package]]
+name = "async-compat"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c97d7ff3c25d6c10d64170c12acaf5d4245e76dece3779c1d92b153a64f11df"
+dependencies = [
+ "futures-core",
+ "futures-io",
+ "once_cell",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -2134,6 +2148,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7530ae8efeaaa488622865966763fe0294832779fff80508c36d69c6a874a6a"
 dependencies = [
  "anyhow",
+ "async-compat",
  "bytes",
  "once_cell",
  "static_assertions",

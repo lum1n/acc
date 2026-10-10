@@ -14,8 +14,13 @@ pub enum Error {
     /// The host presented a key that [`crate::HostKeyCheck`] doesn't trust.
     #[error("untrusted host key {fingerprint}")]
     HostKey { fingerprint: String },
+    /// The SSH agent couldn't be reached or failed to sign.
+    #[error("ssh-agent: {0}")]
+    Agent(String),
     #[error("invalid private key: {0}")]
     Key(String),
+    #[error("invalid argument: {0}")]
+    Invalid(&'static str),
     #[error("invalid session id {0:?}")]
     InvalidId(String),
     /// The session's harness is not running (it exited, or never started).
@@ -23,6 +28,9 @@ pub enum Error {
     NotRunning(String),
     #[error("remote script failed (exit {code:?}): {stderr}")]
     Remote { code: Option<u32>, stderr: String },
+    /// A multiplexer can't do this, or printed something unexpected.
+    #[error("multiplexer: {0}")]
+    Mux(String),
     #[error(transparent)]
     Driver(#[from] DriverError),
 }

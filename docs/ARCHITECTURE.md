@@ -81,6 +81,23 @@ Both also expose `TranscriptObserver` (follow a Claude, Codex or pi transcript),
 (the daemonless scripts below), `Osc7501Scanner` and `shell_quote`. CI replays a recorded Claude
 session through the real library from Swift (macOS), Kotlin (JVM), Python and Node.
 
+`acc-ffi` also carries the SSH transport (`acc-ssh`), so a phone app needs nothing else to drive a
+host end to end. These calls do I/O and are `async` in Swift and `suspend` in Kotlin; they run on a
+tokio runtime the library starts on first use (UniFFI's `tokio` support).
+
+- `SshHost(config)`: password, private key or SSH agent; host keys pinned by fingerprint, read from
+  `known_hosts`, or accepted for trust on first use (`hostKeyFingerprint()`). `connect`,
+  `reconnect` (on returning to the foreground), `disconnect`, `exec`.
+- `launchSession` / `attachSession` → `RemoteSession`: the core `Session` on a detached session
+  (`nextEvents`, `send`, `stop`, `state`, `commands`, `options`). `listSessions`, `removeSession`.
+- `listPanes`, `locatePane(pid)`, `spawnPane`, `paneSession` → `PaneSession`: a harness TUI in a
+  tmux, zellij, screen or Rex pane (`nextEvents`, `send`, `sendInput`, `capture`, `exit`, `kill`).
+
+Errors are typed (`Timeout` and `Disconnected` mean calling again retries; `HostKeyRejected` carries
+the fingerprint to show). Kotlin needs `kotlinx-coroutines-core` for the suspend calls. A Rust test
+drives this surface against a real sshd and tmux; the Swift, Kotlin and Python smoke tests call it
+through the generated bindings.
+
 ## Daemonless sessions
 
 `acc_core::detached` generates host-side shell scripts: the harness runs under `nohup` with stdin on
@@ -97,7 +114,9 @@ it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). 
 - `Host`: one connection, dialed lazily and redialed whenever it has dropped. Every script goes
   through `sh -c`, whatever the login shell (bash, zsh, fish), and launches pick up the `PATH` of the
   user's interactive login shell so nvm and Homebrew installs are found. Host keys are pinned by
-  SHA-256 fingerprint, read from `known_hosts`, or accepted for trust on first use.
+  SHA-256 fingerprint, read from `known_hosts`, or accepted for trust on first use. Logins use a
+  password, a private key, or an SSH agent (keys and certificates, tried in the agent's order; the
+  agent is reached again on every redial).
 - `Detached`: the bytes of one session. Reads track the exact log offset and resume there after any
   reconnect, so nothing is lost or repeated. The follower sends a one-byte heartbeat on stderr every
   second; a stream silent for longer than `Retry::stall` (a socket iOS froze in the background) is
@@ -105,10 +124,22 @@ it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). 
   FIFO (a dropped upload never leaves half a JSON line) and carry an id, so a retry after a lost
   acknowledgement is not delivered twice. When the harness exits, readers drain the log and report
   the exit code.
-- `Session`: a `Driver` on a `Detached`: `send(Command)` and `next_events()`, writing the driver's
-  `poll_transmit` replies itself. A second client attaches from offset 0 and replays the session.
+- `Session`: the core's `acc_core::session::Session` (driver picked by harness, merged state, native
+  session id) on a `Detached`: `send(Command)` and `next_events()`, writing the driver's replies
+  itself and stamping state with the clock. A second client attaches from offset 0 and replays the
+  session into a fresh core.
 
-CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session.
+`acc_ssh::pane` runs the multiplexer commands below over the same `Host`: list, locate (from a
+harness PID's environment), spawn and kill panes, and `Pane`, which co-drives a harness TUI. `Pane`
+turns commands into keystrokes (permission answers keyed from the dialog on screen at that moment),
+and its `next_events` streams the multiplexer's watch output for OSC 7501 states, reads the screen
+when the pane draws (at most every `Pacing::min_gap`, at least every `Pacing::idle`), reopens the
+watch after a dropped connection, and reports `Exited` once the pane is gone. A channel that fails
+to open on a connection that died unnoticed is retried once on a fresh one, since the script never
+started; anything that may have run (a keystroke) is never repeated.
+
+CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session, with
+tmux behind it for `Pane`.
 
 **Takeover** of a session ACC didn't start: find the process, map it to the harness's session id,
 wait for the turn to end (or force), close the TUI, resume headless detached, auto-continue if a turn

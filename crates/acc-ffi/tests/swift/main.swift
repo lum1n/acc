@@ -69,4 +69,30 @@ do {
 let status = Osc7501Scanner().feed(bytes: Data("\u{1b}]7501;state=working:progress=40\u{07}".utf8))
 check(status.first?.state == .working && status.first?.progress == 40, "OSC 7501")
 
+// The async SSH surface: a refused connection and a rejected input both
+// come back as typed errors. Nothing listens on port 1 of a CI runner.
+let host = try! SshHost(config: SshConfig(
+    host: "127.0.0.1", port: 1, user: "nobody", auth: .password(password: "x"),
+    hostKey: .acceptAny, connectTimeoutMs: 2_000))
+do {
+    try await host.connect()
+    check(false, "expected a connection error")
+} catch AccError.Ssh, AccError.Disconnected, AccError.Timeout {
+} catch {
+    check(false, "unexpected error \(error)")
+}
+check(host.connections() == 0 && host.hostKeyFingerprint() == nil, "no connection")
+
+let pane = host.paneSession(pane: PaneRef(multiplexer: .tmux, server: "", session: nil, pane: "%0"), harness: .claude)
+check(pane.pane().pane == "%0" && pane.state() == nil, "pane session")
+do {
+    try await pane.sendInput(inputs: [.keys(keys: [.ctrl(letter: "12")])])
+    check(false, "expected an invalid argument")
+} catch AccError.InvalidArgument {
+} catch {
+    check(false, "unexpected error \(error)")
+}
+try! await pane.stopWatching()
+await host.disconnect()
+
 print("ok: Swift drove a recorded Claude session through acc-ffi")

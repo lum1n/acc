@@ -20,6 +20,20 @@ pub enum Auth {
     Password(String),
     /// A decoded private key (see [`Auth::key`]).
     Key(Arc<PrivateKey>),
+    /// The keys and certificates held by an SSH agent (OpenSSH's
+    /// `ssh-agent`, 1Password, Secretive, gpg-agent...), tried in the
+    /// agent's order. The private keys never leave the agent.
+    Agent(AgentSocket),
+}
+
+/// Where to find the SSH agent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AgentSocket {
+    /// `$SSH_AUTH_SOCK` on Unix; OpenSSH's `\\.\pipe\openssh-ssh-agent` on Windows.
+    #[default]
+    Env,
+    /// A Unix socket path, or a named pipe on Windows.
+    Path(std::path::PathBuf),
 }
 
 impl Auth {
@@ -36,6 +50,7 @@ impl fmt::Debug for Auth {
         match self {
             Auth::Password(_) => f.write_str("Password(..)"),
             Auth::Key(k) => write!(f, "Key({})", k.algorithm()),
+            Auth::Agent(socket) => write!(f, "Agent({socket:?})"),
         }
     }
 }
@@ -213,16 +228,17 @@ impl Host {
         }
     }
 
-    async fn conn(&self) -> Result<Conn> {
+    /// The current connection, dialing one if needed; `true` if it was just dialed.
+    async fn conn(&self) -> Result<(Conn, bool)> {
         let mut slot = self.conn.lock().await;
         if let Some(conn) = slot.as_ref().filter(|c| !c.is_closed()) {
-            return Ok(conn.clone());
+            return Ok((conn.clone(), false));
         }
         *slot = None;
         let conn = Arc::new(self.dial().await?);
         self.dials.fetch_add(1, Ordering::Relaxed);
         *slot = Some(conn.clone());
-        Ok(conn)
+        Ok((conn, true))
     }
 
     /// Forgets `conn` if it is still the current one, so the next call redials.
@@ -262,46 +278,54 @@ impl Host {
             Ok(r) => r?,
         };
         let auth = async {
-            match &c.auth {
-                Auth::Password(p) => handle.authenticate_password(&c.user, p).await,
+            Ok::<_, Error>(match &c.auth {
+                Auth::Password(p) => handle.authenticate_password(&c.user, p).await?.success(),
                 Auth::Key(key) => {
                     let hash = handle.best_supported_rsa_hash().await?.flatten();
                     let key = PrivateKeyWithHashAlg::new(key.clone(), hash);
-                    handle.authenticate_publickey(&c.user, key).await
+                    handle.authenticate_publickey(&c.user, key).await?.success()
                 }
-            }
+                Auth::Agent(socket) => crate::agent::authenticate(&mut handle, &c.user, socket).await?,
+            })
         };
-        let auth = timeout(c.connect_timeout, auth)
+        let ok = timeout(c.connect_timeout, auth)
             .await
             .map_err(|_| Error::Timeout)??;
-        if !auth.success() {
+        if !ok {
             return Err(Error::Auth { user: c.user.clone() });
         }
         Ok(handle)
     }
 
+    /// Opens a channel running `script`. A connection that died unnoticed
+    /// (the network changed, the app was suspended) fails before the script
+    /// starts, so that is retried once on a fresh connection.
     async fn channel(&self, script: &str) -> Result<Channel<client::Msg>> {
-        let conn = self.conn().await?;
-        let open = async {
-            let ch = conn.channel_open_session().await?;
-            ch.exec(true, ssh_command(script)).await?;
-            Ok::<_, russh::Error>(ch)
-        };
-        match timeout(self.config.connect_timeout, open).await {
-            Ok(Ok(ch)) => Ok(ch),
-            Ok(Err(e)) => {
-                self.discard(&conn).await;
-                Err(match e {
-                    russh::Error::SendError | russh::Error::Disconnect | russh::Error::IO(_) => {
-                        Error::Disconnected
+        loop {
+            let (conn, fresh) = self.conn().await?;
+            let open = async {
+                let ch = conn.channel_open_session().await?;
+                ch.exec(true, ssh_command(script)).await?;
+                Ok::<_, russh::Error>(ch)
+            };
+            match timeout(self.config.connect_timeout, open).await {
+                Ok(Ok(ch)) => return Ok(ch),
+                Ok(Err(e)) => {
+                    self.discard(&conn).await;
+                    match e {
+                        russh::Error::SendError | russh::Error::Disconnect | russh::Error::IO(_)
+                            if !fresh => {}
+                        russh::Error::SendError | russh::Error::Disconnect | russh::Error::IO(_) => {
+                            return Err(Error::Disconnected);
+                        }
+                        e => return Err(e.into()),
                     }
-                    e => e.into(),
-                })
-            }
-            Err(_) => {
-                // A half-dead connection: don't wait for keepalives to notice.
-                self.discard(&conn).await;
-                Err(Error::Timeout)
+                }
+                Err(_) => {
+                    // A half-dead connection: don't wait for keepalives to notice.
+                    self.discard(&conn).await;
+                    return Err(Error::Timeout);
+                }
             }
         }
     }

@@ -17,7 +17,7 @@ POSIX tools.
 |---|---|
 | `crates/acc-core` | Sans-IO core: harness catalogue, session state model, event stream, commands/options, driver trait, NDJSON and OSC 7501 parsers, detached-session scripts, multiplexer detection |
 | `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections |
-| `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`) |
+| `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`), including SSH sessions and multiplexer panes |
 | `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node |
 | `crates/acc-cli` | `acc` command-line tool for hosts and spikes |
 
@@ -58,6 +58,22 @@ channel.onData { bytes in
 channel.write(try session.send(command: .prompt(text: "hi")))
 ```
 
+Or let the library do the SSH too (pure Rust, nothing installed on the host). Sessions survive the
+phone dropping off the network or being suspended, and any client can rejoin them:
+
+```swift
+let host = try SshHost(config: SshConfig(host: "devbox", port: 22, user: "me",
+    auth: .privateKey(key: pem, passphrase: nil), hostKey: .fingerprints(fingerprints: [pinned])))
+let session = try await host.launchSession(id: "s1", config: SessionConfig(
+    harness: .claude, cwd: "/home/me/project", opening: .new))
+try await session.send(command: .prompt(text: "hi"))
+while true { for event in try await session.nextEvents() { ui.apply(event) } }
+
+// A Claude Code the user started in tmux: read its dialogs, answer them.
+let pane = host.paneSession(pane: info.pane, harness: .claude)   // from listPanes / locatePane
+try await pane.send(command: .answerPermission(requestId: id, optionId: "1"))
+```
+
 ## Try it by hand
 
 Everything below runs in a plain terminal. Install the CLI once:
@@ -82,7 +98,8 @@ acc run codex . --model gpt-5.5 --json
 **On another machine, over SSH.** Add `--ssh [user@]host[:port]` and the harness runs detached
 on that host, with nothing installed there. Ending input (Ctrl-D) or losing the connection leaves
 it running; `--attach` rejoins it from any machine and replays what you missed. Keys come from
-`~/.ssh` (or `--identity`), host keys are checked against `~/.ssh/known_hosts`.
+the running ssh-agent (`SSH_AUTH_SOCK`), else `~/.ssh`; `--identity` names a key file. Host keys
+are checked against `~/.ssh/known_hosts`.
 
 ```sh
 acc run claude ~/project --ssh me@devbox            # prints the id to rejoin with

@@ -14,115 +14,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acc_core::Event;
-use acc_core::command::{Command as AccCommand, CommandEntry, OptionDef};
-use acc_core::driver::{Driver, DriverError};
+use acc_core::command::Command as AccCommand;
 use acc_core::harness::{Harness, LaunchSpec, Protocol};
-use acc_core::ndjson::{Frame, LineFramer};
-use acc_ssh::{Auth, Detached, Error, Host, HostKeyCheck, Read, Retry, Session, SshConfig, Status};
+use acc_core::multiplexer::{Multiplexer, Target};
+use acc_ssh::{
+    AgentSocket, Auth, Detached, Error, Host, HostKeyCheck, Pane, Read, Retry, Session, SessionConfig,
+    SshConfig, Status,
+};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-struct Sshd {
-    dir: PathBuf,
-    port: u16,
-    child: Child,
-    key: String,
-    fingerprint: String,
-}
+#[path = "support/sshd.rs"]
+mod support;
 
-impl Drop for Sshd {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn find(name: &str) -> Option<PathBuf> {
-    [
-        "/usr/sbin",
-        "/usr/bin",
-        "/usr/local/sbin",
-        "/usr/local/bin",
-        "/opt/homebrew/sbin",
-        "/sbin",
-    ]
-    .iter()
-    .map(|d| Path::new(d).join(name))
-    .find(|p| p.exists())
-}
-
-fn keygen(path: &Path) {
-    let ok = Command::new(find("ssh-keygen").expect("ssh-keygen"))
-        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-        .arg(path)
-        .status()
-        .expect("ssh-keygen")
-        .success();
-    assert!(ok);
-}
-
-fn start_sshd(name: &str) -> Option<Sshd> {
-    let (Some(sshd), Some(_)) = (find("sshd"), find("ssh-keygen")) else {
-        assert!(
-            std::env::var_os("ACC_REQUIRE_SSHD").is_none(),
-            "sshd and ssh-keygen are required"
-        );
-        eprintln!("skipping: sshd not installed");
-        return None;
-    };
-    let dir = std::env::temp_dir().join(format!("acc-sshd-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    keygen(&dir.join("host"));
-    keygen(&dir.join("user"));
-    std::fs::copy(dir.join("user.pub"), dir.join("authorized_keys")).expect("authorized_keys");
-    let fp = Command::new(find("ssh-keygen").expect("ssh-keygen"))
-        .arg("-lf")
-        .arg(dir.join("host.pub"))
-        .output()
-        .expect("fingerprint");
-    let fingerprint = String::from_utf8_lossy(&fp.stdout)
-        .split_whitespace()
-        .nth(1)
-        .expect("fingerprint")
-        .to_owned();
-    // Pick a free port.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
-    let config = format!(
-        "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host\nAuthorizedKeysFile {d}/authorized_keys\n\
-         PasswordAuthentication no\nKbdInteractiveAuthentication no\nStrictModes no\nPidFile {d}/pid\n\
-         PermitRootLogin prohibit-password\nLogLevel ERROR\n",
-        d = dir.display()
-    );
-    std::fs::write(dir.join("sshd_config"), config).expect("config");
-    let child = Command::new(sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(dir.join("sshd_config"))
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let key = std::fs::read_to_string(dir.join("user")).expect("key");
-    Some(Sshd {
-        dir,
-        port,
-        child,
-        key,
-        fingerprint,
-    })
-}
+use support::{Sshd, find, keygen, start_sshd};
 
 /// A TCP proxy to sshd. New connections are always accepted; existing ones
 /// can be cut (like a phone switching networks) or frozen (like iOS
@@ -184,14 +91,11 @@ fn next(f: Fault) -> u32 {
 }
 
 fn host(sshd: &Sshd, port: u16, check: HostKeyCheck) -> Arc<Host> {
-    let user = std::env::var("USER")
-        .ok()
-        .or_else(|| {
-            let out = Command::new("id").arg("-un").output().ok()?;
-            Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        })
-        .expect("user");
-    let mut config = SshConfig::new("127.0.0.1", user, Auth::key(&sshd.key, None).expect("key"), check);
+    host_with(port, check, Auth::key(&sshd.key, None).expect("key"))
+}
+
+fn host_with(port: u16, check: HostKeyCheck, auth: Auth) -> Arc<Host> {
+    let mut config = SshConfig::new("127.0.0.1", support::user(), auth, check);
     config.port = port;
     config.connect_timeout = Duration::from_secs(5);
     Arc::new(Host::new(config))
@@ -265,6 +169,83 @@ async fn rejects_unknown_host_keys() {
     );
 }
 
+/// An `ssh-agent` on its own socket, killed on drop.
+struct Agent {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Agent {
+    fn start(dir: &Path) -> Self {
+        let socket = dir.join("agent.sock");
+        let child = Command::new(find("ssh-agent").expect("ssh-agent"))
+            .arg("-D")
+            .arg("-a")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn ssh-agent");
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Self { child, socket }
+    }
+
+    fn add(&self, key: &Path) {
+        let ok = Command::new(find("ssh-add").expect("ssh-add"))
+            .arg(key)
+            .env("SSH_AUTH_SOCK", &self.socket)
+            .stderr(Stdio::null())
+            .status()
+            .expect("ssh-add")
+            .success();
+        assert!(ok, "ssh-add {}", key.display());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticates_with_ssh_agent() {
+    let Some(sshd) = start_sshd("agent") else { return };
+    let agent = Agent::start(&sshd.dir);
+    let check = || HostKeyCheck::Fingerprints(vec![sshd.fingerprint.clone()]);
+    let via_agent = |socket: &Path| {
+        host_with(
+            sshd.port,
+            check(),
+            Auth::Agent(AgentSocket::Path(socket.to_owned())),
+        )
+    };
+
+    // An empty agent has nothing to offer.
+    match via_agent(&agent.socket).connect().await {
+        Err(Error::Auth { .. }) => {}
+        other => panic!("expected an auth error, got {other:?}"),
+    }
+    // A missing agent is its own error, not a rejection by the host.
+    match via_agent(&sshd.dir.join("no-agent.sock")).connect().await {
+        Err(Error::Agent(_)) => {}
+        other => panic!("expected an agent error, got {other:?}"),
+    }
+
+    // The host rejects the first key and accepts the second.
+    keygen(&sshd.dir.join("other"));
+    agent.add(&sshd.dir.join("other"));
+    agent.add(&sshd.dir.join("user"));
+    let h = via_agent(&agent.socket);
+    let out = h.exec("echo ok", b"").await.expect("exec").ok().expect("exit 0");
+    assert_eq!(out.stdout_str(), "ok\n");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_session_survives_dropped_connections() {
     let Some(sshd) = start_sshd("drop") else { return };
@@ -335,72 +316,48 @@ async fn detached_session_survives_dropped_connections() {
     d.remove().await.expect("remove");
 }
 
-/// Answers each `{"prompt": ...}` line with an `{"echo": ...}` line, so a
-/// shell `sed` can stand in for a harness.
-struct EchoDriver {
-    lines: LineFramer,
-}
-
-impl EchoDriver {
-    fn boxed() -> Box<dyn Driver> {
-        Box::new(Self {
-            lines: LineFramer::new(1 << 20),
-        })
+/// Stands in for Claude Code: replays a recorded session up to its
+/// permission request, waits for the answer on stdin (logging every input
+/// line to `inlog`), then replays the rest.
+fn fake_claude(inlog: &Path) -> LaunchSpec {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../acc-core/tests/fixtures/claude/permission-deny.ndjson");
+    let script = r#"head -n 20 "$1"
+while IFS= read -r l; do printf '%s\n' "$l" >> "$2"; case $l in *ef3cff2f*) break;; esac; done
+tail -n +21 "$1"
+exec cat >> "$2""#;
+    LaunchSpec {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            script.into(),
+            "sh".into(),
+            fixture.display().to_string(),
+            inlog.display().to_string(),
+        ],
+        env: vec![],
+        protocol: Protocol::ClaudeStreamJson,
     }
 }
 
-impl Driver for EchoDriver {
-    fn harness(&self) -> Harness {
-        Harness::Pi
-    }
-
-    fn launch(&self, _resume: Option<&str>) -> LaunchSpec {
-        LaunchSpec {
-            program: "sed".into(),
-            args: vec!["-u".into(), "s/prompt/echo/".into()],
-            env: vec![],
-            protocol: Protocol::PiRpc,
+/// Reads events until one matches `stop`, returning all of them.
+async fn events_until(s: &Session, stop: impl Fn(&Event) -> bool) -> Vec<Event> {
+    let mut seen = Vec::new();
+    loop {
+        let got = timeout(Duration::from_secs(20), s.next_events())
+            .await
+            .expect("timed out")
+            .expect("events");
+        let done = got.iter().any(&stop);
+        seen.extend(got);
+        if done {
+            return seen;
         }
-    }
-
-    fn handshake(&mut self) -> Vec<u8> {
-        b"{\"prompt\":\"hello\"}\n".to_vec()
-    }
-
-    fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
-        self.lines
-            .feed(bytes)
-            .into_iter()
-            .filter_map(|f| match f {
-                Frame::Line(message) => Some(Event::Notice { message }),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn command(&mut self, cmd: AccCommand) -> Result<Vec<u8>, DriverError> {
-        match cmd {
-            AccCommand::Prompt { text } => {
-                Ok(format!("{{\"prompt\":{}}}\n", serde_json::json!(text)).into_bytes())
-            }
-            _ => Err(DriverError::Unsupported {
-                harness: Harness::Pi,
-                what: "anything but prompts",
-            }),
-        }
-    }
-
-    fn commands(&self) -> &[CommandEntry] {
-        &[]
-    }
-
-    fn options(&self) -> &[OptionDef] {
-        &[]
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_drives_a_driver_across_reconnects() {
+async fn session_drives_a_harness_across_reconnects() {
     let Some(sshd) = start_sshd("session") else { return };
     let proxy = Proxy::start(sshd.port).await;
     let h = host(
@@ -409,43 +366,201 @@ async fn session_drives_a_driver_across_reconnects() {
         HostKeyCheck::Fingerprints(vec![sshd.fingerprint.clone()]),
     );
     let id = unique("session");
-    let s = Session::launch(h.clone(), &id, EchoDriver::boxed(), "/tmp", None)
+    let inlog = sshd.dir.join("claude-stdin");
+    let config = SessionConfig::new(Harness::Claude, "/tmp");
+    let mut core = acc_core::session::Session::new(config.clone());
+    let pipe = Detached::launch(h.clone(), &id, &fake_claude(&inlog), "/tmp")
         .await
-        .expect("launch");
+        .expect("launch")
+        .with_retry(retry());
+    pipe.write(&core.start()).await.expect("handshake");
+    let s = Session::from_parts(pipe, core);
+
+    let seen = events_until(&s, |e| matches!(e, Event::PermissionRequested { .. })).await;
+    let Some(Event::PermissionRequested {
+        request_id, options, ..
+    }) = seen.last()
+    else {
+        panic!("no permission request in {seen:?}");
+    };
+    assert_eq!(
+        s.native_id().as_deref(),
+        Some("5f3c1a52-8a3e-4c1e-9d47-2b6f0e9a7c11")
+    );
+    assert!(!s.commands().is_empty(), "command palette from the handshake");
+    let state = s.state().expect("state");
+    assert!(state.observed_at_ms > 0, "state is stamped with the clock");
+
+    // The phone loses its network just before the user answers.
+    proxy.cut();
+    let deny = options
+        .iter()
+        .find(|o| o.id.contains("deny") || o.id.contains("reject"))
+        .expect("deny option");
+    s.send(AccCommand::AnswerPermission {
+        request_id: request_id.clone(),
+        option_id: deny.id.clone(),
+    })
+    .await
+    .expect("answer after cut");
+    events_until(&s, |e| matches!(e, Event::TurnCompleted)).await;
+
+    // A second client replays the whole session into a fresh core.
+    let other = Session::attach(h.clone(), &id, config, 0).expect("attach");
+    let replay = events_until(&other, |e| matches!(e, Event::TurnCompleted)).await;
+    assert!(
+        replay
+            .iter()
+            .any(|e| matches!(e, Event::PermissionRequested { .. }))
+    );
+    assert_eq!(other.native_id(), s.native_id());
+
+    s.pipe().stop().await.expect("stop");
+    let exit = events_until(&s, |e| matches!(e, Event::Exited { .. })).await;
+    assert!(
+        exit.iter()
+            .any(|e| matches!(e, Event::StateChanged(st) if st.state == acc_core::RunState::Exited))
+    );
+    // Later reads only repeat the exit.
+    let again = s.next_events().await.expect("events");
+    assert!(matches!(again.as_slice(), [Event::Exited { .. }]), "{again:?}");
+
+    // The answer reached the harness exactly once, after the handshake.
+    let input = std::fs::read_to_string(&inlog).expect("stdin log");
+    assert!(input.contains("\"initialize\""), "{input}");
+    assert_eq!(input.matches(request_id.as_str()).count(), 1, "{input}");
+    s.pipe().remove().await.expect("remove");
+}
+
+/// Stands in for Claude Code's TUI: once the pane is wide enough, shows a
+/// recorded permission dialog and waits for one key, which it saves to
+/// `answer`. A moment later it reports working over OSC 7501 and shows the
+/// recorded working screen.
+fn fake_claude_tui(answer: &Path) -> acc_core::multiplexer::Program {
+    let screens = Path::new(env!("CARGO_MANIFEST_DIR")).join("../acc-core/tests/fixtures/screens");
+    let script = r#"while [ "$(stty size | cut -d' ' -f2)" -lt 120 ]; do sleep 0.1; done
+stty -icanon -echo min 1
+cat "$1/claude-permission-bash.txt"
+dd bs=1 count=1 of="$2" 2>/dev/null
+sleep 1
+printf '\033[2J\033[H\033]7501;state=working\033\\'
+cat "$1/claude-working.txt"
+exec cat >/dev/null"#;
+    acc_core::multiplexer::Program {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            script.into(),
+            "sh".into(),
+            screens.display().to_string(),
+            answer.display().to_string(),
+        ],
+        env: vec![],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn co_drives_a_tui_in_a_tmux_pane() {
+    if !Path::new("/usr/bin/tmux").exists() && !Path::new("/opt/homebrew/bin/tmux").exists() {
+        assert!(std::env::var_os("ACC_REQUIRE_MUX").is_none(), "tmux is required");
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let Some(sshd) = start_sshd("tmux") else { return };
+    let proxy = Proxy::start(sshd.port).await;
+    let h = host(
+        &sshd,
+        proxy.port,
+        HostKeyCheck::Fingerprints(vec![sshd.fingerprint.clone()]),
+    );
+    let target = Target {
+        multiplexer: Multiplexer::Tmux,
+        server: sshd.dir.join("tmux.sock").display().to_string(),
+        session: None,
+    };
+    let answer = sshd.dir.join("answer");
+    let pane_ref = acc_ssh::pane::spawn(&h, &target, &fake_claude_tui(&answer), "/tmp", "acc-test")
+        .await
+        .expect("spawn");
+    h.exec(
+        &format!(
+            "tmux -S {} resize-window -t {} -x 160 -y 50",
+            target.server, pane_ref.pane
+        ),
+        b"",
+    )
+    .await
+    .expect("resize")
+    .ok()
+    .expect("resize ok");
+    let listed = acc_ssh::pane::list_panes(&h, &target).await.expect("list");
+    assert!(listed.iter().any(|p| p.pane == pane_ref), "{listed:?}");
+
+    let pane = Pane::new(h.clone(), pane_ref.clone(), Harness::Claude).with_pacing(acc_ssh::pane::Pacing {
+        min_gap: Duration::from_millis(100),
+        idle: Duration::from_millis(500),
+    });
     let next = || async {
-        timeout(Duration::from_secs(20), s.next_events())
+        timeout(Duration::from_secs(20), pane.next_events())
             .await
             .expect("timed out")
             .expect("events")
     };
-    let notice = |text: &str| Event::Notice { message: text.into() };
-    assert_eq!(next().await, vec![notice("{\"echo\":\"hello\"}")]);
-
-    s.send(AccCommand::Prompt { text: "a b".into() })
-        .await
-        .expect("send");
-    assert_eq!(next().await, vec![notice("{\"echo\":\"a b\"}")]);
-
-    proxy.cut();
-    s.send(AccCommand::Prompt { text: "after".into() })
-        .await
-        .expect("send after cut");
-    assert_eq!(next().await, vec![notice("{\"echo\":\"after\"}")]);
-
-    // A second client replays the whole session into a fresh driver.
-    let other = Session::attach(h.clone(), &id, EchoDriver::boxed(), 0).expect("attach");
     let mut seen = Vec::new();
-    while seen.len() < 3 {
-        seen.extend(
-            timeout(Duration::from_secs(20), other.next_events())
-                .await
-                .expect("timed out")
-                .expect("events"),
-        );
-    }
-    assert_eq!(seen[2], notice("{\"echo\":\"after\"}"));
+    let request = loop {
+        let got = next().await;
+        if let Some(Event::PermissionRequested { request_id, .. }) = got
+            .iter()
+            .find(|e| matches!(e, Event::PermissionRequested { .. }))
+        {
+            break request_id.clone();
+        }
+        seen.extend(got);
+    };
+    assert!(matches!(
+        pane.state().map(|s| s.state),
+        Some(acc_core::RunState::Blocked { .. })
+    ));
 
-    s.pipe().stop().await.expect("stop");
-    assert!(matches!(next().await.as_slice(), [Event::Exited { .. }]));
-    s.pipe().remove().await.expect("remove");
+    // The phone drops off the network; the answer still lands.
+    proxy.cut();
+    pane.send(AccCommand::AnswerPermission {
+        request_id: request.clone(),
+        option_id: "1".into(),
+    })
+    .await
+    .expect("answer");
+    let mut osc = false;
+    let mut resolved = false;
+    while !(osc && resolved) {
+        for e in next().await {
+            match e {
+                Event::StateChanged(s)
+                    if s.source == acc_core::StateSource::Osc7501
+                        && matches!(s.state, acc_core::RunState::Working { .. }) =>
+                {
+                    osc = true;
+                }
+                Event::PermissionResolved { request_id } if request_id == request => resolved = true,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&answer).expect("answer"), "1");
+
+    // A dialog that's gone can't be answered.
+    let stale = pane
+        .send(AccCommand::AnswerPermission {
+            request_id: request,
+            option_id: "1".into(),
+        })
+        .await;
+    assert!(matches!(stale, Err(Error::Driver(_))), "{stale:?}");
+
+    pane.kill().await.expect("kill");
+    let exit = next().await;
+    assert!(matches!(exit.as_slice(), [.., Event::Exited { .. }]), "{exit:?}");
+    let _ = h
+        .exec(&format!("tmux -S {} kill-server", target.server), b"")
+        .await;
 }
