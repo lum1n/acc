@@ -1,0 +1,18 @@
+[package]
+name = "acc-cli"
+description = "acc command-line tool for hosts and spikes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "acc"
+path = "src/main.rs"
+
+[dependencies]
+acc-core = { workspace = true, features = ["host"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
