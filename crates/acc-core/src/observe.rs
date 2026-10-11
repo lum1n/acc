@@ -23,9 +23,28 @@ use crate::transcript::Transcript;
 
 /// After this long without news, a lower-fidelity state source may override.
 const STALE_MS: u64 = 30_000;
-/// An outstanding tool call this quiet in a live TUI is most likely waiting
-/// on the user's approval.
+/// An outstanding tool call this quiet in a live TUI may be waiting on the
+/// user: the transcript doesn't record approval dialogs.
 const PROMPT_QUIET_MS: u64 = 4_000;
+/// Claude tools that never ask for approval, so a quiet one is just running.
+const CLAUDE_UNPROMPTED: &[&str] = &[
+    "Agent",
+    "Task",
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "TodoWrite",
+    "TodoRead",
+    "NotebookRead",
+    "BashOutput",
+    "KillShell",
+    "KillBash",
+    "TaskOutput",
+    "TaskStop",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+];
 
 #[derive(Debug)]
 enum Reader {
@@ -50,6 +69,24 @@ impl Reader {
             Reader::Codex(_) => 0,
         }
     }
+
+    /// What the outstanding tool calls may be waiting on, and whether that is
+    /// certain from the transcript alone (`false`: only the screen can tell
+    /// a dialog from a slow tool).
+    fn waiting_on(&self, bypass: bool) -> Option<(BlockKind, bool)> {
+        // pi has no approvals; Codex records its own.
+        let Reader::Claude(o) = self else { return None };
+        let mut maybe = false;
+        for name in o.pending_tool_names() {
+            match name {
+                "AskUserQuestion" => return Some((BlockKind::Question, true)),
+                "ExitPlanMode" => return Some((BlockKind::Permission, true)),
+                n if bypass || CLAUDE_UNPROMPTED.contains(&n) => {}
+                _ => maybe = true,
+            }
+        }
+        maybe.then_some((BlockKind::Permission, false))
+    }
 }
 
 /// A foreign harness, followed through its transcript.
@@ -67,6 +104,9 @@ pub struct Observed {
     native_id: Option<String>,
     alive: bool,
     last_news_ms: u64,
+    /// The current block was inferred rather than read, so news from the
+    /// transcript ends it.
+    inferred_block: bool,
 }
 
 impl Observed {
@@ -89,6 +129,7 @@ impl Observed {
             title: None,
             alive: true,
             last_news_ms: 0,
+            inferred_block: false,
             agent,
         }
     }
@@ -168,15 +209,30 @@ impl Observed {
         };
         let replay = self.offset < self.replay_until;
         self.offset += bytes.len() as u64;
-        let events = reader.feed(bytes);
+        let mut events = reader.feed(bytes);
         if !events.is_empty() {
             self.last_news_ms = now_ms;
+        }
+        // The transcript moved on (a result, more output), so whatever the
+        // inferred block was waiting on was answered. The reader doesn't
+        // repeat a state it already reported, so say it here.
+        if self.inferred_block
+            && events.iter().any(|e| {
+                matches!(
+                    e,
+                    Event::ItemStarted { .. } | Event::ItemCompleted { .. } | Event::StateChanged(_)
+                )
+            })
+        {
+            self.inferred_block = false;
+            events.insert(0, Event::StateChanged(working(now_ms)));
         }
         let mut out = Vec::new();
         for mut event in events {
             match &mut event {
                 Event::StateChanged(s) => {
                     s.observed_at_ms = now_ms;
+                    self.inferred_block = false;
                     if !self.tracker.observe(s.clone()) {
                         continue;
                     }
@@ -208,13 +264,42 @@ impl Observed {
         out
     }
 
-    /// Periodic check with whether the process still runs. Infers a waiting
-    /// approval from a quiet outstanding tool call, and the end of the
-    /// session from the process going away.
-    pub fn tick(&mut self, now_ms: u64, process_alive: bool) -> Vec<Update> {
+    /// Whether the process runs with Claude's permission checks off.
+    fn bypasses_permissions(&self) -> bool {
+        let args = &self.agent.args;
+        args.contains("--dangerously-skip-permissions")
+            || args.contains("--permission-mode bypassPermissions")
+            || args.contains("--permission-mode=bypassPermissions")
+    }
+
+    /// A quiet outstanding tool call and what it may be waiting on.
+    fn quiet_wait(&self, now_ms: u64) -> Option<(BlockKind, bool)> {
+        if now_ms.saturating_sub(self.last_news_ms) < PROMPT_QUIET_MS {
+            return None;
+        }
+        self.reader.as_ref()?.waiting_on(self.bypasses_permissions())
+    }
+
+    /// A capture of the TUI's pane for the next [`Observed::tick`], when only
+    /// the screen can tell whether it waits on the user: a quiet tool call
+    /// that may be behind an approval dialog, or an inferred block that may
+    /// have been answered.
+    pub fn screen_exec(&self, now_ms: u64) -> Option<Exec> {
+        let pane = self.agent.pane.as_ref()?;
+        let check = self.inferred_block || matches!(self.quiet_wait(now_ms), Some((_, false)));
+        (self.alive && check).then(|| multiplexer::backend(pane.multiplexer).capture(pane, false))
+    }
+
+    /// Periodic check with whether the process still runs and, when
+    /// [`Observed::screen_exec`] asked for one, the captured screen. Infers
+    /// a waiting approval or question from a quiet outstanding tool call
+    /// (confirmed on screen where there is one), and the end of the session
+    /// from the process going away.
+    pub fn tick(&mut self, now_ms: u64, process_alive: bool, screen: Option<&str>) -> Vec<Update> {
         let mut events = Vec::new();
         if !process_alive && self.alive {
             self.alive = false;
+            self.inferred_block = false;
             events.push(Event::Exited { code: None });
             events.push(Event::StateChanged(SessionState {
                 state: RunState::Exited,
@@ -222,24 +307,42 @@ impl Observed {
                 source: StateSource::Native,
                 observed_at_ms: now_ms,
             }));
-        } else if process_alive
-            && self.reader.as_ref().is_some_and(|r| r.pending_tools() > 0)
-            && now_ms.saturating_sub(self.last_news_ms) >= PROMPT_QUIET_MS
-            && !matches!(
+        } else if process_alive {
+            let on_screen = |kind| match (&self.agent.pane, screen) {
+                (Some(_), Some(text)) => Some(tui::shows_approval(self.agent.harness, text).then_some(kind)),
+                // No capture this time: no news either way.
+                (Some(_), None) => None,
+                // Nothing to look at; the quiet call is the best guess.
+                (None, _) => Some(Some(kind)),
+            };
+            let waiting = match self.quiet_wait(now_ms) {
+                Some((kind, true)) => Some(Some(kind)),
+                Some((kind, false)) => on_screen(kind),
+                None => Some(None),
+            };
+            let blocked = matches!(
                 self.tracker.current().map(|s| &s.state),
                 Some(RunState::Blocked { .. })
-            )
-        {
-            events.push(Event::StateChanged(SessionState {
-                state: RunState::Blocked {
-                    kind: BlockKind::Permission,
-                },
-                message: Some("Waiting in the terminal".into()),
-                // Inferred from the transcript (an unanswered tool call) and
-                // its silence, so it ranks with transcript observations.
-                source: StateSource::Transcript,
-                observed_at_ms: now_ms,
-            }));
+            );
+            match waiting {
+                Some(Some(kind)) if !blocked => {
+                    self.inferred_block = true;
+                    events.push(Event::StateChanged(SessionState {
+                        state: RunState::Blocked { kind },
+                        message: Some("Waiting in the terminal".into()),
+                        // Inferred from the transcript (an unanswered tool call)
+                        // and its silence, so it ranks with transcript observations.
+                        source: StateSource::Transcript,
+                        observed_at_ms: now_ms,
+                    }));
+                }
+                // The dialog went away (approved a slow command, say).
+                Some(None) if self.inferred_block => {
+                    self.inferred_block = false;
+                    events.push(Event::StateChanged(working(now_ms)));
+                }
+                _ => {}
+            }
         }
         let mut out = Vec::new();
         for event in events {
@@ -281,6 +384,15 @@ impl Observed {
             .iter()
             .map(|i: &Input| backend.send(pane, i))
             .collect())
+    }
+}
+
+fn working(now_ms: u64) -> SessionState {
+    SessionState {
+        state: RunState::Working { progress: None },
+        message: None,
+        source: StateSource::Transcript,
+        observed_at_ms: now_ms,
     }
 }
 
@@ -335,23 +447,108 @@ mod tests {
         assert_eq!(o.feed_entry().unwrap().offset, CLAUDE.len() as u64);
     }
 
-    #[test]
-    fn quiet_tool_call_reads_as_waiting_and_exit_ends_it() {
-        let cut: String = CLAUDE
+    /// The fixture up to its Bash call's result: a call left outstanding.
+    fn until_tool_result() -> String {
+        CLAUDE
             .lines()
             .take_while(|l| !l.contains("\"tool_result\""))
             .map(|l| format!("{l}\n"))
-            .collect();
+            .collect()
+    }
+
+    fn tool_result() -> String {
+        CLAUDE
+            .lines()
+            .find(|l| l.contains("\"tool_result\""))
+            .map(|l| format!("{l}\n"))
+            .unwrap()
+    }
+
+    fn blocked(ups: &[Update]) -> bool {
+        ups.iter().any(|u| {
+            matches!(&u.event, Event::StateChanged(s)
+                if s.state == RunState::Blocked { kind: BlockKind::Permission } && s.source == StateSource::Transcript)
+        })
+    }
+
+    fn working(ups: &[Update]) -> bool {
+        ups.iter().any(
+            |u| matches!(&u.event, Event::StateChanged(s) if s.state == RunState::Working { progress: None }),
+        )
+    }
+
+    const DIALOG: &str = " Bash command\n   ls\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n";
+    const RUNNING: &str = "● Bash(ls)\n  ⎿  Running…\n\n> \n";
+
+    #[test]
+    fn slow_tool_in_a_pane_is_not_an_approval() {
         let mut o = Observed::new(agent(0));
-        o.feed(cut.as_bytes(), 1_000);
+        o.feed(until_tool_result().as_bytes(), 1_000);
         assert!(!o.at_safe_point());
-        assert!(o.tick(2_000, true).is_empty());
-        let ups = o.tick(6_000, true);
-        assert!(matches!(&ups[0].event, Event::StateChanged(s)
-            if s.state == RunState::Blocked { kind: BlockKind::Permission } && s.source == StateSource::Transcript));
-        let ups = o.tick(7_000, false);
+        assert!(o.screen_exec(2_000).is_none());
+        assert!(o.tick(2_000, true, None).is_empty());
+        let exec = o.screen_exec(6_000).unwrap();
+        assert!(exec.script.contains("capture-pane"));
+        assert!(o.tick(6_000, true, Some(RUNNING)).is_empty());
+        // No capture is no news.
+        assert!(o.tick(7_000, true, None).is_empty());
+        let ups = o.tick(8_000, true, Some(DIALOG));
+        assert!(blocked(&ups));
+        // Approved: the command runs on with the dialog gone.
+        assert!(o.screen_exec(9_000).is_some());
+        assert!(working(&o.tick(9_000, true, Some(RUNNING))));
+        let ups = o.tick(10_000, false, None);
         assert!(ups.iter().any(|u| matches!(u.event, Event::Exited { .. })));
         assert!(!o.is_alive());
+    }
+
+    #[test]
+    fn transcript_news_ends_an_inferred_block() {
+        let mut a = agent(0);
+        a.pane = None;
+        let mut o = Observed::new(a);
+        o.feed(until_tool_result().as_bytes(), 1_000);
+        assert!(o.screen_exec(6_000).is_none());
+        assert!(blocked(&o.tick(6_000, true, None)));
+        let ups = o.feed(tool_result().as_bytes(), 7_000);
+        assert!(working(&ups));
+        assert_eq!(
+            o.state().map(|s| &s.state),
+            Some(&RunState::Working { progress: None })
+        );
+        // Quiet again but nothing outstanding: no block.
+        assert!(o.tick(20_000, true, None).is_empty());
+    }
+
+    #[test]
+    fn bypassed_permissions_never_wait_on_approval() {
+        let mut a = agent(0);
+        a.pane = None;
+        a.args = "claude --dangerously-skip-permissions".into();
+        let mut o = Observed::new(a);
+        o.feed(until_tool_result().as_bytes(), 1_000);
+        assert!(o.tick(6_000, true, None).is_empty());
+    }
+
+    #[test]
+    fn questions_need_no_screen() {
+        let mut o = Observed::new(agent(0));
+        let ask = r#"{"type":"assistant","uuid":"a1","sessionId":"s","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{}}]}}"#;
+        o.feed(format!("{ask}\n").as_bytes(), 1_000);
+        assert!(o.screen_exec(6_000).is_none());
+        let ups = o.tick(6_000, true, None);
+        assert!(ups.iter().any(|u| matches!(&u.event, Event::StateChanged(s)
+            if s.state == RunState::Blocked { kind: BlockKind::Question })));
+    }
+
+    #[test]
+    fn subagents_and_reads_are_just_running() {
+        let mut a = agent(0);
+        a.pane = None;
+        let mut o = Observed::new(a);
+        let task = r#"{"type":"assistant","uuid":"a1","sessionId":"s","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Task","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}},{"type":"server_tool_use","id":"w1","name":"web_search","input":{}}]}}"#;
+        o.feed(format!("{task}\n").as_bytes(), 1_000);
+        assert!(o.tick(60_000, true, None).is_empty());
     }
 
     #[test]

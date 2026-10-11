@@ -7,7 +7,7 @@
 //! installed on the host, and tells ACC when a session is at a safe point to
 //! take over (the turn has ended and no tool call is outstanding).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
@@ -62,7 +62,8 @@ pub struct Observer {
     framer: LineFramer,
     session_id: Option<String>,
     state: Option<RunState>,
-    pending_tools: HashSet<String>,
+    /// Outstanding tool calls by id, with the tool's name.
+    pending_tools: HashMap<String, String>,
 }
 
 impl Default for Observer {
@@ -77,7 +78,7 @@ impl Observer {
             framer: LineFramer::new(wire::MAX_FRAME),
             session_id: None,
             state: None,
-            pending_tools: HashSet::new(),
+            pending_tools: HashMap::new(),
         }
     }
 
@@ -90,6 +91,11 @@ impl Observer {
     /// call that stays quiet is most likely waiting on a permission prompt.
     pub fn pending_tools(&self) -> usize {
         self.pending_tools.len()
+    }
+
+    /// Names of the tools with no result yet.
+    pub fn pending_tool_names(&self) -> impl Iterator<Item = &str> {
+        self.pending_tools.values().map(String::as_str)
     }
 
     /// True when the last turn ended and nothing is outstanding, so closing
@@ -181,10 +187,14 @@ impl Observer {
                 if let Some(blocks) = message.get("content").and_then(Value::as_array) {
                     for (i, b) in blocks.iter().enumerate() {
                         match str_at(b, "type") {
-                            Some("tool_use" | "server_tool_use") => {
+                            Some(kind @ ("tool_use" | "server_tool_use")) => {
                                 let Some(id) = owned(b, "id") else { continue };
-                                self.pending_tools.insert(id.clone());
                                 let name = str_at(b, "name").unwrap_or_default();
+                                // Server tools run in the API; their result comes in
+                                // the same response, never as a user tool_result.
+                                if kind == "tool_use" {
+                                    self.pending_tools.insert(id.clone(), name.to_owned());
+                                }
                                 out.push(Event::ItemStarted {
                                     id,
                                     kind: super::tool_kind(name),

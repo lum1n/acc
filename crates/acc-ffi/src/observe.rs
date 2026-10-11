@@ -134,13 +134,20 @@ impl AccObserved {
             .collect()
     }
 
-    /// Call every few seconds with the result of `alive_exec`.
-    pub fn tick(&self, now_ms: u64, process_alive: bool) -> Vec<AccUpdate> {
+    /// Call every few seconds with the result of `alive_exec` and, when
+    /// `screen_exec` returned one, that capture's output.
+    pub fn tick(&self, now_ms: u64, process_alive: bool, screen: Option<String>) -> Vec<AccUpdate> {
         lock(&self.inner)
-            .tick(now_ms, process_alive)
+            .tick(now_ms, process_alive, screen.as_deref())
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    /// A capture of the TUI's pane to pass to the next `tick`, when only the
+    /// screen can tell a slow tool from an approval dialog.
+    pub fn screen_exec(&self, now_ms: u64) -> Option<AccExec> {
+        lock(&self.inner).screen_exec(now_ms).map(Into::into)
     }
 
     /// Prints `alive` or `gone`.
