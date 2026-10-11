@@ -120,14 +120,19 @@ impl SessionDir {
     /// Script whose stdin is forwarded to the harness. Writers are serialized
     /// with an atomic `mkdir` lock, since FIFO writes are only atomic up to
     /// PIPE_BUF (512 bytes on macOS) and `flock` isn't on macOS by default.
+    ///
+    /// The FIFO is opened read-write: a write-only open waits for a reader,
+    /// so input to a harness that already exited would hang (holding the
+    /// lock for every later writer).
     pub fn input_script(&self) -> String {
         let d = self.dir();
         format!(
             "d={d}\n\
              [ -p \"$d/in\" ] || {{ echo 'acc: no such session' >&2; exit 3; }}\n\
+             [ -f \"$d/exit\" ] && {{ echo 'acc: the session has exited' >&2; exit 4; }}\n\
              until mkdir \"$d/lock\" 2>/dev/null; do sleep 0.05; done\n\
              trap 'rmdir \"$d/lock\"' EXIT\n\
-             cat >\"$d/in\"\n"
+             cat 1<>\"$d/in\"\n"
         )
     }
 
@@ -409,6 +414,32 @@ mod tests {
         assert!(SessionDir::new("").is_none());
         assert!(SessionDir::new("a b").is_none());
         assert!(SessionDir::new("s_01-abc").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_to_an_exited_session_does_not_hang() {
+        let home = std::env::temp_dir().join(format!("acc-input-{}", std::process::id()));
+        let d = home.join(ROOT).join("s1");
+        std::fs::create_dir_all(&d).unwrap();
+        let run = |script: String| {
+            std::process::Command::new("timeout")
+                .args(["5", "sh", "-c", &script])
+                .env("HOME", &home)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+                .status
+                .code()
+        };
+        let dir = SessionDir::new("s1").unwrap();
+        assert_eq!(run(format!("mkfifo {}", d.join("in").display())), Some(0));
+        // No reader and no exit file yet: still returns (read-write open).
+        assert_eq!(run(dir.input_script()), Some(0));
+        std::fs::write(d.join("exit"), "1\n").unwrap();
+        assert_eq!(run(dir.input_script()), Some(4));
+        assert!(!d.join("lock").exists(), "the lock is released");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

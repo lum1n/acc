@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::harness::Harness;
+use crate::harness::{Harness, Launcher};
 use crate::multiplexer::{self, PaneRef};
 
 /// A transcript file a foreign agent writes.
@@ -40,6 +40,10 @@ pub struct ForeignAgent {
     pub transcript: Option<TranscriptRef>,
     /// The harness's session id, when the transcript or arguments tell.
     pub native_id: Option<String>,
+    /// How it was launched (wrapper such as a `bwrap` sandbox, executable,
+    /// the user's flags), to resume it the same way.
+    #[serde(default)]
+    pub launcher: Option<Launcher>,
 }
 
 impl ForeignAgent {
@@ -59,6 +63,18 @@ ps -eo pid=,etime=,args= 2>/dev/null | while read -r pid etime args; do
   case $b in node|bun|deno|python*) b=${2##*/} ;; esac
   case $b in claude|codex|agent|cursor-agent|copilot|pi|opencode) ;; *) continue ;; esac
   printf 'A\t%s\t%s\t%s\t%s\n' "$pid" "$b" "$etime" "$args"
+  # Exact argv of the agent and of its ancestors (unit-separated), to find
+  # a wrapper that execs into it (a bwrap sandbox, env, nice).
+  if [ -r "/proc/$pid/cmdline" ]; then
+    printf 'V\t%s\t' "$pid"; tr '\0\t\n' '\037  ' <"/proc/$pid/cmdline" 2>/dev/null; printf '\n'
+    q=$pid; i=0
+    while [ $i -lt 8 ]; do
+      q=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$q/status" 2>/dev/null)
+      [ -n "$q" ] && [ "$q" -gt 1 ] || break
+      printf 'W\t%s\t%s\t' "$pid" "$q"; tr '\0\t\n' '\037  ' <"/proc/$q/cmdline" 2>/dev/null; printf '\n'
+      i=$((i+1))
+    done
+  fi
   cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)
   printf 'C\t%s\t%s\n' "$pid" "$cwd"
   if [ -r "/proc/$pid/environ" ]; then
@@ -145,6 +161,8 @@ pub fn parse_discover(out: &str) -> Vec<ForeignAgent> {
     let mut open: HashMap<u32, Vec<TranscriptRef>> = HashMap::new();
     let mut newest: HashMap<u32, TranscriptRef> = HashMap::new();
     let mut labels: HashMap<String, String> = HashMap::new();
+    let mut argv: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut ancestors: HashMap<u32, Vec<Vec<String>>> = HashMap::new();
     for line in out.lines() {
         let f: Vec<&str> = line.splitn(5, '\t').collect();
         let pid = || f.get(1).and_then(|p| p.trim().parse::<u32>().ok());
@@ -170,6 +188,7 @@ pub fn parse_discover(out: &str) -> Vec<ForeignAgent> {
                     pane_label: None,
                     transcript: None,
                     native_id: None,
+                    launcher: None,
                 });
             }
             Some("C") => {
@@ -192,6 +211,16 @@ pub fn parse_discover(out: &str) -> Vec<ForeignAgent> {
             Some("N") => {
                 if let (Some(pid), Some(t)) = (pid(), tref(false)) {
                     newest.insert(pid, t);
+                }
+            }
+            Some("V") => {
+                if let (Some(pid), Some(v)) = (pid(), f.get(2)) {
+                    argv.insert(pid, split_argv(v));
+                }
+            }
+            Some("W") => {
+                if let (Some(pid), Some(v)) = (pid(), f.get(3)) {
+                    ancestors.entry(pid).or_default().push(split_argv(v));
                 }
             }
             Some("P") if f.len() >= 3 => {
@@ -221,8 +250,128 @@ pub fn parse_discover(out: &str) -> Vec<ForeignAgent> {
             .cloned();
         a.transcript = pick.or_else(|| newest.remove(&a.pid));
         a.native_id = native_id(a);
+        let own = argv
+            .remove(&a.pid)
+            .unwrap_or_else(|| a.args.split_whitespace().map(str::to_owned).collect());
+        a.launcher = launcher(
+            a.harness,
+            &own,
+            ancestors.get(&a.pid).map_or(&[][..], Vec::as_slice),
+        );
     }
     agents
+}
+
+/// Splits a `/proc/<pid>/cmdline` printed with unit separators.
+fn split_argv(v: &str) -> Vec<String> {
+    let mut words: Vec<String> = v.split('\u{1f}').map(str::to_owned).collect();
+    if words.last().is_some_and(String::is_empty) {
+        words.pop();
+    }
+    words
+}
+
+fn basename(s: &str) -> &str {
+    s.rsplit('/').next().unwrap_or(s)
+}
+
+/// Executable names a harness runs under.
+fn program_names(h: Harness) -> &'static [&'static str] {
+    match h {
+        Harness::Cursor => &["agent", "cursor-agent"],
+        Harness::Claude => &["claude"],
+        Harness::Codex => &["codex"],
+        Harness::Copilot => &["copilot"],
+        Harness::Pi => &["pi"],
+        Harness::Opencode => &["opencode"],
+    }
+}
+
+/// Ancestors that are where the user typed, not a wrapper.
+fn is_shell_or_multiplexer(argv0: &str) -> bool {
+    let b = basename(argv0).trim_start_matches('-');
+    matches!(
+        b,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ksh"
+            | "mksh"
+            | "tcsh"
+            | "csh"
+            | "nu"
+            | "xonsh"
+            | "tmux"
+            | "tmux: server"
+            | "zellij"
+            | "screen"
+            | "SCREEN"
+            | "login"
+            | "sshd"
+            | "init"
+            | "systemd"
+    ) || b.starts_with("tmux")
+}
+
+/// How the agent was launched. A wrapper is an ancestor whose argv ends
+/// with the harness and arguments the agent still has (`bwrap ... --
+/// /usr/bin/claude --resume x`, `env X=1 claude`); the outermost one in an
+/// unbroken chain is the one to repeat (bwrap shows twice: the monitor and
+/// the sandbox's init). Inside a sandbox the harness path can differ from
+/// the running binary's, so it's matched by name.
+fn launcher(harness: Harness, own: &[String], ancestors: &[Vec<String>]) -> Option<Launcher> {
+    let own_args = own.get(1..).unwrap_or_default();
+    let names = program_names(harness);
+    let mut best: Option<(&Vec<String>, usize)> = None;
+    for anc in ancestors {
+        if anc.first().is_none_or(|a0| is_shell_or_multiplexer(a0)) {
+            break;
+        }
+        let at = (1..anc.len())
+            .rev()
+            .find(|&j| names.contains(&basename(&anc[j])) && own_args.ends_with(&anc[j + 1..]));
+        match at {
+            Some(j) => best = Some((anc, j)),
+            None => break,
+        }
+    }
+    let (prefix, program, user_args) = match best {
+        Some((anc, j)) => (anc[..j].to_vec(), Some(anc[j].clone()), anc[j + 1..].to_vec()),
+        None => (Vec::new(), None, own_args.to_vec()),
+    };
+    let args = match harness {
+        // Claude's TUI flags work in print mode too; other harnesses run
+        // headless under a different command, so their TUI flags don't apply.
+        Harness::Claude => claude_flags(&user_args),
+        _ => Vec::new(),
+    };
+    let l = Launcher {
+        prefix,
+        program,
+        args,
+    };
+    (l != Launcher::default()).then_some(l)
+}
+
+/// The user's Claude flags minus what ACC sets itself (which session to
+/// resume) and positional prompts before the first flag.
+fn claude_flags(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter().skip_while(|a| !a.starts_with('-')).peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--resume" | "-r" | "--session-id" => {
+                if it.peek().is_some_and(|v| !v.starts_with('-')) {
+                    it.next();
+                }
+            }
+            "--continue" | "-c" | "--fork-session" => {}
+            _ if a.starts_with("--resume=") || a.starts_with("--session-id=") => {}
+            _ => out.push(a.clone()),
+        }
+    }
+    out
 }
 
 /// The harness session id: from the transcript the process has open, else
@@ -277,6 +426,68 @@ A\t88\tcodex\t1-00:00:10\tcodex resume abc\n\
 C\t88\t/srv/app\n\
 F\t88\t/home/v/.codex/sessions/2026/10/10/rollout-2026-10-10T12-13-12-01a125bb-467b-7971-9643-70534831e6ee.jsonl\t900\n\
 P\t%3\twork:2\t/tmp/tmux-1000/default\n";
+
+    /// `ps`/`/proc` as seen on a host where most Claude TUIs run inside a
+    /// bwrap sandbox started through a wrapper (`c claude`).
+    fn sandboxed() -> String {
+        let us = '\u{1f}';
+        let sandbox = [
+            "bwrap",
+            "--unshare-all",
+            "--bind",
+            "/home/v/repos",
+            "/home/v/repos",
+            "--chdir",
+            "/home/v/repos/hive",
+            "--die-with-parent",
+            "--",
+        ]
+        .join(&us.to_string());
+        format!(
+            "A\t10\tclaude\t01:00\t/opt/claude-code/bin/claude --dangerously-skip-permissions\n\
+             V\t10\t/opt/claude-code/bin/claude{us}--dangerously-skip-permissions{us}\n\
+             W\t10\t9\t{sandbox}{us}/usr/bin/claude{us}--dangerously-skip-permissions{us}\n\
+             W\t10\t8\t{sandbox}{us}/usr/bin/claude{us}--dangerously-skip-permissions{us}\n\
+             W\t10\t7\t-zsh{us}\n\
+             A\t20\tclaude\t01:00\t/opt/claude-code/bin/claude --resume abc\n\
+             V\t20\t/opt/claude-code/bin/claude{us}--resume{us}abc{us}\n\
+             W\t20\t19\tzsh{us}\n\
+             A\t30\tcursor-agent\t01:00\t/x/cursor-agent --use-system-ca /x/index.js --yolo\n\
+             V\t30\t/x/cursor-agent{us}--use-system-ca{us}/x/index.js{us}--yolo{us}\n\
+             W\t30\t29\tbwrap{us}--{us}agent{us}--yolo{us}\n"
+        )
+    }
+
+    #[test]
+    fn finds_the_sandbox_a_tui_runs_in() {
+        let found = parse_discover(&sandboxed());
+        let l = found[0].launcher.as_ref().unwrap();
+        assert_eq!(l.wrapper(), Some("bwrap"));
+        assert_eq!(l.prefix.last().map(String::as_str), Some("--"));
+        assert!(l.prefix.contains(&"/home/v/repos/hive".to_owned()));
+        assert_eq!(l.program.as_deref(), Some("/usr/bin/claude"));
+        assert_eq!(l.args, ["--dangerously-skip-permissions"]);
+
+        // Not wrapped: no prefix, and the resume flag is ACC's to set.
+        assert_eq!(found[1].launcher, None);
+
+        // Cursor re-execs itself with its bundle; the wrapper still matches.
+        let c = found[2].launcher.as_ref().unwrap();
+        assert_eq!(
+            (c.prefix.as_slice(), c.program.as_deref()),
+            (&["bwrap".to_owned(), "--".to_owned()][..], Some("agent"))
+        );
+        assert!(c.args.is_empty());
+    }
+
+    #[test]
+    fn keeps_claude_flags_but_not_session_or_prompt() {
+        let words = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            claude_flags(&words("fix-it --resume abc --model opus -c --add-dir /a")),
+            words("--model opus --add-dir /a")
+        );
+    }
 
     #[test]
     fn finds_tuis_with_pane_and_transcript() {

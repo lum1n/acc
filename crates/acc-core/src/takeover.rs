@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::Command;
 use crate::discover::ForeignAgent;
-use crate::harness::Harness;
+use crate::harness::{Harness, Launcher};
 use crate::multiplexer::{self, Exec, Multiplexer, PaneRef, tui};
 use crate::session::{LaunchRequest, Origin};
 use crate::shell::quote;
@@ -33,6 +33,8 @@ pub enum TakeoverInput {
 }
 
 /// What the client should do next.
+// Built once per action; boxing a launch request isn't worth the churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TakeoverAction {
@@ -172,6 +174,7 @@ impl Takeover {
                     pane,
                     transcript: self.agent.transcript.as_ref().map(|t| t.path.clone()),
                 },
+                launcher: self.agent.launcher.clone(),
             },
         }
     }
@@ -314,20 +317,59 @@ fn parse_pane_label(label: &str) -> Option<PaneRef> {
     })
 }
 
+/// Commands longer than this are written to a script under
+/// [`RESUME_DIR`] and the pane gets `sh <script>`, so a sandbox's long argv
+/// doesn't flood the user's shell.
+const MAX_TYPED: usize = 200;
+
+/// Where hand-back scripts go, relative to `$HOME`.
+pub const RESUME_DIR: &str = ".acc/resume";
+
 /// Script handing a session back to its TUI in the pane it was taken from:
-/// types the resume command into the shell left there. Stop the headless
-/// session first (its `kill_exec`). `None` when there's no pane to go back to.
-pub fn hand_back_exec(harness: Harness, native_id: &str, pane_label: &str, cwd: &str) -> Option<Exec> {
+/// types the resume command into the shell left there, inside the wrapper
+/// the TUI was started with. Stop the headless session first (its
+/// `kill_exec`). `None` when there's no pane to go back to.
+pub fn hand_back_exec(
+    harness: Harness,
+    native_id: &str,
+    pane_label: &str,
+    cwd: &str,
+    launcher: Option<&Launcher>,
+) -> Option<Exec> {
     let pane = parse_pane_label(pane_label)?;
     let backend = multiplexer::backend(pane.multiplexer);
-    let mut inputs = vec![
+    let argv = tui::resume_argv(harness, native_id, launcher).ok()?;
+    let command = crate::shell::join(argv.iter().map(String::as_str));
+    let mut steps = Vec::new();
+    let typed = if command.len() > MAX_TYPED {
+        let name: String = native_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .take(64)
+            .collect();
+        let path = format!("{RESUME_DIR}/{}-{name}.sh", harness.program());
+        steps.push(Exec::new(format!(
+            "mkdir -p \"$HOME\"/{RESUME_DIR} && printf '%s\\n' {} >\"$HOME\"/{path}",
+            quote(&format!("exec {command}"))
+        )));
+        format!("sh ~/{path}")
+    } else {
+        command
+    };
+    let inputs = [
         multiplexer::Input::Text(format!("cd {}", quote(cwd))),
         multiplexer::Input::Keys(vec![multiplexer::Key::Enter]),
+        multiplexer::Input::Text(typed),
+        multiplexer::Input::Keys(vec![multiplexer::Key::Enter]),
     ];
-    inputs.extend(tui::resume_inputs(harness, native_id).ok()?);
-    Some(join_execs(
-        inputs.iter().map(|i| backend.send(&pane, i)).collect(),
-    ))
+    steps.extend(inputs.iter().map(|i| backend.send(&pane, i)));
+    Some(join_execs(steps))
 }
 
 #[cfg(test)]
@@ -356,6 +398,7 @@ mod tests {
                 exact: true,
             }),
             native_id: Some("sid".into()),
+            launcher: None,
         }
     }
 
@@ -459,8 +502,53 @@ mod tests {
 
     #[test]
     fn hand_back_types_resume_into_the_pane() {
-        let exec = hand_back_exec(Harness::Claude, "sid", "tmux:%3", "/w").unwrap();
+        let exec = hand_back_exec(Harness::Claude, "sid", "tmux:%3", "/w", None).unwrap();
         assert!(exec.script.contains("send-keys") && exec.script.contains("claude --resume sid"));
-        assert!(hand_back_exec(Harness::Claude, "sid", "bogus", "/w").is_none());
+        assert!(hand_back_exec(Harness::Claude, "sid", "bogus", "/w", None).is_none());
+    }
+
+    #[test]
+    fn hand_back_resumes_inside_the_sandbox_from_a_script() {
+        let mut prefix: Vec<String> = ["bwrap", "--unshare-all", "--chdir", "/w"]
+            .map(String::from)
+            .to_vec();
+        for i in 0..30 {
+            prefix.extend(["--ro-bind".into(), format!("/opt/d{i}"), format!("/opt/d{i}")]);
+        }
+        prefix.push("--".into());
+        let l = Launcher {
+            prefix,
+            program: Some("/usr/bin/claude".into()),
+            args: vec!["--dangerously-skip-permissions".into()],
+        };
+        let exec = hand_back_exec(Harness::Claude, "sid", "tmux:%3", "/w", Some(&l)).unwrap();
+        let s = &exec.script;
+        assert!(s.contains("/.acc/resume/claude-sid.sh"), "{s}");
+        assert!(s.contains("exec bwrap --unshare-all"));
+        assert!(s.contains("/usr/bin/claude --resume sid --dangerously-skip-permissions"));
+        assert!(s.contains("sh ~/.acc/resume/claude-sid.sh"));
+    }
+
+    #[test]
+    fn takeover_resumes_with_the_tuis_launcher() {
+        let mut a = agent(true);
+        a.launcher = Some(Launcher {
+            prefix: vec!["bwrap".into(), "--".into()],
+            program: Some("/usr/bin/claude".into()),
+            args: vec![],
+        });
+        let mut t = Takeover::new(a, Some("sid".into()), false).unwrap();
+        assert!(matches!(
+            t.next(TakeoverInput::Tick {
+                now_ms: 0,
+                safe: true
+            }),
+            TakeoverAction::Run { .. }
+        ));
+        assert!(matches!(t.next(ran(100, "")), TakeoverAction::Run { .. }));
+        let TakeoverAction::Launch { request } = t.next(ran(200, "gone\n")) else {
+            panic!("launch")
+        };
+        assert_eq!(request.launcher.unwrap().prefix, ["bwrap", "--"]);
     }
 }

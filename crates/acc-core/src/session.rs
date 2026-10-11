@@ -28,7 +28,7 @@ use crate::command::{Apply, Command, CommandEntry, OptionDef, OptionId};
 use crate::detached::{SessionDir, Status, parse_status};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
-use crate::harness::{Harness, LaunchSpec};
+use crate::harness::{Harness, LaunchSpec, Launcher};
 use crate::multiplexer::Exec;
 use crate::pi::PiDriver;
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
@@ -63,6 +63,10 @@ pub struct LaunchRequest {
     /// Set when the new session replaces `parent`, which should be stopped.
     pub replaces_parent: bool,
     pub origin: Origin,
+    /// Start the harness the way a taken-over TUI was started (its sandbox
+    /// or other wrapper, executable and flags).
+    #[serde(default)]
+    pub launcher: Option<Launcher>,
 }
 
 /// How a session came to be.
@@ -99,6 +103,9 @@ pub struct SessionSpec {
     pub parent: Option<String>,
     #[serde(default)]
     pub origin: Origin,
+    /// Kept so relaunches (fork, model change) and hand-back use it too.
+    #[serde(default)]
+    pub launcher: Option<Launcher>,
 }
 
 impl SessionSpec {
@@ -133,6 +140,8 @@ pub struct Update {
 }
 
 /// What to do for a command.
+// Built once per action; boxing a launch request isn't worth the churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Outbound {
@@ -260,6 +269,7 @@ impl Session {
             created_ms: now_ms,
             parent: req.parent.clone(),
             origin: req.origin.clone(),
+            launcher: req.launcher.clone(),
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
@@ -267,6 +277,9 @@ impl Session {
             Harness::Codex => Harness::Codex.launch(None),
             _ => driver.launch(spec.resume.as_deref()),
         };
+        if let Some(launcher) = &spec.launcher {
+            spec.launch = launcher.wrap(spec.launch);
+        }
         let exec = Exec::new(dir.launch_script_with_spec(&spec.launch, &spec.cwd, Some(&spec.to_json())));
         let mut transmit = driver.handshake();
         let mut pending_prompt = req.prompt.filter(|p| !p.trim().is_empty());
@@ -463,6 +476,7 @@ impl Session {
             parent: Some(self.spec.id.clone()),
             replaces_parent: !fork,
             origin: self.spec.origin.clone(),
+            launcher: self.spec.launcher.clone(),
         }
     }
 
@@ -725,6 +739,28 @@ mod tests {
             ups.extend(a.feed(chunk, 3));
         }
         (a, ups)
+    }
+
+    #[test]
+    fn launches_inside_the_launcher_and_relaunches_keep_it() {
+        let mut r = req(Harness::Claude);
+        r.launcher = Some(Launcher {
+            prefix: vec!["bwrap".into(), "--die-with-parent".into(), "--".into()],
+            program: Some("/usr/bin/claude".into()),
+            args: vec!["--dangerously-skip-permissions".into()],
+        });
+        let (mut s, exec) = Session::launch(r, "s1", "t", 1).unwrap();
+        assert!(
+            exec.script
+                .contains("bwrap --die-with-parent -- /usr/bin/claude -p"),
+            "{}",
+            exec.script
+        );
+        assert!(exec.script.contains("--dangerously-skip-permissions"));
+        let Ok(Outbound::Relaunch(again)) = s.command(Command::Fork) else {
+            panic!("fork relaunches")
+        };
+        assert_eq!(again.launcher, s.spec().launcher);
     }
 
     #[test]

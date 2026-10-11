@@ -123,8 +123,28 @@ pub fn launch(harness: Harness, resume: Option<&str>) -> Result<Program, DriverE
 /// after ACC closed the TUI there: types the resume command into the shell
 /// left in the pane.
 pub fn resume_inputs(harness: Harness, resume: &str) -> Result<Vec<Input>, DriverError> {
-    let argv = launch(harness, Some(resume))?.argv();
+    let argv = resume_argv(harness, resume, None)?;
     Ok(submit(&crate::shell::join(argv.iter().map(String::as_str))))
+}
+
+/// The TUI command resuming `resume`, run the way `launcher` describes
+/// (inside the user's sandbox, with their executable and flags).
+pub fn resume_argv(
+    harness: Harness,
+    resume: &str,
+    launcher: Option<&crate::harness::Launcher>,
+) -> Result<Vec<String>, DriverError> {
+    let mut program = launch(harness, Some(resume))?;
+    let Some(l) = launcher else {
+        return Ok(program.argv());
+    };
+    if let Some(p) = &l.program {
+        program.program = p.clone();
+    }
+    program.args.extend(l.args.iter().cloned());
+    let mut argv = l.prefix.clone();
+    argv.extend(program.argv());
+    Ok(argv)
 }
 
 #[cfg(test)]

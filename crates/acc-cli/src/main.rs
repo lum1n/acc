@@ -17,6 +17,8 @@ use acc_core::pi::{PiDriver, Transcript};
 const USAGE: &str = "\
 usage:
   acc harnesses                         detect installed harnesses and versions
+  acc discover                          list harness TUIs on this machine (with any sandbox
+                                        they run in), one JSON object per line
   acc acp <harness> <cwd> [--resume ID] [--model M] [--program PATH]
                                         drive an ACP harness (cursor, copilot, opencode);
                                         stdin lines are JSON commands or prompt text
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["harnesses"] => harnesses(),
+        ["discover"] => discover(),
         ["osc7501"] => osc(),
         ["script", "mux", rest @ ..] => mux(rest),
         ["acp", harness, rest @ ..] => match parse_harness(harness).and_then(|h| {
@@ -59,6 +62,25 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Runs the discovery script under `sh` here, as a client would over SSH.
+fn discover() -> ExitCode {
+    let out = match Command::new("sh")
+        .arg("-c")
+        .arg(acc_core::discover::discover_script())
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => {
+            eprintln!("acc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for agent in acc_core::discover::parse_discover(&out) {
+        println!("{}", serde_json::to_string(&agent).unwrap_or_default());
+    }
+    ExitCode::SUCCESS
 }
 
 fn harnesses() -> ExitCode {

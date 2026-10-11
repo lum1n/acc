@@ -7,7 +7,7 @@
 use acc_core::command::{Apply, Command, CommandEntry, CommandSource, Exec as CmdExec, OptionDef, OptionId};
 use acc_core::detached::{FeedEntry, FeedPath, Listing, Status};
 use acc_core::event::{Event, ItemKind, PermissionOption, Quota, QuotaWindow, Usage};
-use acc_core::harness::Availability;
+use acc_core::harness::{Availability, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag};
 use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
@@ -649,6 +649,36 @@ impl From<AccOrigin> for Origin {
     }
 }
 
+/// How a TUI the user started was launched: the wrapper's argv up to the
+/// harness (a `bwrap` sandbox, `env`, ...), the harness executable as the
+/// wrapper ran it, and the user's flags to keep.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccLauncher {
+    pub prefix: Vec<String>,
+    pub program: Option<String>,
+    pub args: Vec<String>,
+}
+
+impl From<Launcher> for AccLauncher {
+    fn from(l: Launcher) -> Self {
+        Self {
+            prefix: l.prefix,
+            program: l.program,
+            args: l.args,
+        }
+    }
+}
+
+impl From<AccLauncher> for Launcher {
+    fn from(l: AccLauncher) -> Self {
+        Self {
+            prefix: l.prefix,
+            program: l.program,
+            args: l.args,
+        }
+    }
+}
+
 /// What to start.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AccLaunchRequest {
@@ -665,6 +695,9 @@ pub struct AccLaunchRequest {
     pub parent: Option<String>,
     pub replaces_parent: bool,
     pub origin: AccOrigin,
+    /// Start inside a taken-over TUI's wrapper (sandbox) with its flags.
+    #[uniffi(default = None)]
+    pub launcher: Option<AccLauncher>,
 }
 
 impl From<AccLaunchRequest> for LaunchRequest {
@@ -681,6 +714,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             parent: r.parent,
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),
+            launcher: r.launcher.map(Into::into),
         }
     }
 }
@@ -699,6 +733,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             parent: r.parent,
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),
+            launcher: r.launcher.map(Into::into),
         }
     }
 }
@@ -716,6 +751,8 @@ pub struct AccSessionSpec {
     pub created_ms: u64,
     pub parent: Option<String>,
     pub origin: AccOrigin,
+    /// Set when the harness runs in a taken-over TUI's wrapper (sandbox).
+    pub launcher: Option<AccLauncher>,
     /// The full spec, to persist and pass back to `AccSession.attach`.
     pub json: String,
 }
@@ -733,11 +770,14 @@ impl From<&SessionSpec> for AccSessionSpec {
             created_ms: s.created_ms,
             parent: s.parent.clone(),
             origin: s.origin.clone().into(),
+            launcher: s.launcher.clone().map(Into::into),
             json: s.to_json(),
         }
     }
 }
 
+// Built once per action; boxing a launch request isn't worth the churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum AccOutbound {
     /// Write these bytes with the session's `input_exec` (may be empty).

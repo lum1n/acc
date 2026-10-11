@@ -33,6 +33,9 @@ pub struct AccForeignAgent {
     /// The process has the transcript open (otherwise it is a guess).
     pub transcript_exact: bool,
     pub native_id: Option<String>,
+    /// How it was launched; a non-empty prefix means it runs in a wrapper
+    /// such as a `bwrap` sandbox, which takeover and hand-back keep.
+    pub launcher: Option<AccLauncher>,
     /// The full record, to pass back to `AccObserved` and `AccTakeover`.
     pub json: String,
 }
@@ -52,6 +55,7 @@ impl From<&ForeignAgent> for AccForeignAgent {
             transcript_size: a.transcript.as_ref().map_or(0, |t| t.size),
             transcript_exact: a.transcript.as_ref().is_some_and(|t| t.exact),
             native_id: a.native_id.clone(),
+            launcher: a.launcher.clone().map(Into::into),
             json: serde_json::to_string(a).unwrap_or_default(),
         }
     }
@@ -84,8 +88,10 @@ pub fn takeover_blocker(agent_json: String, native_id: Option<String>) -> Option
 /// Types the resume command into the pane a session was taken from.
 /// Stop the headless session first.
 #[uniffi::export]
-pub fn hand_back_exec(harness: AccHarness, native_id: String, pane: String, cwd: String) -> Option<AccExec> {
-    takeover::hand_back_exec(harness.into(), &native_id, &pane, &cwd).map(Into::into)
+pub fn hand_back_exec(spec_json: String, native_id: String, pane: String) -> Option<AccExec> {
+    let spec = acc_core::session::SessionSpec::from_json(&spec_json)?;
+    takeover::hand_back_exec(spec.harness, &native_id, &pane, &spec.cwd, spec.launcher.as_ref())
+        .map(Into::into)
 }
 
 /// A foreign agent followed through its transcript.
@@ -233,6 +239,8 @@ pub enum AccTakeoverInput {
 }
 
 /// What the client should do next.
+// Built once per action; boxing a launch request isn't worth the churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum AccTakeoverAction {
     Run {

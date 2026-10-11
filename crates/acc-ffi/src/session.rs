@@ -333,6 +333,7 @@ mod tests {
             parent: None,
             replaces_parent: false,
             origin: AccOrigin::Started,
+            launcher: None,
         };
         let id = new_session_id(AccHarness::Claude, vec![7; 15]);
         let s = AccSession::launch(req, id, "ph".into(), 1).unwrap();

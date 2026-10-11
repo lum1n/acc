@@ -43,6 +43,47 @@ pub struct LaunchSpec {
     pub protocol: Protocol,
 }
 
+/// How a TUI the user started was launched, so ACC can start the harness
+/// the same way: inside the same wrapper (a `bwrap` sandbox, `env`, `nice`,
+/// ...), from the same executable, with the user's own flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Launcher {
+    /// The wrapper's argv up to the harness, e.g. `bwrap ... --`.
+    #[serde(default)]
+    pub prefix: Vec<String>,
+    /// The harness executable as the wrapper ran it (inside a sandbox the
+    /// path can differ from the host's).
+    #[serde(default)]
+    pub program: Option<String>,
+    /// The user's flags to keep (resume flags removed).
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl Launcher {
+    /// Runs `spec` through this launcher: prefix, then the program, the
+    /// harness arguments and the user's flags.
+    pub fn wrap(&self, mut spec: LaunchSpec) -> LaunchSpec {
+        if let Some(program) = &self.program {
+            spec.program = program.clone();
+        }
+        spec.args.extend(self.args.iter().cloned());
+        if let Some((first, rest)) = self.prefix.split_first() {
+            let inner = std::mem::replace(&mut spec.program, first.clone());
+            let mut args = rest.to_vec();
+            args.push(inner);
+            args.append(&mut spec.args);
+            spec.args = args;
+        }
+        spec
+    }
+
+    /// The wrapper's program name, e.g. `bwrap`, when there is one.
+    pub fn wrapper(&self) -> Option<&str> {
+        self.prefix.first().map(|p| p.rsplit('/').next().unwrap_or(p))
+    }
+}
+
 impl Harness {
     pub const ALL: [Harness; 6] = [
         Harness::Claude,
@@ -222,6 +263,43 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), Harness::ALL.len());
+    }
+
+    #[test]
+    fn launcher_wraps_program_and_keeps_flags() {
+        let spec = LaunchSpec {
+            program: "claude".into(),
+            args: vec!["-p".into()],
+            env: vec![],
+            protocol: Protocol::ClaudeStreamJson,
+        };
+        let l = Launcher {
+            prefix: vec![
+                "bwrap".into(),
+                "--bind".into(),
+                "/a".into(),
+                "/a".into(),
+                "--".into(),
+            ],
+            program: Some("/usr/bin/claude".into()),
+            args: vec!["--dangerously-skip-permissions".into()],
+        };
+        let w = l.wrap(spec.clone());
+        assert_eq!(w.program, "bwrap");
+        assert_eq!(
+            w.args,
+            [
+                "--bind",
+                "/a",
+                "/a",
+                "--",
+                "/usr/bin/claude",
+                "-p",
+                "--dangerously-skip-permissions"
+            ]
+        );
+        assert_eq!(l.wrapper(), Some("bwrap"));
+        assert_eq!(Launcher::default().wrap(spec.clone()), spec);
     }
 
     #[test]

@@ -318,6 +318,7 @@ mod tests {
                 exact: true,
             }),
             native_id: None,
+            launcher: None,
         }
     }
 
