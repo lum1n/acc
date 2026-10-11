@@ -62,20 +62,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
-          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p acc-ffi --release --target aarch64-apple-ios
-      - run: cargo build -p acc-ffi --release --target aarch64-apple-ios-sim
-      - name: Generate Swift bindings
-        run: |
-          cargo build -p acc-ffi --release
-          cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \
-            generate --library target/release/libacc_ffi.dylib --language swift --out-dir bindings/swift
-      - name: Type-check Swift bindings
+      - name: Build the xcframework and Swift package
+        run: scripts/build-xcframework.sh
+      - name: Type-check the Swift bindings
         run: |
           cd bindings/swift
-          swiftc -parse-as-library -typecheck -I . \
-            -Xcc -fmodule-map-file=acc_ffiFFI.modulemap acc_ffi.swift
+          xcrun --sdk iphonesimulator swiftc -parse-as-library -typecheck \
+            -target arm64-apple-ios16.0-simulator \
+            -I AccFFI.xcframework/ios-arm64_x86_64-simulator/Headers Sources/Acc/acc_ffi.swift
 
   android:
     runs-on: ubuntu-latest

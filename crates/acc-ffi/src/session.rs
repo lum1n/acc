@@ -1,0 +1,372 @@
+//! `AccSession`, `AccFanIn` and the host scripts, as UniFFI objects and
+//! functions.
+//!
+//! Everything is a byte pump: the app runs the [`AccExec`]s it is given over
+//! its own SSH channels and feeds back what they print. Nothing here calls
+//! back into the app, so objects can live inside a Swift actor and be used
+//! from one task without any cross-thread callbacks.
+
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use acc_core::detached::{self, FanInParser, FeedEntry};
+use acc_core::harness;
+use acc_core::item;
+use acc_core::session::{self, Session, SessionError, SessionSpec};
+
+use crate::types::*;
+
+/// Errors from sessions and parsers.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum AccError {
+    #[error("invalid session: {message}")]
+    InvalidSession { message: String },
+    #[error("{message}")]
+    Unsupported { message: String },
+    #[error("unknown request {request_id}")]
+    UnknownRequest { request_id: String },
+    #[error("invalid option value {value}")]
+    InvalidOption { value: String },
+    #[error("the harness has no session yet")]
+    NotStarted,
+}
+
+impl From<SessionError> for AccError {
+    fn from(e: SessionError) -> Self {
+        use acc_core::driver::DriverError;
+        match e {
+            SessionError::Driver(DriverError::UnknownRequest(request_id)) => {
+                Self::UnknownRequest { request_id }
+            }
+            SessionError::Driver(DriverError::InvalidOption(value)) => Self::InvalidOption { value },
+            SessionError::Driver(DriverError::NotStarted) => Self::NotStarted,
+            SessionError::Driver(e @ DriverError::Unsupported { .. }) => Self::Unsupported {
+                message: e.to_string(),
+            },
+            e => Self::InvalidSession {
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One detached agent session on a host, from this client's point of view.
+///
+/// 1. `launch` (then run `take_launch_exec`; its stdout is the PID) or
+///    `attach` (then run `status_exec` and pass its stdout to `on_status`).
+/// 2. Follow the log from `offset` and pass every chunk to `feed`.
+/// 3. After `feed` and `command`, send `take_transmit` with `input_exec`.
+#[derive(Debug, uniffi::Object)]
+pub struct AccSession {
+    inner: Mutex<Session>,
+    launch: Mutex<Option<AccExec>>,
+}
+
+#[uniffi::export]
+impl AccSession {
+    /// Starts a new session. `id` comes from `new_session_id`; `client_tag`
+    /// must be unique among clients that may share the session.
+    #[uniffi::constructor]
+    pub fn launch(
+        request: AccLaunchRequest,
+        id: String,
+        client_tag: String,
+        now_ms: u64,
+    ) -> Result<Arc<Self>, AccError> {
+        let (session, exec) = Session::launch(request.into(), &id, &client_tag, now_ms)?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(session),
+            launch: Mutex::new(Some(exec.into())),
+        }))
+    }
+
+    /// Joins a session from its `spec.json` (an `AccSessionSpec.json`).
+    #[uniffi::constructor]
+    pub fn attach(spec_json: String, client_tag: String) -> Result<Arc<Self>, AccError> {
+        let spec = SessionSpec::from_json(&spec_json).ok_or_else(|| AccError::InvalidSession {
+            message: "unreadable spec.json".into(),
+        })?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Session::attach(spec, &client_tag)?),
+            launch: Mutex::new(None),
+        }))
+    }
+
+    /// The script that starts the harness, once, for a launched session.
+    pub fn take_launch_exec(&self) -> Option<AccExec> {
+        lock(&self.launch).take()
+    }
+
+    pub fn status_exec(&self) -> AccExec {
+        lock(&self.inner).status_exec().into()
+    }
+
+    /// Follows the log from the current offset on a channel of its own.
+    pub fn attach_exec(&self) -> AccExec {
+        lock(&self.inner).attach_exec().into()
+    }
+
+    pub fn input_exec(&self, bytes: Vec<u8>) -> AccExec {
+        lock(&self.inner).input_exec(bytes).into()
+    }
+
+    pub fn kill_exec(&self) -> AccExec {
+        lock(&self.inner).kill_exec().into()
+    }
+
+    pub fn remove_exec(&self) -> AccExec {
+        lock(&self.inner).remove_exec().into()
+    }
+
+    /// A rewrite of `spec.json`, when the native id or title became known.
+    pub fn take_spec_write(&self) -> Option<AccExec> {
+        lock(&self.inner).take_spec_write().map(Into::into)
+    }
+
+    pub fn on_status(&self, stdout: String, now_ms: u64) -> Vec<AccUpdate> {
+        convert(lock(&self.inner).on_status(&stdout, now_ms))
+    }
+
+    /// The content of the session's exit file, from a fan-in `SessionExit` entry.
+    pub fn on_exit_file(&self, text: String, now_ms: u64) -> Vec<AccUpdate> {
+        convert(lock(&self.inner).on_exit_file(&text, now_ms))
+    }
+
+    /// Bytes of the log, starting at `offset`.
+    pub fn feed(&self, bytes: Vec<u8>, now_ms: u64) -> Vec<AccUpdate> {
+        convert(lock(&self.inner).feed(&bytes, now_ms))
+    }
+
+    pub fn command(&self, command: AccCommand) -> Result<AccOutbound, AccError> {
+        Ok(lock(&self.inner).command(command.into())?.into())
+    }
+
+    /// Bytes to write to the harness now (send with `input_exec`).
+    pub fn take_transmit(&self) -> Vec<u8> {
+        lock(&self.inner).take_transmit()
+    }
+
+    pub fn spec(&self) -> AccSessionSpec {
+        lock(&self.inner).spec().into()
+    }
+
+    pub fn offset(&self) -> u64 {
+        lock(&self.inner).offset()
+    }
+
+    pub fn is_replaying(&self) -> bool {
+        lock(&self.inner).is_replaying()
+    }
+
+    pub fn is_alive(&self) -> bool {
+        lock(&self.inner).is_alive()
+    }
+
+    pub fn state(&self) -> Option<AccSessionState> {
+        lock(&self.inner).state().cloned().map(Into::into)
+    }
+
+    pub fn items(&self) -> Vec<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().items().iter().map(|i| item(i, h)).collect()
+    }
+
+    pub fn item(&self, id: String) -> Option<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().get(&id).map(|i| item(i, h))
+    }
+
+    pub fn usage(&self) -> AccUsage {
+        lock(&self.inner).usage().clone().into()
+    }
+
+    pub fn quota(&self) -> Option<AccQuota> {
+        lock(&self.inner).quota().cloned().map(Into::into)
+    }
+
+    pub fn permissions(&self) -> Vec<AccPermission> {
+        lock(&self.inner)
+            .permissions()
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn commands(&self) -> Vec<AccCommandEntry> {
+        lock(&self.inner).commands().iter().map(Into::into).collect()
+    }
+
+    pub fn options(&self) -> Vec<AccOptionDef> {
+        lock(&self.inner).options().iter().map(Into::into).collect()
+    }
+}
+
+fn convert(updates: Vec<acc_core::session::Update>) -> Vec<AccUpdate> {
+    updates.into_iter().map(Into::into).collect()
+}
+
+/// Follows many files on a host over one channel (see `script`).
+#[derive(Debug, uniffi::Object)]
+pub struct AccFanIn {
+    entries: Vec<FeedEntry>,
+    parser: Mutex<FanInParser>,
+}
+
+#[uniffi::export]
+impl AccFanIn {
+    #[uniffi::constructor]
+    pub fn new(entries: Vec<AccFeedEntry>) -> Arc<Self> {
+        let entries: Vec<FeedEntry> = entries.into_iter().map(Into::into).collect();
+        Arc::new(Self {
+            parser: Mutex::new(FanInParser::new(&entries)),
+            entries,
+        })
+    }
+
+    /// The long-running script; run it on a long-lived channel.
+    pub fn exec(&self) -> AccExec {
+        AccExec::script(detached::fan_in_script(&self.entries))
+    }
+
+    pub fn feed(&self, bytes: Vec<u8>) -> Vec<AccFeedLine> {
+        lock(&self.parser)
+            .feed(&bytes)
+            .into_iter()
+            .map(|l| AccFeedLine {
+                key: l.key,
+                bytes: l.bytes,
+                offset: l.offset,
+            })
+            .collect()
+    }
+
+    /// Bytes of `key`'s file consumed so far.
+    pub fn offset(&self, key: String) -> Option<u64> {
+        lock(&self.parser).offset(&key)
+    }
+}
+
+/// Lists every detached session on the host.
+#[uniffi::export]
+pub fn list_sessions_exec() -> AccExec {
+    AccExec::script(detached::list_script())
+}
+
+#[uniffi::export]
+pub fn parse_session_list(stdout: String) -> Vec<AccListing> {
+    detached::parse_list(&stdout)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+#[uniffi::export]
+pub fn parse_session_status(stdout: String) -> Option<AccStatus> {
+    detached::parse_status(&stdout).map(Into::into)
+}
+
+/// Finds the installed harnesses (login `PATH`, with versions).
+#[uniffi::export]
+pub fn probe_exec() -> AccExec {
+    AccExec::script(harness::probe_script())
+}
+
+#[uniffi::export]
+pub fn parse_probe(stdout: String) -> Vec<AccAvailability> {
+    harness::parse_probe(&stdout)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Prints the absolute path of a directory (`~` expanded) or fails.
+#[uniffi::export]
+pub fn resolve_dir_exec(dir: String) -> AccExec {
+    AccExec::script(session::resolve_dir_script(&dir))
+}
+
+/// A session id from at least 15 random bytes supplied by the caller.
+#[uniffi::export]
+pub fn new_session_id(harness: AccHarness, entropy: Vec<u8>) -> String {
+    session::new_session_id(harness.into(), &entropy)
+}
+
+/// Parses `git diff` output into files and hunks.
+#[uniffi::export]
+pub fn parse_unified_diff(text: String) -> Vec<AccFileDiff> {
+    item::parse_unified(&text, "")
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Display name of a harness.
+#[uniffi::export]
+pub fn harness_display_name(harness: AccHarness) -> String {
+    acc_core::Harness::from(harness).display_name().to_owned()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    const HI: &[u8] = include_bytes!("../../acc-core/tests/fixtures/claude/hi-and-controls.ndjson");
+
+    #[test]
+    fn launch_attach_feed_round_trip_through_ffi_types() {
+        let req = AccLaunchRequest {
+            harness: AccHarness::Claude,
+            cwd: "/w".into(),
+            model: None,
+            permission: None,
+            resume: None,
+            fork: false,
+            title: None,
+            prompt: Some("hi".into()),
+            parent: None,
+            replaces_parent: false,
+            origin: AccOrigin::Started,
+        };
+        let id = new_session_id(AccHarness::Claude, vec![7; 15]);
+        let s = AccSession::launch(req, id, "ph".into(), 1).unwrap();
+        assert!(s.take_launch_exec().is_some());
+        assert!(s.take_launch_exec().is_none());
+        assert!(!s.take_transmit().is_empty());
+
+        let b = AccSession::attach(s.spec().json, "desk".into()).unwrap();
+        b.on_status(format!("alive 3 {}", HI.len()), 2);
+        let ups = b.feed(HI.to_vec(), 3);
+        assert!(ups.iter().all(|u| u.replay));
+        assert!(
+            b.items()
+                .iter()
+                .any(|i| i.kind == AccItemKind::AgentMessage && i.text == "hi")
+        );
+        assert!(matches!(
+            b.command(AccCommand::Fork).unwrap(),
+            AccOutbound::Relaunch { .. }
+        ));
+        assert!(b.options().iter().any(|o| o.id == AccOptionId::Model));
+    }
+
+    #[test]
+    fn fan_in_and_listing() {
+        let f = AccFanIn::new(vec![AccFeedEntry {
+            key: "k".into(),
+            path: AccFeedPath::SessionLog { id: "abc".into() },
+            offset: 4,
+        }]);
+        assert!(f.exec().script.contains("tail -c +\"$3\""));
+        let lines = f.feed(b"k\t{}\n".to_vec());
+        assert_eq!(lines[0].offset, 7);
+        let list = parse_session_list("S\tabc\talive 1 2\t-\n".into());
+        assert_eq!(list[0].status, AccStatus::Alive { pid: 1, size: 2 });
+    }
+}

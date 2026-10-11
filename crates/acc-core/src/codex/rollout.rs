@@ -6,9 +6,10 @@
 //! usage with nothing installed on the host, and tells ACC when the thread is
 //! at a safe point to take over with `thread/resume`.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::event::{Event, Quota, QuotaWindow, Usage};
+use crate::claude::transcript::whole_item;
+use crate::event::{Event, ItemKind, Quota, QuotaWindow, Usage};
 use crate::harness::Harness;
 use crate::ndjson::{Frame, LineFramer};
 use crate::shell::quote;
@@ -88,6 +89,7 @@ impl Observer {
     fn line(&mut self, v: &Value, out: &mut Vec<Event>) {
         let p = v.get("payload").cloned().unwrap_or(Value::Null);
         match str_at(v, "type") {
+            Some("response_item") => self.item(&p, v, out),
             Some("session_meta") if !self.started => {
                 if let Some(id) = owned(&p, "id") {
                     self.started = true;
@@ -124,6 +126,120 @@ impl Observer {
                 Some("token_count") => self.token_count(&p, out),
                 _ => {}
             },
+            _ => {}
+        }
+    }
+
+    /// Conversation items, shaped like the app-server's so the same
+    /// item rendering applies to observed and driven sessions.
+    fn item(&mut self, p: &Value, line: &Value, out: &mut Vec<Event>) {
+        let fallback = || format!("ord-{}", u64_at(line, "ordinal").unwrap_or(0));
+        let id = owned(p, "id").unwrap_or_else(fallback);
+        let text_of = |key: &str| {
+            p.get(key)
+                .and_then(Value::as_array)
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|b| str_at(b, "text"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        };
+        match str_at(p, "type") {
+            Some("message") => {
+                let text = text_of("content");
+                let kind = match str_at(p, "role") {
+                    Some("user") => ItemKind::UserMessage,
+                    Some("assistant") => ItemKind::AgentMessage,
+                    _ => return,
+                };
+                // Context Codex injects as user messages isn't the user's.
+                let injected = text.trim_start().starts_with('<') || text.starts_with("# AGENTS.md");
+                if !text.is_empty() && !(kind == ItemKind::UserMessage && injected) {
+                    whole_item(out, id, kind, text, Value::Null);
+                }
+            }
+            Some("reasoning") => {
+                let text = text_of("summary");
+                if !text.is_empty() {
+                    whole_item(out, id, ItemKind::Reasoning, text, Value::Null);
+                }
+            }
+            Some("function_call" | "custom_tool_call" | "local_shell_call") => {
+                let Some(call) = owned(p, "call_id") else { return };
+                let name = str_at(p, "name").unwrap_or("shell");
+                let args: Value = str_at(p, "arguments")
+                    .and_then(|a| serde_json::from_str(a).ok())
+                    .unwrap_or(Value::Null);
+                let (kind, ext) = if str_at(p, "type") == Some("local_shell_call") {
+                    let action = p.get("action").cloned().unwrap_or(Value::Null);
+                    (
+                        ItemKind::CommandExecution,
+                        json!({"type": "commandExecution", "command": action.get("command"),
+                               "cwd": action.get("working_directory")}),
+                    )
+                } else if matches!(
+                    name,
+                    "shell" | "exec_command" | "shell_command" | "container.exec"
+                ) {
+                    let command = args.get("command").or_else(|| args.get("cmd")).cloned();
+                    (
+                        ItemKind::CommandExecution,
+                        json!({"type": "commandExecution", "command": command, "cwd": args.get("workdir")}),
+                    )
+                } else if name == "apply_patch" {
+                    let patch = str_at(p, "input")
+                        .or_else(|| str_at(&args, "input"))
+                        .unwrap_or_default();
+                    (
+                        ItemKind::FileChange,
+                        json!({"type": "fileChange", "changes": crate::item::apply_patch_changes(patch)}),
+                    )
+                } else {
+                    let arguments = if args.is_null() {
+                        p.get("input").cloned()
+                    } else {
+                        Some(args)
+                    };
+                    (
+                        ItemKind::ToolCall,
+                        json!({"type": "dynamicToolCall", "tool": name, "arguments": arguments}),
+                    )
+                };
+                out.push(Event::ItemStarted {
+                    id: call,
+                    kind,
+                    extensions: ext,
+                });
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                let Some(call) = owned(p, "call_id") else { return };
+                let raw = p.get("output").cloned().unwrap_or(Value::Null);
+                // Shell outputs are JSON text with the output and exit code.
+                let parsed: Value = raw
+                    .as_str()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(Value::Null);
+                let output = owned(&parsed, "output")
+                    .or_else(|| raw.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let exit = parsed
+                    .pointer("/metadata/exit_code")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let failed = exit.as_i64().is_some_and(|c| c != 0);
+                out.push(Event::ItemCompleted {
+                    id: call,
+                    extensions: json!({
+                        "aggregatedOutput": output,
+                        "contentItems": output,
+                        "exitCode": exit,
+                        "status": if failed { "failed" } else { "completed" },
+                    }),
+                });
+            }
             _ => {}
         }
     }
@@ -183,6 +299,52 @@ impl Observer {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollout_items_render_like_app_server_items() {
+        let lines = [
+            json!({"type": "response_item", "ordinal": 1, "payload": {"type": "message", "role": "user", "id": "u1",
+                "content": [{"type": "input_text", "text": "<environment_context>x</environment_context>"}]}}),
+            json!({"type": "response_item", "ordinal": 2, "payload": {"type": "message", "role": "user", "id": "u2",
+                "content": [{"type": "input_text", "text": "run tests"}]}}),
+            json!({"type": "response_item", "ordinal": 3, "payload": {"type": "function_call", "name": "shell",
+                "call_id": "c1", "arguments": "{\"command\":[\"cargo\",\"test\"],\"workdir\":\"/w\"}"}}),
+            json!({"type": "response_item", "ordinal": 4, "payload": {"type": "function_call_output", "call_id": "c1",
+                "output": "{\"output\":\"ok\",\"metadata\":{\"exit_code\":101}}"}}),
+            json!({"type": "response_item", "ordinal": 5, "payload": {"type": "message", "role": "assistant", "id": "a1",
+                "content": [{"type": "output_text", "text": "tests fail"}]}}),
+        ];
+        let mut bytes = Vec::new();
+        for l in &lines {
+            bytes.extend(serde_json::to_vec(l).unwrap());
+            bytes.push(b'\n');
+        }
+        let mut o = Observer::new();
+        let mut t = crate::transcript::Transcript::new();
+        for e in o.feed(&bytes) {
+            t.apply(&e);
+        }
+        let kinds: Vec<_> = t.items().iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ItemKind::UserMessage,
+                ItemKind::CommandExecution,
+                ItemKind::AgentMessage
+            ]
+        );
+        let cmd = t.get("c1").unwrap();
+        assert_eq!(cmd.status, crate::transcript::ItemStatus::Failed);
+        assert_eq!(
+            cmd.detail(Harness::Codex),
+            crate::item::ItemDetail::Command {
+                command: "cargo test".into(),
+                cwd: Some("/w".into()),
+                output: "ok".into(),
+                exit_code: Some(101)
+            }
+        );
+    }
 
     const ROLLOUT: &str = include_str!("../../tests/fixtures/codex/rollout.jsonl");
 

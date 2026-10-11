@@ -62,6 +62,10 @@ pub struct CodexConfig {
     pub approval_policy: Option<String>,
     /// Permission profile id such as `:workspace` (see `permissionProfile/list`).
     pub permissions: Option<String>,
+    /// Prefix for this client's request ids. With a tag, ids are strings
+    /// (`<tag>-<n>`) so clients sharing one detached session never mistake
+    /// each other's responses in the shared log. Without one, ids are numbers.
+    pub client_tag: Option<String>,
 }
 
 /// What a request ACC sent was for, so its response can be applied.
@@ -108,7 +112,7 @@ pub struct CodexDriver {
     config: CodexConfig,
     framer: LineFramer,
     next_id: u64,
-    pending: HashMap<u64, Req>,
+    pending: HashMap<String, Req>,
     thread_id: Option<String>,
     turn_id: Option<String>,
     state: Option<RunState>,
@@ -169,12 +173,26 @@ impl CodexDriver {
 
     fn request(&mut self, method: &str, params: Value, kind: Req) -> Vec<u8> {
         self.next_id += 1;
-        self.pending.insert(self.next_id, kind);
+        let id = match &self.config.client_tag {
+            Some(tag) => Value::String(format!("{tag}-{}", self.next_id)),
+            None => json!(self.next_id),
+        };
+        self.pending.insert(request_key(&id), kind);
         if params.is_null() {
-            wire::line(&json!({"id": self.next_id, "method": method}))
+            wire::line(&json!({"id": id, "method": method}))
         } else {
-            wire::line(&json!({"id": self.next_id, "method": method, "params": params}))
+            wire::line(&json!({"id": id, "method": method, "params": params}))
         }
+    }
+
+    /// Read-only queries for the palette, options and quota.
+    fn queries(&mut self) -> Vec<u8> {
+        let mut out = self.request("model/list", json!({}), Req::ModelList);
+        out.extend(self.request("permissionProfile/list", json!({}), Req::Profiles));
+        out.extend(self.request("collaborationMode/list", json!({}), Req::Modes));
+        out.extend(self.request("account/rateLimits/read", Value::Null, Req::RateLimits));
+        out.extend(self.request("skills/list", self.skills_params(), Req::Skills));
+        out
     }
 
     fn thread(&self) -> Result<String, DriverError> {
@@ -224,11 +242,14 @@ impl CodexDriver {
     // ---- responses -------------------------------------------------------
 
     fn on_response(&mut self, id: &Value, v: &Value, out: &mut Vec<Event>) {
-        let kind = id
-            .as_u64()
-            .and_then(|n| self.pending.remove(&n))
-            .unwrap_or(Req::Other);
+        let key = request_key(id);
+        let ours = self.pending.contains_key(&key);
+        let kind = self.pending.remove(&key).unwrap_or(Req::Other);
         if let Some(err) = v.get("error") {
+            if !ours {
+                // Another client's failure, read from a shared log.
+                return;
+            }
             // Rate limits need a ChatGPT login; API-key users simply have none.
             if kind != Req::RateLimits {
                 let msg = str_at(err, "message").unwrap_or("request failed");
@@ -239,6 +260,12 @@ impl CodexDriver {
             return;
         }
         let result = v.get("result").cloned().unwrap_or(Value::Null);
+        // Another client's (or an earlier connection's) thread start, resume
+        // or fork, read from a shared log: adopt the thread it opened.
+        let kind = match kind {
+            Req::Other if !ours && result.pointer("/thread/id").is_some() => Req::Thread,
+            k => k,
+        };
         match kind {
             Req::Thread => self.on_thread(&result, out),
             Req::TurnStart => {
@@ -483,6 +510,16 @@ impl CodexDriver {
                 let req = self.request("skills/list", self.skills_params(), Req::Skills);
                 self.transmit.extend(req);
             }
+            // The turn's aggregated unified diff, for clients that show one
+            // per turn rather than per file-change item.
+            "turn/diff/updated" if ours => {
+                if let Some(diff) = owned(&p, "diff") {
+                    out.push(Event::Native {
+                        kind: "turn_diff".into(),
+                        payload: json!({"turnId": p.get("turnId"), "diff": diff}),
+                    });
+                }
+            }
             "thread/compacted" if ours => out.push(Event::Notice {
                 message: "Conversation compacted".into(),
             }),
@@ -648,12 +685,17 @@ impl CodexDriver {
             }
         };
         let key = request_key(&id);
+        let item_id = owned(&params, "itemId");
+        let input = params.clone();
         self.requests
             .insert(key.clone(), ServerRequest { id, method, params });
         out.push(Event::PermissionRequested {
             request_id: key,
             title,
             options,
+            kind,
+            item_id,
+            input,
         });
         self.set_state(RunState::Blocked { kind }, None, out);
     }
@@ -912,12 +954,13 @@ impl Driver for CodexDriver {
             None => self.request("thread/start", self.thread_params(), Req::Thread),
         };
         out.extend(thread);
-        out.extend(self.request("model/list", json!({}), Req::ModelList));
-        out.extend(self.request("permissionProfile/list", json!({}), Req::Profiles));
-        out.extend(self.request("collaborationMode/list", json!({}), Req::Modes));
-        out.extend(self.request("account/rateLimits/read", Value::Null, Req::RateLimits));
-        out.extend(self.request("skills/list", self.skills_params(), Req::Skills));
+        out.extend(self.queries());
         out
+    }
+
+    /// The thread comes from the log; only the side queries are repeated.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        self.queries()
     }
 
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {

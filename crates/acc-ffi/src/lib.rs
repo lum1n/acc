@@ -1,8 +1,19 @@
 //! UniFFI surface of acc-core for Swift (iOS/macOS) and Kotlin (Android/JVM).
 //!
-//! Kept deliberately thin: records mirror core types, objects wrap stateful
-//! parsers behind a `Mutex` so they are safe to share across threads. Panics
-//! are caught by UniFFI and surfaced as errors instead of crashing the app.
+//! Records mirror core types ([`types`]); objects wrap stateful sessions and
+//! parsers behind a `Mutex` so they are safe to share across threads
+//! ([`session`]). The surface is a byte pump with no callbacks: the app runs
+//! the scripts it is handed over its own SSH channels and feeds back their
+//! output. Panics are caught by UniFFI and surfaced as errors instead of
+//! crashing the app.
+
+pub mod observe;
+pub mod session;
+pub mod types;
+
+pub use observe::*;
+pub use session::*;
+pub use types::*;
 
 use std::sync::Mutex;
 

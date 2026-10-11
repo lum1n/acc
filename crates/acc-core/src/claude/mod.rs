@@ -57,6 +57,10 @@ pub struct ClaudeConfig {
     /// With a resume id: start a new session id from that conversation
     /// (`--fork-session`), which is how ACC forks a Claude session.
     pub fork: bool,
+    /// Prefix for this client's control request ids. Clients sharing one
+    /// detached session see each other's responses in the shared log, so
+    /// each needs its own (`[A-Za-z0-9_-]`). Defaults to `acc`.
+    pub client_tag: Option<String>,
 }
 
 /// What a control request ACC sent was for, so its reply can be applied.
@@ -153,7 +157,8 @@ impl ClaudeDriver {
 
     fn control(&mut self, request: Value, kind: Pending) -> Vec<u8> {
         self.next_request += 1;
-        let id = format!("acc-{}", self.next_request);
+        let tag = self.config.client_tag.as_deref().unwrap_or("acc");
+        let id = format!("{tag}-{}", self.next_request);
         self.pending.insert(id.clone(), kind);
         wire::line(&json!({"type": "control_request", "request_id": id, "request": request}))
     }
@@ -498,6 +503,7 @@ impl ClaudeDriver {
                         let Some(id) = owned(block, "tool_use_id") else {
                             continue;
                         };
+                        self.resolve_tool(&id, out);
                         if self.open_tools.remove(&id) {
                             out.push(Event::ItemCompleted {
                                 id,
@@ -572,6 +578,14 @@ impl ClaudeDriver {
             context_used: self.last_context,
             context_window: self.context_window,
         }));
+        // A turn can't end while a prompt is open, so anything left was
+        // answered or withdrawn in a way the log doesn't show.
+        let mut left: Vec<String> = self.permissions.drain().map(|(id, _)| id).collect();
+        left.sort_unstable();
+        out.extend(
+            left.into_iter()
+                .map(|request_id| Event::PermissionResolved { request_id }),
+        );
         out.push(Event::TurnCompleted);
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false)
             || str_at(v, "subtype").is_some_and(|s| s != "success");
@@ -691,6 +705,8 @@ impl ClaudeDriver {
             (title, options, None)
         };
         let is_question = question.is_some();
+        let item_id = owned(req, "tool_use_id");
+        let preview = input.clone();
         self.permissions.insert(
             id.clone(),
             PendingPermission {
@@ -704,6 +720,13 @@ impl ClaudeDriver {
             request_id: id,
             title,
             options,
+            kind: if is_question {
+                BlockKind::Question
+            } else {
+                BlockKind::Permission
+            },
+            item_id,
+            input: preview,
         });
         if !self.native_state_events {
             let kind = if is_question {
@@ -720,6 +743,9 @@ impl ClaudeDriver {
         let id = str_at(resp, "request_id").unwrap_or_default();
         let kind = self.pending.remove(id).unwrap_or(Pending::Other);
         if str_at(resp, "subtype") == Some("error") {
+            if !self.is_ours(id) {
+                return;
+            }
             let error = str_at(resp, "error").unwrap_or("request failed");
             out.push(Event::Notice {
                 message: format!("Claude Code: {error}"),
@@ -727,6 +753,14 @@ impl ClaudeDriver {
             return;
         }
         let body = resp.get("response").cloned().unwrap_or(Value::Null);
+        // Another client's (or an earlier connection's) `initialize` reply,
+        // read from a shared log: adopt the palette and options it carries.
+        let kind = match kind {
+            Pending::Other if body.get("commands").is_some() && body.get("models").is_some() => {
+                Pending::Initialize
+            }
+            k => k,
+        };
         match kind {
             Pending::Initialize => {
                 if let Some(list) = body.get("commands").and_then(Value::as_array) {
@@ -780,6 +814,28 @@ impl ClaudeDriver {
                     out.push(Event::OptionsChanged);
                 }
             }
+        }
+    }
+
+    /// Whether a control request id was minted by this client.
+    fn is_ours(&self, id: &str) -> bool {
+        let tag = self.config.client_tag.as_deref().unwrap_or("acc");
+        id.strip_prefix(tag).is_some_and(|rest| rest.starts_with('-'))
+    }
+
+    /// A permission is over once its tool reports a result (allowed and run,
+    /// or denied). Answers travel on stdin, so a shared log or a replay only
+    /// shows the outcome; this is how every client learns of it.
+    fn resolve_tool(&mut self, tool_use_id: &str, out: &mut Vec<Event>) {
+        let done: Vec<String> = self
+            .permissions
+            .iter()
+            .filter(|(_, p)| p.tool_use_id.as_deref() == Some(tool_use_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in done {
+            self.permissions.remove(&id);
+            out.push(Event::PermissionResolved { request_id: id });
         }
     }
 
@@ -948,6 +1004,14 @@ impl Driver for ClaudeDriver {
         self.control(json!({"subtype": "initialize"}), Pending::Initialize)
     }
 
+    /// The palette and options come from the first client's `initialize`
+    /// reply in the log; only usage and the model list are asked again.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        let mut bytes = self.control(json!({"subtype": "get_context_usage"}), Pending::Other);
+        bytes.extend(self.control(json!({"subtype": "list_models"}), Pending::Other));
+        bytes
+    }
+
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
         let mut out = Vec::new();
         for frame in self.framer.feed(bytes) {
@@ -1053,7 +1117,7 @@ fn slash(name: &str, args: &str) -> String {
     }
 }
 
-fn tool_kind(name: &str) -> ItemKind {
+pub(crate) fn tool_kind(name: &str) -> ItemKind {
     match name {
         "Bash" | "PowerShell" => ItemKind::CommandExecution,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ItemKind::FileChange,

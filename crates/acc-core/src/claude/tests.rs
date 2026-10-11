@@ -16,6 +16,20 @@ fn replay(d: &mut ClaudeDriver, recording: &str) -> Vec<Event> {
     out
 }
 
+/// The permission recording up to and including the `can_use_tool` request,
+/// so the prompt is still open (the full recording goes on to deny it).
+fn until_prompt(recording: &str) -> String {
+    let mut out = String::new();
+    for line in recording.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if line.contains("\"can_use_tool\"") {
+            break;
+        }
+    }
+    out
+}
+
 fn sent(bytes: &[u8]) -> Vec<Value> {
     String::from_utf8(bytes.to_vec())
         .unwrap()
@@ -40,6 +54,7 @@ fn launch_spec_requests_control_protocol() {
         model: Some("opus".into()),
         permission_mode: None,
         fork: true,
+        client_tag: None,
     });
     let spec = d.launch(Some("abc"));
     for flag in [
@@ -181,6 +196,7 @@ fn permission_round_trip_matches_recording() {
                 request_id,
                 title,
                 options,
+                ..
             } => Some((request_id.clone(), title.clone(), options.clone())),
             _ => None,
         })
@@ -216,7 +232,7 @@ fn permission_round_trip_matches_recording() {
 #[test]
 fn answers_are_control_responses() {
     let mut d = ClaudeDriver::default();
-    replay(&mut d, PERMISSION);
+    replay(&mut d, &until_prompt(PERMISSION));
     let rid = "ef3cff2f-5523-4403-874b-dfeb45c76fb7";
 
     let bytes = d
@@ -272,7 +288,7 @@ fn ask_user_question_is_a_question_answered_by_allowing() {
 #[test]
 fn cancel_request_resolves_pending_permission() {
     let mut d = ClaudeDriver::default();
-    replay(&mut d, PERMISSION);
+    replay(&mut d, &until_prompt(PERMISSION));
     let events = d.on_output(
         b"{\"type\":\"control_cancel_request\",\"request_id\":\"ef3cff2f-5523-4403-874b-dfeb45c76fb7\"}\n",
     );
@@ -421,4 +437,59 @@ fn garbage_and_unknown_frames_are_kept_not_fatal() {
     let events = d.on_output(b"not json\n{\"type\":\"future_thing\"}\n");
     assert_eq!(events.len(), 2);
     assert!(events.iter().all(|e| matches!(e, Event::Unrecognized { .. })));
+}
+
+#[test]
+fn tool_result_resolves_the_prompt_for_every_reader_of_the_log() {
+    let mut d = ClaudeDriver::default();
+    let events = replay(&mut d, PERMISSION);
+    let rid = "ef3cff2f-5523-4403-874b-dfeb45c76fb7";
+    let asked = events
+        .iter()
+        .position(|e| matches!(e, Event::PermissionRequested { request_id, .. } if request_id == rid));
+    let resolved = events
+        .iter()
+        .position(|e| matches!(e, Event::PermissionResolved { request_id } if request_id == rid));
+    assert!(matches!((asked, resolved), (Some(a), Some(r)) if a < r));
+    assert_eq!(
+        d.command(Command::AnswerPermission {
+            request_id: rid.into(),
+            option_id: "allow".into()
+        }),
+        Err(DriverError::UnknownRequest(rid.into()))
+    );
+}
+
+#[test]
+fn client_tag_prefixes_ids_and_foreign_errors_are_ignored() {
+    let mut d = ClaudeDriver::new(ClaudeConfig {
+        client_tag: Some("phone7".into()),
+        ..ClaudeConfig::default()
+    });
+    let hs = sent(&d.handshake());
+    assert_eq!(hs[0]["request_id"], "phone7-1");
+    let events = d.on_output(
+        b"{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"desk-3\",\"error\":\"x\"}}\n",
+    );
+    assert!(events.is_empty());
+}
+
+#[test]
+fn attaching_client_adopts_another_clients_initialize_reply() {
+    let mut first = ClaudeDriver::default();
+    let _ = first.handshake();
+    let mut late = ClaudeDriver::new(ClaudeConfig {
+        client_tag: Some("late".into()),
+        ..ClaudeConfig::default()
+    });
+    let events = replay(&mut late, HI);
+    assert!(events.contains(&Event::CommandsChanged));
+    assert!(late.commands().iter().any(|c| c.source != CommandSource::Acc));
+    let attach = sent(&late.attach_handshake());
+    assert!(attach.iter().all(|m| m["request"]["subtype"] != "initialize"));
+    assert!(
+        attach
+            .iter()
+            .all(|m| m["request_id"].as_str().unwrap().starts_with("late-"))
+    );
 }

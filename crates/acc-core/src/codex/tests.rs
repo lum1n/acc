@@ -302,6 +302,7 @@ fn command_approval_round_trip() {
                 request_id,
                 title,
                 options,
+                ..
             } => Some((request_id.clone(), title.clone(), options.clone())),
             _ => None,
         })
@@ -560,4 +561,53 @@ fn prompt_before_thread_is_not_started() {
         d.command(Command::Prompt { text: "x".into() }),
         Err(DriverError::NotStarted)
     );
+}
+
+#[test]
+fn client_tag_makes_string_ids_and_attach_skips_initialize() {
+    let mut d = CodexDriver::new(CodexConfig {
+        client_tag: Some("ph".into()),
+        ..CodexConfig::default()
+    });
+    let msgs = sent(&d.handshake());
+    assert_eq!(msgs[0]["id"], "ph-1");
+    let attach = sent(&d.attach_handshake());
+    assert!(
+        attach
+            .iter()
+            .all(|m| m["id"].as_str().is_some_and(|i| i.starts_with("ph-")))
+    );
+    let methods: Vec<_> = attach.iter().map(|m| m["method"].as_str().unwrap()).collect();
+    assert!(
+        !methods
+            .iter()
+            .any(|m| *m == "initialize" || m.starts_with("thread/"))
+    );
+    assert!(methods.contains(&"model/list"));
+}
+
+#[test]
+fn late_client_adopts_thread_from_shared_log_and_ignores_foreign_errors() {
+    let mut late = CodexDriver::new(CodexConfig {
+        client_tag: Some("late".into()),
+        ..CodexConfig::default()
+    });
+    let events = replay(&mut late, HANDSHAKE);
+    assert_eq!(late.thread_id(), Some(THREAD));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::SessionStarted { native_id, .. } if native_id == THREAD))
+    );
+    assert!(feed(&mut late, json!({"id": 9, "error": {"message": "nope"}})).is_empty());
+}
+
+#[test]
+fn turn_diff_is_passed_through() {
+    let mut d = started();
+    let events = feed(
+        &mut d,
+        json!({"method": "turn/diff/updated", "params": {"threadId": THREAD, "turnId": "t1", "diff": "diff --git a/x b/x\n"}}),
+    );
+    assert!(events.iter().any(|e| matches!(e, Event::Native { kind, payload } if kind == "turn_diff" && payload["diff"].as_str().is_some())));
 }

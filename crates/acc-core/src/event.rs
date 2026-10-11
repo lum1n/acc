@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::Harness;
-use crate::state::SessionState;
+use crate::state::{BlockKind, SessionState};
+
+fn permission_kind() -> BlockKind {
+    BlockKind::Permission
+}
 
 /// Identifies an item (message, tool call, file edit, command) within a session.
 pub type ItemId = String;
@@ -49,6 +53,16 @@ pub enum Event {
         request_id: String,
         title: String,
         options: Vec<PermissionOption>,
+        /// A question to answer (options are suggested answers, and any
+        /// text is accepted as the option id) rather than an approval.
+        #[serde(default = "permission_kind")]
+        kind: BlockKind,
+        /// The tool item this request is about, when the harness says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<ItemId>,
+        /// The tool input or request parameters, for previews.
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        input: Value,
     },
     /// A pending request was answered (possibly by another client) or withdrawn.
     PermissionResolved {

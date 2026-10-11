@@ -17,6 +17,10 @@
 //! - [`claude`], [`codex`]: drivers for Claude Code stream-json and Codex app-server.
 //! - [`ndjson`], [`osc7501`]: incremental parsers used by drivers and terminals.
 //! - [`detached`]: shell scripts for daemonless, disconnect-proof sessions.
+//! - [`session`]: a driver bound to a detached session: launch, attach with
+//!   replay, and the folded transcript, state, usage and permissions.
+//! - [`item`], [`transcript`]: typed item details (commands, tools, diffs) and
+//!   the per-session item list.
 //! - [`multiplexer`]: locating harnesses inside tmux, zellij, screen and Rex.
 //! - [`acp`]: the Agent Client Protocol driver (Cursor, Copilot, opencode).
 
@@ -24,21 +28,28 @@ pub mod claude;
 pub mod codex;
 pub mod command;
 pub mod detached;
+pub mod discover;
 pub mod driver;
 pub mod event;
 pub mod harness;
+pub mod item;
 // Harness drivers.
 pub mod acp;
 pub mod multiplexer;
 pub mod ndjson;
+pub mod observe;
 pub mod osc7501;
 pub mod pi;
+pub mod session;
 pub mod shell;
 pub mod state;
+pub mod takeover;
+pub mod transcript;
 mod wire;
 
 pub use event::Event;
 pub use harness::Harness;
+pub use multiplexer::Exec;
 pub use state::{BlockKind, RunState, SessionState, StateSource};
 
 /// Version of this crate, for clients to show and compare across host and client.

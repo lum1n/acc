@@ -70,6 +70,40 @@ session.
 wait for the turn to end (or force), close the TUI, resume headless detached, auto-continue if a turn
 was interrupted. Inside a multiplexer ACC can also co-drive the TUI via the multiplexer's CLI.
 
+## Sessions
+
+`acc_core::session::Session` binds a driver to a detached session directory. `launch` writes
+`spec.json` (harness, cwd, launch command, native id once known) next to the log, so any client can
+list sessions (`detached::list_script`) and attach. Attaching replays `out.ndjson` through a fresh
+driver while suppressing everything it would transmit, then sends only safe, repeatable queries
+(`Driver::attach_handshake`). Request ids carry a per-client tag, and drivers read other clients'
+responses by shape, so several clients share one harness. Claude answers travel on stdin and never
+reach the log, so the Claude driver resolves a permission from the tool's result instead; every
+client, and every replay, sees it answered.
+
+Every update carries a `replay` flag (history vs. live, for notifications) and the change it made to
+the session's `Transcript`: items with accumulated text and merged extensions. `item::detail` turns
+each harness's native item JSON into one typed shape (tool call, command with output and exit code,
+file change with hunks) and `item::parse_unified` reads `git diff`. Commands a harness can only carry
+out with a new process (Claude fork, a model Cursor takes at spawn) come back as
+`Outbound::Relaunch`.
+
+`detached::fan_in_script` follows any number of logs and transcripts on one SSH channel, tagged per
+file, with byte offsets so a restarted follower resumes without loss; closing the channel takes all
+its processes down. One long-lived channel per host keeps a client inside sshd's per-connection
+session limit however many agents run.
+
+## Foreign sessions
+
+`discover` lists harness TUIs ACC didn't start: process, working directory, multiplexer pane (from
+its environment), and its transcript (an open file, else the newest in the harness's directory).
+`observe::Observed` follows that transcript (Claude, Codex and pi observers emit full conversation
+items, not just state), infers a waiting approval from a quiet outstanding tool call, and can type
+prompts into the pane. `takeover::Takeover` is the state machine for moving it into a detached
+session: wait for a safe point (or interrupt when forced), close the TUI the way a user would,
+confirm the process is gone, resume headless with the harness's session id. `hand_back_exec` types
+the resume command back into the original pane.
+
 ## Multiplexers
 
 `acc_core::multiplexer` drives harnesses running inside tmux, zellij, screen and Rex with the host's

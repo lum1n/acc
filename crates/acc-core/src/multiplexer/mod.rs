@@ -104,14 +104,14 @@ pub struct Exec {
 }
 
 impl Exec {
-    fn new(script: String) -> Self {
+    pub fn new(script: String) -> Self {
         Self {
             script,
             stdin: Vec::new(),
         }
     }
 
-    fn with_stdin(script: String, stdin: impl Into<Vec<u8>>) -> Self {
+    pub fn with_stdin(script: String, stdin: impl Into<Vec<u8>>) -> Self {
         Self {
             script,
             stdin: stdin.into(),

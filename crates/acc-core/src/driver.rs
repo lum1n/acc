@@ -34,6 +34,15 @@ pub trait Driver: Send {
     /// ACP/app-server `initialize`). Empty for harnesses that need none.
     fn handshake(&mut self) -> Vec<u8>;
 
+    /// Bytes to write when joining a harness that another client (or an
+    /// earlier connection of this one) already started and initialized, after
+    /// its log has been replayed through [`Driver::on_output`]. Only safe,
+    /// repeatable queries (models, usage, palette) are sent; never a second
+    /// `initialize` or a new session.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+
     /// Feed bytes read from the harness; returns events in order.
     ///
     /// Drivers have no clock, so `SessionState::observed_at_ms` is 0 in the

@@ -624,6 +624,9 @@ impl PiDriver {
             request_id: id,
             title,
             options,
+            kind,
+            item_id: None,
+            input: v.clone(),
         });
     }
 
@@ -744,6 +747,11 @@ impl Driver for PiDriver {
             out.extend(req);
         }
         out
+    }
+
+    /// pi's handshake is read-only queries, so a joining client repeats it.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        self.handshake()
     }
 
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
@@ -957,6 +965,11 @@ impl Transcript {
             open_tools: Vec::new(),
             usage: Usage::default(),
         }
+    }
+
+    /// Tool calls with no result yet.
+    pub fn pending_tools(&self) -> usize {
+        self.open_tools.len()
     }
 
     /// Feeds bytes from the session file (from a `tail -c +N -f`).

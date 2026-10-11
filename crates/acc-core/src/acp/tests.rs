@@ -238,10 +238,9 @@ fn a_full_turn_with_a_permission_prompt() {
         id: "item-2".into(),
         extensions: Value::Null
     }));
-    assert!(events.contains(&Event::PermissionRequested {
-        request_id: "7".into(),
-        title: "cargo build".into(),
-        options: vec![
+    assert!(events.iter().any(|e| matches!(e, Event::PermissionRequested {
+        request_id, title, options, kind: BlockKind::Permission, item_id, ..
+    } if request_id == "7" && title == "cargo build" && item_id.is_some() && options == &vec![
             PermissionOption {
                 id: "allow-once".into(),
                 label: "Allow".into()
@@ -250,8 +249,7 @@ fn a_full_turn_with_a_permission_prompt() {
                 id: "reject-once".into(),
                 label: "Reject".into()
             },
-        ],
-    }));
+        ])));
 
     // The answer echoes the agent's numeric id.
     let answer = one(&d

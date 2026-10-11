@@ -163,6 +163,55 @@ impl Harness {
     }
 }
 
+/// A harness found on a host by [`probe_script`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Availability {
+    pub harness: Harness,
+    /// Absolute path of the executable.
+    pub path: String,
+    /// First line of `--version`, when it printed one in time.
+    pub version: Option<String>,
+}
+
+/// Script listing which harnesses are installed on the host, using the
+/// user's login `PATH`. Parse it with [`parse_probe`].
+pub fn probe_script() -> String {
+    let programs = Harness::ALL.map(Harness::program).join(" ");
+    format!(
+        "{prelude}\n\
+         if command -v timeout >/dev/null 2>&1; then t='timeout 8'; else t=''; fi\n\
+         for p in {programs}; do\n\
+         path=$(command -v \"$p\" 2>/dev/null) || continue\n\
+         case $path in /*) ;; *) continue ;; esac\n\
+         v=$($t \"$path\" --version </dev/null 2>/dev/null | head -n 1)\n\
+         printf 'H\\t%s\\t%s\\t%s\\n' \"$p\" \"$path\" \"$v\"\n\
+         done; true\n",
+        prelude = crate::detached::login_path_prelude(),
+    )
+}
+
+/// Parses the output of [`probe_script`].
+pub fn parse_probe(out: &str) -> Vec<Availability> {
+    out.lines()
+        .filter_map(|line| {
+            let mut f = line.strip_prefix("H\t")?.splitn(3, '\t');
+            let program = f.next()?;
+            let harness = Harness::ALL.into_iter().find(|h| h.program() == program)?;
+            let path = f.next()?.to_owned();
+            let version = f
+                .next()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned);
+            Some(Availability {
+                harness,
+                path,
+                version,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +229,32 @@ mod tests {
         let spec = Harness::Claude.launch(Some("abc"));
         assert_eq!(spec.args[spec.args.len() - 2..], ["--resume", "abc"]);
         assert_eq!(spec.protocol, Protocol::ClaudeStreamJson);
+    }
+
+    #[test]
+    fn probe_parses_found_harnesses() {
+        let out = "H\tclaude\t/u/bin/claude\t2.1.296 (Claude Code)\nH\tagent\t/u/bin/agent\t\nnoise\n";
+        let found = parse_probe(out);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].version.as_deref(), Some("2.1.296 (Claude Code)"));
+        assert_eq!(
+            (found[1].harness, found[1].version.clone()),
+            (Harness::Cursor, None)
+        );
+        assert!(probe_script().contains("command -v"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_script_runs_under_sh() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe_script())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        // Whatever is installed here, every line must parse.
+        assert_eq!(parse_probe(&out).len(), out.lines().count());
     }
 
     #[test]

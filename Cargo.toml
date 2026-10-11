@@ -14,6 +14,7 @@ acc-core = { path = "crates/acc-core" }
 base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+similar = { version = "2", default-features = false, features = ["text"] }
 thiserror = "2"
 uniffi = "0.32"
 wasm-bindgen = "0.2"

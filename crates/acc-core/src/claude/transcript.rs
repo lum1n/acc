@@ -2,15 +2,16 @@
 //!
 //! Every Claude Code front end (terminal, desktop app, IDE extensions) appends
 //! the conversation to `~/.claude/projects/<project>/<session>.jsonl`. Tailing
-//! it over SSH (`tail -c +OFFSET -f`) gives state and usage with nothing
+//! it over SSH (`tail -c +OFFSET -f`) gives the conversation (messages,
+//! reasoning, tool calls and their results), state and usage with nothing
 //! installed on the host, and tells ACC when a session is at a safe point to
 //! take over (the turn has ended and no tool call is outstanding).
 
 use std::collections::HashSet;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::event::{Event, Usage};
+use crate::event::{Event, ItemKind, Usage};
 use crate::harness::Harness;
 use crate::ndjson::{Frame, LineFramer};
 use crate::shell::quote;
@@ -110,6 +111,14 @@ impl Observer {
     }
 
     fn line(&mut self, v: &Value, out: &mut Vec<Event>) {
+        if str_at(v, "type") == Some("ai-title")
+            && let Some(title) = owned(v, "aiTitle")
+        {
+            out.push(Event::Native {
+                kind: "title".into(),
+                payload: json!({ "title": title }),
+            });
+        }
         if self.session_id.is_none()
             && let Some(id) = owned(v, "sessionId")
         {
@@ -128,17 +137,31 @@ impl Observer {
         match str_at(v, "type") {
             Some("user") => {
                 let mut prompt = false;
+                let mut text = String::new();
                 match message.get("content") {
-                    Some(Value::String(s)) => prompt = !s.starts_with("<local-command"),
+                    Some(Value::String(s)) => {
+                        prompt = !s.starts_with("<local-command");
+                        text.push_str(s);
+                    }
                     Some(Value::Array(blocks)) => {
                         for b in blocks {
                             match str_at(b, "type") {
                                 Some("tool_result") => {
                                     if let Some(id) = str_at(b, "tool_use_id") {
                                         self.pending_tools.remove(id);
+                                        out.push(Event::ItemCompleted {
+                                            id: id.to_owned(),
+                                            extensions: json!({
+                                                "is_error": b.get("is_error").cloned().unwrap_or(Value::Bool(false)),
+                                                "content": b.get("content").cloned().unwrap_or(Value::Null),
+                                            }),
+                                        });
                                     }
                                 }
-                                Some("text") => prompt = true,
+                                Some("text") => {
+                                    prompt = true;
+                                    text.push_str(str_at(b, "text").unwrap_or_default());
+                                }
                                 _ => {}
                             }
                         }
@@ -149,15 +172,43 @@ impl Observer {
                 if prompt && !meta {
                     self.pending_tools.clear();
                     self.set(RunState::Working { progress: None }, out);
+                    let id = owned(v, "uuid").unwrap_or_else(|| format!("user-{}", text.len()));
+                    whole_item(out, id, ItemKind::UserMessage, text, Value::Null);
                 }
             }
             Some("assistant") => {
+                let uuid = owned(v, "uuid").unwrap_or_default();
                 if let Some(blocks) = message.get("content").and_then(Value::as_array) {
-                    for b in blocks {
-                        if str_at(b, "type") == Some("tool_use")
-                            && let Some(id) = owned(b, "id")
-                        {
-                            self.pending_tools.insert(id);
+                    for (i, b) in blocks.iter().enumerate() {
+                        match str_at(b, "type") {
+                            Some("tool_use" | "server_tool_use") => {
+                                let Some(id) = owned(b, "id") else { continue };
+                                self.pending_tools.insert(id.clone());
+                                let name = str_at(b, "name").unwrap_or_default();
+                                out.push(Event::ItemStarted {
+                                    id,
+                                    kind: super::tool_kind(name),
+                                    extensions: json!({
+                                        "name": name,
+                                        "input": b.get("input").cloned().unwrap_or(Value::Null),
+                                    }),
+                                });
+                            }
+                            Some("text") => whole_item(
+                                out,
+                                format!("{uuid}:{i}"),
+                                ItemKind::AgentMessage,
+                                str_at(b, "text").unwrap_or_default().to_owned(),
+                                Value::Null,
+                            ),
+                            Some("thinking") => whole_item(
+                                out,
+                                format!("{uuid}:{i}"),
+                                ItemKind::Reasoning,
+                                str_at(b, "thinking").unwrap_or_default().to_owned(),
+                                Value::Null,
+                            ),
+                            _ => {}
                         }
                     }
                 }
@@ -201,6 +252,19 @@ impl Observer {
             observed_at_ms: 0,
         }));
     }
+}
+
+/// Announces an item that is complete when first seen.
+pub(crate) fn whole_item(out: &mut Vec<Event>, id: String, kind: ItemKind, text: String, ext: Value) {
+    out.push(Event::ItemStarted {
+        id: id.clone(),
+        kind,
+        extensions: Value::Null,
+    });
+    if !text.is_empty() {
+        out.push(Event::ItemDelta { id: id.clone(), text });
+    }
+    out.push(Event::ItemCompleted { id, extensions: ext });
 }
 
 #[cfg(test)]
@@ -248,6 +312,33 @@ mod tests {
                 RunState::Done
             ]
         );
+    }
+
+    #[test]
+    fn transcript_becomes_a_conversation() {
+        let mut o = Observer::new();
+        let mut t = crate::transcript::Transcript::new();
+        for e in o.feed(TRANSCRIPT.as_bytes()) {
+            t.apply(&e);
+        }
+        let kinds: Vec<_> = t.items().iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ItemKind::UserMessage,
+                ItemKind::AgentMessage,
+                ItemKind::UserMessage,
+                ItemKind::CommandExecution,
+                ItemKind::AgentMessage
+            ]
+        );
+        assert_eq!(t.items()[1].text, "hi");
+        let bash = &t.items()[3];
+        assert_eq!(bash.status, crate::transcript::ItemStatus::Failed);
+        assert!(matches!(
+            bash.detail(Harness::Claude),
+            crate::item::ItemDetail::Command { ref command, .. } if command.contains("acc-probe")
+        ));
     }
 
     #[test]
