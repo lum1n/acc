@@ -21,6 +21,8 @@ pub enum DriverError {
     UnknownRequest(String),
     #[error("unknown option value {0}")]
     InvalidOption(String),
+    #[error("this command needs {0}")]
+    MissingArgument(&'static str),
 }
 
 /// Translates between one harness protocol and ACC's model.

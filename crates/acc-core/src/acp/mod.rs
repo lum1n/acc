@@ -24,7 +24,9 @@ use serde_json::{Value, json};
 pub use options::{ConfigOption, ConfigValue};
 use options::{OptionState, Route, set_config_params};
 
-use crate::command::{Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, offer, offer_option,
+};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Usage};
 use crate::harness::{Harness, LaunchSpec, Protocol};
@@ -501,6 +503,7 @@ impl AcpDriver {
             model: self.opts.current_model(),
         });
         out.push(Event::OptionsChanged);
+        self.refresh_palette(out);
         self.set_state(RunState::Idle, None, out);
         for (sid, msg) in std::mem::take(&mut self.early) {
             if self.session_id.as_deref() == Some(sid.as_str()) {
@@ -886,35 +889,74 @@ impl AcpDriver {
     fn options_changed(&mut self, out: &mut Vec<Event>) {
         self.opts.rebuild(self.harness);
         out.push(Event::OptionsChanged);
+        self.refresh_palette(out);
     }
 
-    /// Harness commands first, then ACC's canonical ones the harness lacks.
+    /// Rebuilds the palette after the options changed, reporting it when
+    /// pickers came or went.
+    fn refresh_palette(&mut self, out: &mut Vec<Event>) {
+        let before: Vec<String> = self.commands.iter().map(|c| c.name.clone()).collect();
+        self.rebuild_commands();
+        if self.commands.iter().map(|c| &c.name).ne(before.iter()) {
+            out.push(Event::CommandsChanged);
+        }
+    }
+
+    /// Harness commands first, then ACC's canonical ones the harness lacks,
+    /// then pickers for the options the agent reports.
     fn rebuild_commands(&mut self) {
         let mut all = self.harness_commands.clone();
-        let rpc = |name: &str, description: &str, method: &str| CommandEntry {
-            name: name.into(),
-            description: description.into(),
-            arg_hint: None,
-            source: CommandSource::Acc,
-            exec: Exec::Rpc {
-                method: method.into(),
-            },
-        };
-        let mut canonical = vec![
+        let rpc =
+            |name: &str, description: &str, method: &str| CommandEntry::rpc(name, description, None, method);
+        offer(
+            &mut all,
             rpc("interrupt", "Stop the current turn", "session/cancel"),
-            rpc("new", "Start a new session", "session/new"),
-        ];
+        );
+        offer(&mut all, rpc("new", "Start a new session", "session/new"));
         if self.fork_session {
-            canonical.push(rpc("fork", "Fork this session", "session/fork"));
+            offer(&mut all, rpc("fork", "Fork this session", "session/fork"));
         }
-        for c in canonical {
-            if !all.iter().any(|h| h.name == c.name) {
-                all.push(c);
-            }
+        // opencode 1.18.35 and 2.0.14 run `/compact` without listing it.
+        if self.harness == Harness::Opencode {
+            offer(
+                &mut all,
+                CommandEntry {
+                    source: CommandSource::Builtin,
+                    exec: Exec::Text,
+                    ..rpc("compact", "Summarize the conversation to free context", "")
+                },
+            );
+        }
+        for (id, name, description) in OPTION_COMMANDS {
+            let method = match self.opts.route(id) {
+                Some(Route::SpawnFlag) => "restart",
+                Some(Route::Config { .. }) => "session/set_config_option",
+                Some(Route::LegacyMode) => "session/set_mode",
+                Some(Route::LegacyModel) => "session/set_model",
+                None => continue,
+            };
+            offer_option(
+                &mut all,
+                &self.opts.defs,
+                id,
+                CommandEntry::rpc(name, description, Some("<value>"), method),
+            );
         }
         self.commands = all;
     }
 }
+
+/// Palette names for option pickers.
+const OPTION_COMMANDS: [(OptionId, &str, &str); 4] = [
+    (OptionId::Model, "model", "Choose the model"),
+    (OptionId::Effort, "effort", "Choose reasoning effort"),
+    (OptionId::Mode, "mode", "Choose the agent mode"),
+    (
+        OptionId::Permission,
+        "permissions",
+        "Choose what the agent may do without asking",
+    ),
+];
 
 impl Driver for AcpDriver {
     fn harness(&self) -> Harness {
@@ -1057,6 +1099,22 @@ impl AcpDriver {
             "interrupt" => self.command(Command::Interrupt),
             "new" => self.command(Command::New),
             "fork" => self.command(Command::Fork),
+            // An option picker the agent doesn't list as its own command.
+            _ if !self.harness_commands.iter().any(|c| c.name == name)
+                && let Some((id, ..)) = OPTION_COMMANDS.iter().find(|(_, n, _)| *n == name) =>
+            {
+                let value = args.trim();
+                if value.is_empty() {
+                    return Err(DriverError::MissingArgument("a value"));
+                }
+                self.command(Command::SetOption {
+                    id: *id,
+                    value: value.to_owned(),
+                })
+            }
+            "compact" if self.harness == Harness::Opencode => self.command(Command::Compact {
+                hint: Some(args.to_owned()).filter(|a| !a.trim().is_empty()),
+            }),
             _ if self.harness_commands.iter().any(|c| c.name == name) => {
                 let text = if args.is_empty() {
                     format!("/{name}")
@@ -1194,6 +1252,7 @@ fn parse_commands(list: Option<&Value>) -> Vec<CommandEntry> {
                     .map(str::to_owned),
                 source: CommandSource::Builtin,
                 exec: Exec::Text,
+                input: CommandInput::None,
                 name,
             })
         })

@@ -94,6 +94,20 @@ pub fn hand_back_exec(spec_json: String, native_id: String, pane: String) -> Opt
         .map(Into::into)
 }
 
+/// A shell command line that opens `harness`'s own TUI in `cwd`, for
+/// palette entries whose `exec` is `terminal`. It starts a fresh session
+/// rather than resuming the headless one, so the two never share a session.
+#[uniffi::export]
+pub fn tui_command(harness: AccHarness, cwd: String) -> Option<String> {
+    let program = acc_core::multiplexer::tui::launch(harness.into(), None).ok()?;
+    let argv = program.argv();
+    Some(format!(
+        "cd {} && exec {}",
+        acc_core::shell::quote(&cwd),
+        acc_core::shell::join(argv.iter().map(String::as_str))
+    ))
+}
+
 /// A foreign agent followed through its transcript.
 #[derive(Debug, uniffi::Object)]
 pub struct AccObserved {

@@ -34,9 +34,14 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::command::{Apply, Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Apply, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, offer_option,
+    split_verb,
+};
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemKind, PermissionOption, Quota, QuotaWindow, Usage};
+use crate::event::{
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+};
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -79,6 +84,12 @@ enum Req {
     Modes,
     RateLimits,
     Skills,
+    /// Data for a panel ACC draws.
+    Panel(&'static str),
+    /// An action from a panel; the panel is fetched again afterwards.
+    PanelAction(&'static str),
+    /// `mcpServer/oauth/login`, which answers with a URL to open.
+    McpLogin,
     Other,
 }
 
@@ -321,6 +332,18 @@ impl CodexDriver {
                     .collect();
                 self.rebuild_commands();
                 out.push(Event::CommandsChanged);
+            }
+            Req::Panel(id) => out.push(Event::Panel(self.panel(id, &result))),
+            Req::PanelAction(id) => {
+                let bytes = self.open_panel(id);
+                self.transmit.extend(bytes);
+            }
+            Req::McpLogin => {
+                if let Some(url) = owned(&result, "authorizationUrl") {
+                    out.push(Event::Notice {
+                        message: format!("Open to log in: {url}"),
+                    });
+                }
             }
             Req::Initialize | Req::Other => {
                 if let Some(turn) = result.pointer("/turn/id").and_then(Value::as_str) {
@@ -758,15 +781,7 @@ impl CodexDriver {
     }
 
     fn rebuild_commands(&mut self) {
-        let rpc = |name: &str, desc: &str, hint: Option<&str>, method: &str| CommandEntry {
-            name: name.into(),
-            description: desc.into(),
-            arg_hint: hint.map(str::to_owned),
-            source: CommandSource::Acc,
-            exec: Exec::Rpc {
-                method: method.into(),
-            },
-        };
+        let rpc = CommandEntry::rpc;
         let mut c = vec![
             rpc(
                 "compact",
@@ -790,15 +805,171 @@ impl CodexDriver {
                 "thread/shellCommand",
             ),
             rpc("interrupt", "Stop the current turn", None, "turn/interrupt"),
+            rpc(
+                "mcp",
+                "MCP servers: status, reload, log in",
+                None,
+                "mcpServerStatus/list",
+            ),
+            rpc("status", "Account, model and permissions", None, "account/read"),
+            rpc(
+                "experimental",
+                "Turn experimental features on or off",
+                None,
+                "experimentalFeature/list",
+            ),
         ];
+        // Option changes ride on the next `turn/start`.
+        for (id, name, description) in [
+            (OptionId::Model, "model", "Choose the model"),
+            (OptionId::Effort, "effort", "Choose reasoning effort"),
+            (OptionId::Mode, "mode", "Collaboration mode, such as plan"),
+            (
+                OptionId::Permission,
+                "permissions",
+                "Choose what Codex may do without asking",
+            ),
+        ] {
+            offer_option(
+                &mut c,
+                &self.options,
+                id,
+                rpc(name, description, Some("<value>"), "turn/start"),
+            );
+        }
         c.extend(self.skills.iter().map(|s| CommandEntry {
             name: s.name.clone(),
             description: s.description.clone(),
             arg_hint: None,
             source: CommandSource::Skill,
             exec: Exec::SkillItem,
+            input: CommandInput::None,
         }));
         self.commands = c;
+    }
+
+    /// Runs one of the panel entries (`mcp`, `status`, `experimental`).
+    fn panel_command(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let (verb, target) = split_verb(args);
+        Ok(match (name, verb) {
+            ("mcp", "") => self.open_panel("mcp"),
+            ("mcp", "reload") => {
+                self.request("config/mcpServer/reload", Value::Null, Req::PanelAction("mcp"))
+            }
+            ("mcp", "login") if !target.is_empty() => {
+                self.request("mcpServer/oauth/login", json!({"name": target}), Req::McpLogin)
+            }
+            ("experimental", "") => self.open_panel("experimental"),
+            ("experimental", "enable" | "disable") if !target.is_empty() => self.request(
+                "experimentalFeature/enablement/set",
+                json!({"enablement": {target: verb == "enable"}}),
+                Req::PanelAction("experimental"),
+            ),
+            ("status", _) => self.open_panel("status"),
+            (_, "login" | "enable" | "disable") => return Err(DriverError::MissingArgument("a name")),
+            (_, v) => return Err(DriverError::InvalidOption(v.to_owned())),
+        })
+    }
+
+    fn open_panel(&mut self, id: &'static str) -> Vec<u8> {
+        match id {
+            "mcp" => self.request(
+                "mcpServerStatus/list",
+                json!({"detail": "toolsAndAuthOnly"}),
+                Req::Panel(id),
+            ),
+            "experimental" => self.request("experimentalFeature/list", json!({}), Req::Panel(id)),
+            "status" => self.request("account/read", json!({"refreshToken": false}), Req::Panel(id)),
+            _ => Vec::new(),
+        }
+    }
+
+    fn panel(&self, id: &str, result: &Value) -> Panel {
+        let mut rows = Vec::new();
+        let mut actions = Vec::new();
+        let title = match id {
+            "mcp" => {
+                for s in list(result, "data") {
+                    let Some(name) = owned(s, "name") else { continue };
+                    let tools = s.get("tools").and_then(Value::as_object).map_or(0, Map::len);
+                    let auth = str_at(s, "authStatus").unwrap_or_default();
+                    let mut row_actions = Vec::new();
+                    if auth == "notLoggedIn" {
+                        row_actions.push(PanelAction::new("Log in", "mcp", format!("login {name}")));
+                    }
+                    rows.push(PanelRow {
+                        label: name,
+                        value: Some(format!("{tools} tools")),
+                        detail: Some(auth_label(auth).to_owned()).filter(|a| !a.is_empty()),
+                        actions: row_actions,
+                    });
+                }
+                actions.push(PanelAction::new("Reload", "mcp", "reload"));
+                "MCP servers"
+            }
+            "experimental" => {
+                for f in list(result, "data").filter(|f| str_at(f, "stage") == Some("beta")) {
+                    let Some(name) = owned(f, "name") else { continue };
+                    let on = f.get("enabled").and_then(Value::as_bool) == Some(true);
+                    let verb = if on { "disable" } else { "enable" };
+                    rows.push(PanelRow {
+                        label: owned(f, "displayName").unwrap_or_else(|| name.clone()),
+                        value: Some(if on { "on" } else { "off" }.into()),
+                        detail: owned(f, "description"),
+                        actions: vec![PanelAction::new(
+                            if on { "Turn off" } else { "Turn on" },
+                            "experimental",
+                            format!("{verb} {name}"),
+                        )],
+                    });
+                }
+                "Experimental features"
+            }
+            "status" => {
+                let account = result.get("account").filter(|a| !a.is_null());
+                let login = match account.and_then(|a| str_at(a, "type")) {
+                    Some("chatgpt") => account
+                        .and_then(|a| owned(a, "email"))
+                        .map(|e| format!("ChatGPT ({e})")),
+                    Some("apiKey") => Some("API key".into()),
+                    Some(other) => Some(other.to_owned()),
+                    None => Some("not logged in".into()),
+                };
+                let plan = account.and_then(|a| owned(a, "planType"));
+                let mut push = |label: &str, value: Option<String>| {
+                    if value.is_some() {
+                        rows.push(PanelRow {
+                            label: label.into(),
+                            value,
+                            ..PanelRow::default()
+                        });
+                    }
+                };
+                push("Account", login);
+                push("Plan", plan);
+                push("Thread", self.thread_id.clone());
+                for o in &self.options {
+                    let label = match o.id {
+                        OptionId::Model => "Model",
+                        OptionId::Effort => "Reasoning effort",
+                        OptionId::Mode => "Mode",
+                        OptionId::Permission => "Permissions",
+                    };
+                    push(label, o.current.clone());
+                }
+                "Status"
+            }
+            _ => "",
+        };
+        Panel {
+            id: id.to_owned(),
+            title: title.into(),
+            sections: vec![PanelSection {
+                title: None,
+                rows,
+                actions,
+            }],
+        }
     }
 
     fn current_model(&self) -> Option<&str> {
@@ -812,6 +983,11 @@ impl CodexDriver {
     }
 
     fn rebuild_options(&mut self) {
+        self.rebuild_option_defs();
+        self.rebuild_commands();
+    }
+
+    fn rebuild_option_defs(&mut self) {
         let model = self.current_model().map(str::to_owned);
         let info = model.as_deref().and_then(|m| self.model_info(m));
         let efforts: Vec<String> = info
@@ -965,6 +1141,7 @@ impl Driver for CodexDriver {
 
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
         let mut out = Vec::new();
+        let palette = self.commands.len();
         for frame in self.framer.feed(bytes) {
             match frame {
                 Frame::Line(line) => match serde_json::from_str::<Value>(&line) {
@@ -978,6 +1155,10 @@ impl Driver for CodexDriver {
                     raw: "<invalid utf-8>".into(),
                 }),
             }
+        }
+        // Option pickers join the palette once Codex reports the option.
+        if self.commands.len() != palette && !out.contains(&Event::CommandsChanged) {
+            out.push(Event::CommandsChanged);
         }
         out
     }
@@ -1051,7 +1232,19 @@ impl Driver for CodexDriver {
             } => self.answer(&request_id, &option_id),
             Command::Invoke { name, args } => {
                 let args = args.trim().to_owned();
+                let set = |id| Command::SetOption {
+                    id,
+                    value: args.clone(),
+                };
                 match name.trim_start_matches('/') {
+                    "model" | "effort" | "mode" | "permissions" if args.is_empty() => {
+                        Err(DriverError::MissingArgument("a value"))
+                    }
+                    "model" => self.command(set(OptionId::Model)),
+                    "effort" => self.command(set(OptionId::Effort)),
+                    "mode" => self.command(set(OptionId::Mode)),
+                    "permissions" => self.command(set(OptionId::Permission)),
+                    n @ ("mcp" | "status" | "experimental") => self.panel_command(n, &args),
                     "compact" => self.command(Command::Compact { hint: None }),
                     "new" => self.command(Command::New),
                     "fork" => self.command(Command::Fork),
@@ -1119,6 +1312,15 @@ fn list<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
 }
 
 /// JSON-RPC ids may be numbers or strings; ACC exposes them as strings.
+fn auth_label(status: &str) -> &'static str {
+    match status {
+        "notLoggedIn" => "needs login",
+        "oAuth" => "logged in",
+        "bearerToken" => "token",
+        _ => "",
+    }
+}
+
 fn request_key(id: &Value) -> String {
     match id {
         Value::String(s) => s.clone(),

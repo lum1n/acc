@@ -20,9 +20,11 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::command::{Apply, Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Apply, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, split_verb,
+};
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemKind, PermissionOption, Usage};
+use crate::event::{Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Usage};
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -38,6 +40,10 @@ pub const CANCEL: &str = "cancel";
 #[derive(Debug, Clone)]
 enum Pending {
     SetThinking(String),
+    /// Data for a panel ACC draws; the response is also handled as usual.
+    Panel(&'static str),
+    /// A change made from a panel; the panel is fetched again afterwards.
+    PanelAction(&'static str),
     /// Any other request; its response is handled by `command`.
     Plain,
 }
@@ -305,6 +311,21 @@ impl PiDriver {
             return;
         }
         let data = v.get("data").cloned().unwrap_or(Value::Null);
+        match &pending {
+            Some(Pending::Panel(panel_id)) => out.push(Event::Panel(panel(panel_id, &data))),
+            Some(Pending::PanelAction(panel_id)) => {
+                let req = self.open_panel(panel_id);
+                self.outgoing.extend(req);
+            }
+            _ => {}
+        }
+        if command == "export_html"
+            && let Some(path) = data.get("path").and_then(Value::as_str)
+        {
+            out.push(Event::Notice {
+                message: format!("Exported to {path}"),
+            });
+        }
         let changed = match command.as_str() {
             "get_commands" => Some(Event::CommandsChanged),
             "get_state"
@@ -462,6 +483,7 @@ impl PiDriver {
                 arg_hint: None,
                 source,
                 exec: Exec::Text,
+                input: CommandInput::None,
             });
         }
         self.commands = entries;
@@ -698,6 +720,54 @@ impl PiDriver {
         Some(bytes)
     }
 
+    /// Runs a palette entry. Built-in names go through `builtin` or a
+    /// panel; pi expands the rest.
+    fn invoke(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let (verb, rest) = split_verb(args);
+        Ok(match (name, args) {
+            // pi would send these to the model as text.
+            ("model" | "thinking" | "name", "") => return Err(DriverError::MissingArgument("a value")),
+            ("session", "") => self.open_panel("session"),
+            ("settings", "") => self.open_panel("settings"),
+            ("settings", _) => {
+                let body = match (verb, rest) {
+                    ("auto-compaction", v @ ("on" | "off")) => {
+                        json!({ "type": "set_auto_compaction", "enabled": v == "on" })
+                    }
+                    ("steering", mode) if !mode.is_empty() => {
+                        json!({ "type": "set_steering_mode", "mode": mode })
+                    }
+                    ("follow-up", mode) if !mode.is_empty() => {
+                        json!({ "type": "set_follow_up_mode", "mode": mode })
+                    }
+                    _ => return Err(DriverError::InvalidOption(args.to_owned())),
+                };
+                self.request(obj(body), Pending::PanelAction("settings"))
+            }
+            ("fork", "") => self.open_panel("fork"),
+            ("fork", entry) => self.request(obj(json!({ "type": "fork", "entryId": entry })), Pending::Plain),
+            ("export", path) => {
+                let mut body = obj(json!({ "type": "export_html" }));
+                if !path.is_empty() {
+                    body.insert("outputPath".into(), Value::String(path.to_owned()));
+                }
+                self.request(body, Pending::Plain)
+            }
+            (name, "") => self.prompt(format!("/{name}")),
+            (name, args) => self.prompt(format!("/{name} {args}")),
+        })
+    }
+
+    fn open_panel(&mut self, id: &'static str) -> Vec<u8> {
+        let kind = match id {
+            "session" => "get_session_stats",
+            "settings" => "get_state",
+            "fork" => "get_fork_messages",
+            _ => return Vec::new(),
+        };
+        self.request(obj(json!({ "type": kind })), Pending::Panel(id))
+    }
+
     fn compact(&mut self, hint: Option<&str>) -> Vec<u8> {
         let mut body = obj(json!({ "type": "compact" }));
         if let Some(h) = hint {
@@ -809,15 +879,7 @@ impl Driver for PiDriver {
                 request_id,
                 option_id,
             } => self.answer(&request_id, &option_id)?,
-            // Built-in names go through `builtin`; pi expands the rest.
-            Command::Invoke { name, args } => {
-                let name = name.trim_start_matches('/');
-                self.prompt(if args.is_empty() {
-                    format!("/{name}")
-                } else {
-                    format!("/{name} {args}")
-                })
-            }
+            Command::Invoke { name, args } => self.invoke(name.trim_start_matches('/'), args.trim())?,
             Command::Refresh => self.handshake(),
         })
     }
@@ -838,14 +900,10 @@ impl Driver for PiDriver {
 /// Built-in pi commands ACC runs through RPC.
 fn canonical_commands() -> Vec<CommandEntry> {
     let e = |name: &str, description: &str, arg: Option<&str>, method: &str| CommandEntry {
-        name: name.into(),
-        description: description.into(),
-        arg_hint: arg.map(str::to_owned),
         source: CommandSource::Builtin,
-        exec: Exec::Rpc {
-            method: method.into(),
-        },
+        ..CommandEntry::rpc(name, description, arg, method)
     };
+    let option = |id| CommandInput::Option { id };
     vec![
         e(
             "compact",
@@ -855,16 +913,155 @@ fn canonical_commands() -> Vec<CommandEntry> {
         ),
         e("new", "Start a new session", None, "new_session"),
         e("clone", "Copy this session into a new one", None, "clone"),
+        e(
+            "fork",
+            "Continue from an earlier message in a new session",
+            None,
+            "fork",
+        ),
         e("name", "Name this session", Some("<name>"), "set_session_name"),
-        e("model", "Switch model", Some("<provider/model>"), "set_model"),
+        e("model", "Switch model", Some("<provider/model>"), "set_model").with_input(option(OptionId::Model)),
         e(
             "thinking",
             "Set thinking level",
             Some("<level>"),
             "set_thinking_level",
+        )
+        .with_input(option(OptionId::Effort)),
+        e(
+            "session",
+            "Session info, tokens and cost",
+            None,
+            "get_session_stats",
         ),
-        e("session", "Show token and cost totals", None, "get_session_stats"),
+        e(
+            "settings",
+            "Auto-compaction and message queueing",
+            None,
+            "get_state",
+        ),
+        e(
+            "export",
+            "Export the session to HTML",
+            Some("[path]"),
+            "export_html",
+        ),
     ]
+}
+
+/// Draws an RPC response as panel `id`.
+fn panel(id: &str, data: &Value) -> Panel {
+    let row = |label: &str, value: Option<String>| PanelRow {
+        label: label.into(),
+        value,
+        ..PanelRow::default()
+    };
+    let num = |ptr: &str| data.pointer(ptr).and_then(Value::as_u64).map(|n| n.to_string());
+    let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
+    let (title, rows) = match id {
+        "session" => (
+            "Session",
+            vec![
+                row("Session", text("sessionId")),
+                row("File", text("sessionFile")),
+                row("User messages", num("/userMessages")),
+                row("Assistant messages", num("/assistantMessages")),
+                row("Tool calls", num("/toolCalls")),
+                row("Input tokens", num("/tokens/input")),
+                row("Output tokens", num("/tokens/output")),
+                row("Cache read", num("/tokens/cacheRead")),
+                row("Cache write", num("/tokens/cacheWrite")),
+                row(
+                    "Cost",
+                    data.get("cost")
+                        .and_then(Value::as_f64)
+                        .map(|c| format!("${c:.4}")),
+                ),
+                row(
+                    "Context",
+                    num("/contextUsage/tokens")
+                        .map(|t| format!("{t} / {}", num("/contextUsage/contextWindow").unwrap_or_default())),
+                ),
+            ],
+        ),
+        "settings" => {
+            let auto = data.get("autoCompactionEnabled").and_then(Value::as_bool);
+            let modes = |key: &str, verb: &str| {
+                let current = text(key);
+                PanelRow {
+                    actions: ["all", "one-at-a-time"]
+                        .iter()
+                        .filter(|m| current.as_deref() != Some(**m))
+                        .map(|m| PanelAction::new(format!("Use {m}"), "settings", format!("{verb} {m}")))
+                        .collect(),
+                    ..row(
+                        if verb == "steering" {
+                            "Steering"
+                        } else {
+                            "Follow-ups"
+                        },
+                        current,
+                    )
+                }
+            };
+            (
+                "Settings",
+                vec![
+                    PanelRow {
+                        actions: auto
+                            .map(|on| {
+                                let (label, v) = if on {
+                                    ("Turn off", "off")
+                                } else {
+                                    ("Turn on", "on")
+                                };
+                                vec![PanelAction::new(
+                                    label,
+                                    "settings",
+                                    format!("auto-compaction {v}"),
+                                )]
+                            })
+                            .unwrap_or_default(),
+                        ..row(
+                            "Auto-compaction",
+                            auto.map(|on| if on { "on" } else { "off" }.into()),
+                        )
+                    },
+                    modes("steeringMode", "steering"),
+                    modes("followUpMode", "follow-up"),
+                ],
+            )
+        }
+        "fork" => (
+            "Fork from a message",
+            data.get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|m| {
+                    let entry = m.get("entryId").and_then(Value::as_str)?;
+                    let text = m.get("text").and_then(Value::as_str).unwrap_or_default();
+                    Some(PanelRow {
+                        label: text.lines().next().unwrap_or_default().to_owned(),
+                        actions: vec![PanelAction::new("Fork here", "fork", entry)],
+                        ..PanelRow::default()
+                    })
+                })
+                .collect(),
+        ),
+        _ => ("", Vec::new()),
+    };
+    Panel {
+        id: id.to_owned(),
+        title: title.into(),
+        sections: vec![PanelSection {
+            rows: rows
+                .into_iter()
+                .filter(|r| r.value.is_some() || !r.actions.is_empty())
+                .collect(),
+            ..PanelSection::default()
+        }],
+    }
 }
 
 fn obj(v: Value) -> Map<String, Value> {
@@ -1424,5 +1621,117 @@ mod tests {
             ".pi/agent/sessions/--home-u-my proj--"
         );
         assert_eq!(session_dir("C:\\src\\x"), ".pi/agent/sessions/--C--src-x--");
+    }
+
+    fn invoke(d: &mut PiDriver, name: &str, args: &str) -> Result<Vec<Value>, DriverError> {
+        d.command(Command::Invoke {
+            name: name.into(),
+            args: args.into(),
+        })
+        .map(|b| sent(&b))
+    }
+
+    fn reply(id: &Value, command: &str, data: Value) -> String {
+        format!(
+            "{}\n",
+            json!({ "type": "response", "id": id, "command": command, "success": true, "data": data })
+        )
+    }
+
+    fn panel(events: &[Event]) -> &Panel {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::Panel(p) => Some(p),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no panel in {events:?}"))
+    }
+
+    #[test]
+    fn pickers_never_reach_the_model_without_a_value() {
+        let mut d = PiDriver::new();
+        let model = d.commands().iter().find(|c| c.name == "model").unwrap();
+        assert_eq!(model.input, CommandInput::Option { id: OptionId::Model });
+        assert!(matches!(
+            invoke(&mut d, "model", ""),
+            Err(DriverError::MissingArgument(_))
+        ));
+        assert!(matches!(
+            invoke(&mut d, "thinking", ""),
+            Err(DriverError::MissingArgument(_))
+        ));
+        assert_eq!(
+            invoke(&mut d, "thinking", "high").unwrap()[0]["type"],
+            "set_thinking_level"
+        );
+    }
+
+    #[test]
+    fn session_and_fork_panels() {
+        let mut d = PiDriver::new();
+        let req = invoke(&mut d, "session", "").unwrap();
+        assert_eq!(req[0]["type"], "get_session_stats");
+        let events = d.on_output(
+            reply(
+                &req[0]["id"],
+                "get_session_stats",
+                json!({ "sessionId": "abc", "userMessages": 2, "tokens": { "input": 10, "output": 5 }, "cost": 0.5 }),
+            )
+            .as_bytes(),
+        );
+        let rows = &panel(&events).sections[0].rows;
+        assert_eq!(rows[0].value.as_deref(), Some("abc"));
+        assert!(
+            rows.iter()
+                .any(|r| r.label == "Cost" && r.value.as_deref() == Some("$0.5000"))
+        );
+        // The stats still update usage.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Usage(u) if u.input_tokens == Some(10)))
+        );
+
+        let req = invoke(&mut d, "fork", "").unwrap();
+        assert_eq!(req[0]["type"], "get_fork_messages");
+        let events = d.on_output(
+            reply(
+                &req[0]["id"],
+                "get_fork_messages",
+                json!({ "messages": [{ "entryId": "e1", "text": "First prompt\nmore" }] }),
+            )
+            .as_bytes(),
+        );
+        let row = &panel(&events).sections[0].rows[0];
+        assert_eq!(row.label, "First prompt");
+        assert_eq!(row.actions[0].args, "e1");
+        let fork = invoke(&mut d, "fork", "e1").unwrap();
+        assert_eq!(fork[0]["type"], "fork");
+        assert_eq!(fork[0]["entryId"], "e1");
+    }
+
+    #[test]
+    fn settings_panel_toggles_and_refreshes() {
+        let mut d = PiDriver::new();
+        let req = invoke(&mut d, "settings", "").unwrap();
+        let events = d.on_output(
+            reply(
+                &req[0]["id"],
+                "get_state",
+                json!({ "autoCompactionEnabled": true, "steeringMode": "all", "followUpMode": "one-at-a-time" }),
+            )
+            .as_bytes(),
+        );
+        let rows = &panel(&events).sections[0].rows;
+        assert_eq!(rows[0].actions[0].args, "auto-compaction off");
+        assert_eq!(rows[1].actions[0].args, "steering one-at-a-time");
+        assert_eq!(rows[2].actions[0].args, "follow-up all");
+
+        let set = invoke(&mut d, "settings", "auto-compaction off").unwrap();
+        assert_eq!(set[0]["type"], "set_auto_compaction");
+        assert_eq!(set[0]["enabled"], false);
+        d.on_output(reply(&set[0]["id"], "set_auto_compaction", Value::Null).as_bytes());
+        assert_eq!(sent(&d.poll_transmit())[0]["type"], "get_state");
     }
 }

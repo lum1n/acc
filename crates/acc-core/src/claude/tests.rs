@@ -493,3 +493,201 @@ fn attaching_client_adopts_another_clients_initialize_reply() {
             .all(|m| m["request_id"].as_str().unwrap().starts_with("late-"))
     );
 }
+
+fn control_reply(id: &Value, body: Value) -> String {
+    format!(
+        "{}\n",
+        json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": body}})
+    )
+}
+
+fn invoke(d: &mut ClaudeDriver, name: &str, args: &str) -> Result<Vec<Value>, DriverError> {
+    d.command(Command::Invoke {
+        name: name.into(),
+        args: args.into(),
+    })
+    .map(|b| sent(&b))
+}
+
+#[test]
+fn option_commands_open_pickers_and_set_options() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let input = |name: &str| {
+        d.commands()
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.input.clone())
+    };
+    assert_eq!(input("model"), Some(CommandInput::Option { id: OptionId::Model }));
+    assert_eq!(
+        input("effort"),
+        Some(CommandInput::Option { id: OptionId::Effort })
+    );
+    assert_eq!(
+        input("mode"),
+        Some(CommandInput::Option {
+            id: OptionId::Permission
+        })
+    );
+
+    let model = invoke(&mut d, "model", "opus").unwrap();
+    assert_eq!(model[0]["request"]["subtype"], "set_model");
+    assert_eq!(model[0]["request"]["model"], "opus");
+    let mode = invoke(&mut d, "mode", "plan").unwrap();
+    assert_eq!(mode[0]["request"]["subtype"], "set_permission_mode");
+    assert_eq!(mode[0]["request"]["mode"], "plan");
+    assert!(matches!(
+        invoke(&mut d, "mode", ""),
+        Err(DriverError::MissingArgument(_))
+    ));
+    // Without a value Claude prints the current model and the choices.
+    assert_eq!(
+        invoke(&mut d, "model", "").unwrap()[0]["message"]["content"],
+        "/model"
+    );
+}
+
+#[test]
+fn mcp_opens_a_panel_whose_actions_refresh_it() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let mcp = d.commands().iter().find(|c| c.name == "mcp").unwrap();
+    assert_eq!(
+        mcp.exec,
+        Exec::Rpc {
+            method: "mcp_status".into()
+        }
+    );
+
+    let req = invoke(&mut d, "mcp", "").unwrap();
+    assert_eq!(req[0]["request"]["subtype"], "mcp_status");
+    let events = d.on_output(
+        control_reply(
+            &req[0]["request_id"],
+            json!({"mcpServers": [
+                {"name": "sentry", "status": "failed", "error": "401", "scope": "user", "config": {"type": "http"}},
+                {"name": "repclue", "status": "disabled", "scope": "project", "config": {"type": "stdio"}},
+            ]}),
+        )
+        .as_bytes(),
+    );
+    let Some(Event::Panel(panel)) = events.first() else {
+        panic!("no panel in {events:?}");
+    };
+    assert_eq!(panel.id, "mcp");
+    let rows = &panel.sections[0].rows;
+    assert_eq!(rows[0].label, "sentry");
+    assert_eq!(rows[0].value.as_deref(), Some("failed"));
+    assert_eq!(rows[0].detail.as_deref(), Some("user · http · 401"));
+    assert_eq!(rows[0].actions[0].args, "reconnect sentry");
+    assert_eq!(rows[0].actions[1].args, "disable sentry");
+    assert_eq!(rows[1].actions[1].args, "enable repclue");
+
+    let toggle = invoke(&mut d, "mcp", "enable repclue").unwrap();
+    assert_eq!(toggle[0]["request"]["subtype"], "mcp_toggle");
+    assert_eq!(toggle[0]["request"]["serverName"], "repclue");
+    assert_eq!(toggle[0]["request"]["enabled"], true);
+    d.on_output(control_reply(&toggle[0]["request_id"], json!({})).as_bytes());
+    let again = sent(&d.poll_transmit());
+    assert_eq!(again[0]["request"]["subtype"], "mcp_status");
+    assert!(matches!(
+        invoke(&mut d, "mcp", "reconnect"),
+        Err(DriverError::MissingArgument(_))
+    ));
+}
+
+#[test]
+fn status_and_permissions_panels() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let req = invoke(&mut d, "status", "").unwrap();
+    assert_eq!(req[0]["request"]["subtype"], "get_status");
+    let events = d.on_output(
+        control_reply(
+            &req[0]["request_id"],
+            json!({"sections": [{"title": "Session", "rows": [{"label": "Version", "value": "2.1.296"}]}]}),
+        )
+        .as_bytes(),
+    );
+    let Some(Event::Panel(status)) = events.first() else {
+        panic!("no panel");
+    };
+    assert_eq!(status.sections[0].title.as_deref(), Some("Session"));
+    assert_eq!(status.sections[0].rows[0].value.as_deref(), Some("2.1.296"));
+
+    // Recorded from Claude Code 2.1.280 with a local settings file.
+    let req = invoke(&mut d, "permissions", "").unwrap();
+    let events = d.on_output(
+        control_reply(
+            &req[0]["request_id"],
+            json!({"state": {"rules": [
+                {"behavior": "allow", "source": "localSettings", "rule": "Bash(npm test:*)",
+                 "description": {"prefix": "Any Bash command starting with ", "emphasis": "npm test"}, "editability": "persistent"},
+                {"behavior": "deny", "source": "localSettings", "rule": "Read(./.env)", "editability": "persistent"},
+            ], "workspaceDirectories": [], "originalCwd": "/p", "managedOnly": false}}),
+        )
+        .as_bytes(),
+    );
+    let Some(Event::Panel(rules)) = events.first() else {
+        panic!("no panel");
+    };
+    let titles: Vec<_> = rules
+        .sections
+        .iter()
+        .map(|s| s.title.as_deref().unwrap())
+        .collect();
+    assert_eq!(titles, ["Allow", "Deny"]);
+    assert_eq!(
+        rules.sections[0].rows[0].detail.as_deref(),
+        Some("Any Bash command starting with npm test")
+    );
+}
+
+#[test]
+fn terminal_only_commands_are_listed_but_not_sent() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let doctor = d.commands().iter().find(|c| c.name == "doctor").unwrap();
+    assert_eq!(doctor.exec, Exec::Terminal);
+    assert!(matches!(
+        invoke(&mut d, "doctor", ""),
+        Err(DriverError::Unsupported { .. })
+    ));
+    // reload-plugins is terminal-only as text but has a control request.
+    let reload = invoke(&mut d, "reload-plugins", "").unwrap();
+    assert_eq!(reload[0]["request"]["subtype"], "reload_plugins");
+}
+
+#[test]
+fn panels_answer_only_the_client_that_asked() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let events = d.on_output(control_reply(&json!("other-7"), json!({"mcpServers": []})).as_bytes());
+    assert!(!events.iter().any(|e| matches!(e, Event::Panel(_))));
+}
+
+#[test]
+fn terminal_commands_are_known_before_the_first_turn() {
+    let mut d = ClaudeDriver::default();
+    let init = d.handshake();
+    let id = sent(&init)[0]["request_id"].clone();
+    d.on_output(
+        control_reply(
+            &id,
+            json!({"commands": [
+                {"name": "doctor", "description": "Diagnose", "builtin": true},
+                {"name": "output-style", "description": "Switch style", "argumentHint": "[style]", "builtin": true},
+            ], "models": [], "available_output_styles": ["default", "Concise"]}),
+        )
+        .as_bytes(),
+    );
+    let doctor = d.commands().iter().find(|c| c.name == "doctor").unwrap();
+    assert_eq!(doctor.exec, Exec::Terminal);
+    let style = d.commands().iter().find(|c| c.name == "output-style").unwrap();
+    let CommandInput::Choice { choices, required } = &style.input else {
+        panic!("no choices: {style:?}");
+    };
+    assert_eq!(choices[1].value, "Concise");
+    assert!(!required);
+}

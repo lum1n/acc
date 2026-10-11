@@ -158,9 +158,17 @@ fn handshake_opens_a_new_session() {
     assert_eq!(d.auth_methods()[0].0, "copilot-login");
 
     let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["compact", "interrupt", "new"]);
+    assert_eq!(
+        names,
+        ["compact", "interrupt", "new", "model", "mode", "permissions"]
+    );
     assert_eq!(d.commands()[0].exec, Exec::Text);
     assert_eq!(d.commands()[1].source, CommandSource::Acc);
+    // Copilot reports model, mode and allow-all as options: each gets a picker.
+    assert_eq!(
+        d.commands()[3].input,
+        CommandInput::Option { id: OptionId::Model }
+    );
 
     let ids: Vec<_> = d.options().iter().map(|o| o.id).collect();
     assert_eq!(ids, [OptionId::Mode, OptionId::Model, OptionId::Permission]);
@@ -825,4 +833,46 @@ fn invoke_notice_and_resolved_permissions() {
         }),
         Err(DriverError::UnknownRequest(_))
     ));
+}
+
+#[test]
+fn option_pickers_set_config_options() {
+    let mut d = ready_copilot();
+    let mode = d
+        .commands()
+        .iter()
+        .find(|c| c.name == "mode")
+        .expect("mode picker");
+    assert_eq!(mode.input, CommandInput::Option { id: OptionId::Mode });
+    let set = one(&d
+        .command(Command::Invoke {
+            name: "mode".into(),
+            args: "plan".into(),
+        })
+        .expect("mode"));
+    assert_eq!(set["method"], "session/set_config_option");
+    assert_eq!(set["params"]["value"], "plan");
+    assert!(matches!(
+        d.command(Command::Invoke {
+            name: "model".into(),
+            args: String::new(),
+        }),
+        Err(DriverError::MissingArgument(_))
+    ));
+    // No effort option, no effort picker.
+    assert!(!d.commands().iter().any(|c| c.name == "effort"));
+}
+
+#[test]
+fn opencode_lists_its_unadvertised_compact() {
+    let mut d = driver(Harness::Opencode, Start::Attach);
+    feed(&mut d, &[update("s1", text_chunk("agent_message_chunk", "x"))]);
+    assert!(d.commands().iter().any(|c| c.name == "compact"));
+    let c = one(&d
+        .command(Command::Invoke {
+            name: "compact".into(),
+            args: "keep notes".into(),
+        })
+        .expect("compact"));
+    assert_eq!(c["params"]["prompt"][0]["text"], "/compact keep notes");
 }

@@ -4,9 +4,13 @@
 //! UIs can light up harness-specific features without the bindings knowing
 //! every shape.
 
-use acc_core::command::{Apply, Command, CommandEntry, CommandSource, Exec as CmdExec, OptionDef, OptionId};
+use acc_core::command::{
+    Apply, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec as CmdExec, OptionDef, OptionId,
+};
 use acc_core::detached::{FeedEntry, FeedPath, Listing, Status};
-use acc_core::event::{Event, ItemKind, PermissionOption, Quota, QuotaWindow, Usage};
+use acc_core::event::{
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+};
 use acc_core::harness::{Availability, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag};
 use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec, Update};
@@ -237,6 +241,10 @@ pub enum AccEvent {
     Notice {
         message: String,
     },
+    /// A dialog to draw; replaces an open panel with the same id.
+    Panel {
+        panel: AccPanel,
+    },
     TurnCompleted,
     Exited {
         code: Option<i32>,
@@ -301,6 +309,7 @@ impl From<Event> for AccEvent {
             Event::CommandsChanged => Self::CommandsChanged,
             Event::OptionsChanged => Self::OptionsChanged,
             Event::Notice { message } => Self::Notice { message },
+            Event::Panel(panel) => Self::Panel { panel: panel.into() },
             Event::TurnCompleted => Self::TurnCompleted,
             Event::Exited { code } => Self::Exited { code },
             Event::Unrecognized { raw } => Self::Unrecognized { raw },
@@ -514,8 +523,130 @@ pub struct AccCommandEntry {
     pub description: String,
     pub arg_hint: Option<String>,
     pub source: AccCommandSource,
-    /// How it runs: `text`, `rpc`, `endpoint` or `skill`.
+    /// How it runs: `text`, `rpc`, `endpoint`, `skill` or `terminal`
+    /// (only the harness's own TUI can run it).
     pub exec: String,
+    /// What to ask for first; the answer is `Invoke`'s `args`.
+    pub input: AccCommandInput,
+}
+
+/// What a palette entry needs from the user.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum AccCommandInput {
+    /// Free text as `arg_hint` describes it, or nothing.
+    None,
+    /// A value of this option, picked from `options()`.
+    Option { id: AccOptionId },
+    /// One of these values.
+    Choice { choices: Vec<AccChoice>, required: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccChoice {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+impl From<&Choice> for AccChoice {
+    fn from(c: &Choice) -> Self {
+        Self {
+            value: c.value.clone(),
+            label: c.label.clone(),
+            description: c.description.clone(),
+        }
+    }
+}
+
+impl From<&CommandInput> for AccCommandInput {
+    fn from(i: &CommandInput) -> Self {
+        match i {
+            CommandInput::None => Self::None,
+            CommandInput::Option { id } => Self::Option { id: (*id).into() },
+            CommandInput::Choice { choices, required } => Self::Choice {
+                choices: choices.iter().map(Into::into).collect(),
+                required: *required,
+            },
+        }
+    }
+}
+
+/// A dialog's content: sections of rows, each with optional actions.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPanel {
+    /// The palette entry it answers, e.g. `mcp`.
+    pub id: String,
+    pub title: String,
+    pub sections: Vec<AccPanelSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPanelSection {
+    pub title: Option<String>,
+    pub rows: Vec<AccPanelRow>,
+    pub actions: Vec<AccPanelAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPanelRow {
+    pub label: String,
+    pub value: Option<String>,
+    pub detail: Option<String>,
+    pub actions: Vec<AccPanelAction>,
+}
+
+/// A button: send `AccCommand::Invoke { name: command, args }`. With
+/// `prompt`, ask for text first and append it to `args` after a space.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPanelAction {
+    pub label: String,
+    pub command: String,
+    pub args: String,
+    pub prompt: Option<String>,
+    pub destructive: bool,
+}
+
+impl From<PanelAction> for AccPanelAction {
+    fn from(a: PanelAction) -> Self {
+        Self {
+            label: a.label,
+            command: a.command,
+            args: a.args,
+            prompt: a.prompt,
+            destructive: a.destructive,
+        }
+    }
+}
+
+impl From<PanelRow> for AccPanelRow {
+    fn from(r: PanelRow) -> Self {
+        Self {
+            label: r.label,
+            value: r.value,
+            detail: r.detail,
+            actions: r.actions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<PanelSection> for AccPanelSection {
+    fn from(s: PanelSection) -> Self {
+        Self {
+            title: s.title,
+            rows: s.rows.into_iter().map(Into::into).collect(),
+            actions: s.actions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<Panel> for AccPanel {
+    fn from(p: Panel) -> Self {
+        Self {
+            id: p.id,
+            title: p.title,
+            sections: p.sections.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 impl From<&CommandEntry> for AccCommandEntry {
@@ -530,8 +661,10 @@ impl From<&CommandEntry> for AccCommandEntry {
                 CmdExec::Rpc { .. } => "rpc",
                 CmdExec::Endpoint { .. } => "endpoint",
                 CmdExec::SkillItem => "skill",
+                CmdExec::Terminal => "terminal",
             }
             .to_owned(),
+            input: (&c.input).into(),
         }
     }
 }

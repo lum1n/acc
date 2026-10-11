@@ -34,9 +34,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
 
-use crate::command::{Apply, Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Apply, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
+    offer_option, split_verb,
+};
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemKind, PermissionOption, Quota, QuotaWindow, Usage};
+use crate::event::{
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+};
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -46,6 +51,32 @@ use crate::wire::{self, f64_at, owned, str_at, u64_at};
 /// when the process was started with a bypass flag, so it is offered only
 /// when it is already the current mode.
 const PERMISSION_MODES: [&str; 5] = ["default", "acceptEdits", "plan", "auto", "dontAsk"];
+
+/// Commands only Claude's TUI runs, as 2.1.296 reports them in
+/// `system/init`. Assumed until the first `init` gives the real list.
+const TERMINAL_COMMANDS: [&str; 4] = ["doctor", "color", "focus", "reload-plugins"];
+
+/// Dialogs ACC draws itself from a control request: palette name,
+/// description (when Claude doesn't list the command) and request subtype.
+const PANELS: [(&str, &str, &str); 5] = [
+    (
+        "mcp",
+        "MCP servers: status, reconnect, enable or disable",
+        "mcp_status",
+    ),
+    (
+        "status",
+        "Version, session, account and environment",
+        "get_status",
+    ),
+    (
+        "permissions",
+        "Allow, ask and deny rules",
+        "list_permission_rules",
+    ),
+    ("memory", "Memory files and auto-memory", "get_memory_dialog"),
+    ("hooks", "Configured hooks", "get_hooks_listing"),
+];
 
 /// Launch-time settings. Everything else changes at runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -70,6 +101,12 @@ enum Pending {
     SetModel(String),
     SetEffort(String),
     SetPermission(String),
+    /// A dialog's data, drawn as the panel for this palette entry.
+    Panel(&'static str),
+    /// An action from a panel; the panel is fetched again afterwards.
+    PanelAction(&'static str),
+    /// `reload_plugins`, which answers with the new palette.
+    Reload,
     Other,
 }
 
@@ -111,6 +148,10 @@ pub struct ClaudeDriver {
     models: Vec<Value>,
     hidden_commands: Vec<String>,
     skills: Vec<String>,
+    /// From the `initialize` reply, for the `/output-style` picker.
+    output_styles: Vec<String>,
+    /// The palette as Claude last listed it.
+    listed_commands: Vec<Value>,
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
     transmit: Vec<u8>,
@@ -139,14 +180,16 @@ impl ClaudeDriver {
             last_context: None,
             context_window: None,
             models: Vec::new(),
-            hidden_commands: Vec::new(),
+            hidden_commands: TERMINAL_COMMANDS.iter().map(|c| (*c).to_owned()).collect(),
             skills: Vec::new(),
+            output_styles: Vec::new(),
+            listed_commands: Vec::new(),
             commands: Vec::new(),
             options: Vec::new(),
             transmit: Vec::new(),
         };
-        d.set_commands(&[]);
         d.rebuild_options(None, None);
+        d.set_commands(&[]);
         d
     }
 
@@ -232,10 +275,16 @@ impl ClaudeDriver {
                 let id = owned(v, "session_id");
                 let model = owned(v, "model");
                 if let Some(names) = v.get("terminal_slash_commands").and_then(Value::as_array) {
-                    self.hidden_commands = names
+                    let hidden: Vec<String> = names
                         .iter()
                         .filter_map(|n| n.as_str().map(str::to_owned))
                         .collect();
+                    if hidden != self.hidden_commands {
+                        self.hidden_commands = hidden;
+                        let listed = std::mem::take(&mut self.listed_commands);
+                        self.set_commands(&listed);
+                        out.push(Event::CommandsChanged);
+                    }
                 }
                 if let Some(names) = v.get("skills").and_then(Value::as_array) {
                     self.skills = names
@@ -244,7 +293,7 @@ impl ClaudeDriver {
                         .collect();
                 }
                 // Without the rich `initialize` list, fall back to bare names.
-                if self.commands.iter().all(|c| c.source == CommandSource::Acc)
+                if self.listed_commands.is_empty()
                     && let Some(names) = v.get("slash_commands").and_then(Value::as_array)
                 {
                     let list: Vec<Value> = names
@@ -763,6 +812,12 @@ impl ClaudeDriver {
         };
         match kind {
             Pending::Initialize => {
+                if let Some(styles) = body.get("available_output_styles").and_then(Value::as_array) {
+                    self.output_styles = styles
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                }
                 if let Some(list) = body.get("commands").and_then(Value::as_array) {
                     self.set_commands(list);
                     out.push(Event::CommandsChanged);
@@ -797,6 +852,20 @@ impl ClaudeDriver {
             Pending::SetPermission(mode) => {
                 self.set_option_current(OptionId::Permission, mode);
                 out.push(Event::OptionsChanged);
+            }
+            Pending::Panel(id) => out.push(Event::Panel(panel(id, &body))),
+            Pending::PanelAction(id) => {
+                let bytes = self.open_panel(id);
+                self.transmit.extend(bytes);
+            }
+            Pending::Reload => {
+                if let Some(list) = body.get("commands").and_then(Value::as_array) {
+                    self.set_commands(list);
+                    out.push(Event::CommandsChanged);
+                }
+                out.push(Event::Notice {
+                    message: "Reloaded plugins".into(),
+                });
             }
             Pending::Other => {
                 if let (Some(used), Some(max)) = (u64_at(&body, "totalTokens"), u64_at(&body, "maxTokens")) {
@@ -840,6 +909,7 @@ impl ClaudeDriver {
     }
 
     fn set_commands(&mut self, list: &[Value]) {
+        self.listed_commands = list.to_vec();
         let mut entries: Vec<CommandEntry> = list
             .iter()
             .filter_map(|c| {
@@ -863,20 +933,151 @@ impl ClaudeDriver {
                     arg_hint: owned(c, "argumentHint").filter(|h| !h.is_empty()),
                     source,
                     exec: Exec::Text,
+                    input: CommandInput::None,
                     name,
                 })
             })
             .collect();
-        entries.push(CommandEntry {
-            name: "interrupt".into(),
-            description: "Stop the current turn".into(),
-            arg_hint: None,
-            source: CommandSource::Acc,
-            exec: Exec::Rpc {
-                method: "interrupt".into(),
-            },
-        });
+        // Commands whose TUI dialog has a control request behind it run
+        // that instead and answer with a panel.
+        for (name, description, subtype) in PANELS {
+            match entries.iter_mut().find(|e| e.name == *name) {
+                Some(e) => {
+                    e.exec = Exec::Rpc {
+                        method: (*subtype).into(),
+                    }
+                }
+                None => entries.push(CommandEntry::rpc(name, description, None, subtype)),
+            }
+        }
+        // Terminal-only commands with a control request behind them.
+        if self.hidden_commands.iter().any(|c| c == "reload-plugins") {
+            entries.push(CommandEntry::rpc(
+                "reload-plugins",
+                "Reload plugins, skills and MCP servers",
+                None,
+                "reload_plugins",
+            ));
+        }
+        // The rest need Claude's own TUI.
+        for name in &self.hidden_commands {
+            if !entries.iter().any(|e| &e.name == name) {
+                entries.push(CommandEntry {
+                    name: name.clone(),
+                    description: "Opens in Claude Code's terminal UI".into(),
+                    arg_hint: None,
+                    source: CommandSource::Builtin,
+                    exec: Exec::Terminal,
+                    input: CommandInput::None,
+                });
+            }
+        }
+        offer_option(
+            &mut entries,
+            &self.options,
+            OptionId::Model,
+            CommandEntry::rpc("model", "Switch model", Some("<model>"), "set_model"),
+        );
+        offer_option(
+            &mut entries,
+            &self.options,
+            OptionId::Effort,
+            CommandEntry::rpc(
+                "effort",
+                "Set reasoning effort",
+                Some("<level>"),
+                "apply_flag_settings",
+            ),
+        );
+        offer_option(
+            &mut entries,
+            &self.options,
+            OptionId::Permission,
+            CommandEntry::rpc(
+                "mode",
+                "Permission mode: plan, accept edits, auto, ...",
+                Some("<mode>"),
+                "set_permission_mode",
+            ),
+        );
+        if let Some(e) = entries.iter_mut().find(|e| e.name == "output-style")
+            && !self.output_styles.is_empty()
+        {
+            e.input = CommandInput::Choice {
+                choices: self.output_styles.iter().map(Choice::new).collect(),
+                required: false,
+            };
+        }
+        if let Some(e) = entries.iter_mut().find(|e| e.name == "rename") {
+            e.exec = Exec::Rpc {
+                method: "rename_session".into(),
+            };
+        }
+        entries.push(CommandEntry::rpc(
+            "interrupt",
+            "Stop the current turn",
+            None,
+            "interrupt",
+        ));
         self.commands = entries;
+    }
+
+    /// Runs a palette entry. Entries backed by a control request use it;
+    /// the rest go to Claude as `/name args`.
+    fn invoke(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let name = name.trim_start_matches('/');
+        let args = args.trim();
+        let set = |id| Command::SetOption {
+            id,
+            value: args.to_owned(),
+        };
+        let entry = self.commands.iter().find(|e| e.name == name);
+        if entry.is_some_and(|e| e.exec == Exec::Terminal) {
+            return Err(DriverError::Unsupported {
+                harness: Harness::Claude,
+                what: "this command outside its terminal UI",
+            });
+        }
+        Ok(match (name, args) {
+            ("interrupt", _) => return self.command(Command::Interrupt),
+            ("model", a) if !a.is_empty() => return self.command(set(OptionId::Model)),
+            ("effort", a) if !a.is_empty() => return self.command(set(OptionId::Effort)),
+            ("mode", "") => return Err(DriverError::MissingArgument("a permission mode")),
+            ("mode", _) => return self.command(set(OptionId::Permission)),
+            ("rename", a) if !a.is_empty() => {
+                return self.command(Command::Rename { name: a.to_owned() });
+            }
+            ("reload-plugins", _) if entry.is_some_and(|e| e.exec != Exec::Text) => {
+                self.control(json!({"subtype": "reload_plugins"}), Pending::Reload)
+            }
+            ("mcp", a) if !a.is_empty() => {
+                let (verb, server) = split_verb(a);
+                if server.is_empty() {
+                    return Err(DriverError::MissingArgument("an MCP server name"));
+                }
+                let request = match verb {
+                    "reconnect" => json!({"subtype": "mcp_reconnect", "serverName": server}),
+                    "enable" | "disable" => {
+                        json!({"subtype": "mcp_toggle", "serverName": server, "enabled": verb == "enable"})
+                    }
+                    _ => return Err(DriverError::InvalidOption(verb.to_owned())),
+                };
+                self.control(request, Pending::PanelAction("mcp"))
+            }
+            (n, _) if PANELS.iter().any(|(p, ..)| *p == n) => {
+                let id = PANELS.iter().find(|(p, ..)| *p == n).map_or("", |(p, ..)| *p);
+                self.open_panel(id)
+            }
+            _ => Self::user_text(&slash(name, args)),
+        })
+    }
+
+    /// Asks for the data behind panel `id`.
+    fn open_panel(&mut self, id: &'static str) -> Vec<u8> {
+        match PANELS.iter().find(|(p, ..)| *p == id) {
+            Some((id, _, subtype)) => self.control(json!({"subtype": subtype}), Pending::Panel(id)),
+            None => Vec::new(),
+        }
     }
 
     /// Rebuilds option definitions from the model list, keeping current values.
@@ -1042,12 +1243,7 @@ impl Driver for ClaudeDriver {
             Command::Compact { hint } => Self::user_text(&slash("compact", hint.as_deref().unwrap_or(""))),
             Command::New => Self::user_text("/clear"),
             Command::Review => Self::user_text("/review"),
-            Command::Invoke { name, args } => {
-                if name == "interrupt" {
-                    return self.command(Command::Interrupt);
-                }
-                Self::user_text(&slash(&name, &args))
-            }
+            Command::Invoke { name, args } => return self.invoke(&name, &args),
             Command::Rename { name } => self.control(
                 json!({"subtype": "rename_session", "title": name}),
                 Pending::Other,
@@ -1106,6 +1302,195 @@ impl Driver for ClaudeDriver {
     fn poll_transmit(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.transmit)
     }
+}
+
+/// Draws a control response as panel `id`.
+fn panel(id: &str, body: &Value) -> Panel {
+    let list = |v: &Value, key: &str| -> Vec<Value> {
+        v.get(key).and_then(Value::as_array).cloned().unwrap_or_default()
+    };
+    let text = |v: &Value, key: &str| owned(v, key).filter(|s| !s.is_empty());
+    let mut panel = Panel {
+        id: id.to_owned(),
+        ..Panel::default()
+    };
+    match id {
+        "mcp" => {
+            panel.title = "MCP servers".into();
+            let rows = list(body, "mcpServers")
+                .iter()
+                .filter_map(|s| {
+                    let name = owned(s, "name")?;
+                    let status = owned(s, "status").unwrap_or_default();
+                    let kind = s.get("config").and_then(|c| owned(c, "type"));
+                    let detail = [owned(s, "scope"), kind, text(s, "error")]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    let toggle = if status == "disabled" { "enable" } else { "disable" };
+                    let mut actions = vec![PanelAction::new("Reconnect", "mcp", format!("reconnect {name}"))];
+                    actions.push(PanelAction {
+                        destructive: toggle == "disable",
+                        ..PanelAction::new(capitalize(toggle), "mcp", format!("{toggle} {name}"))
+                    });
+                    Some(PanelRow {
+                        label: name,
+                        value: Some(status),
+                        detail: Some(detail).filter(|d| !d.is_empty()),
+                        actions,
+                    })
+                })
+                .collect();
+            panel.sections.push(PanelSection {
+                rows,
+                ..PanelSection::default()
+            });
+        }
+        "status" => {
+            panel.title = "Status".into();
+            panel.sections = list(body, "sections")
+                .iter()
+                .map(|sec| PanelSection {
+                    title: text(sec, "title"),
+                    rows: list(sec, "rows")
+                        .iter()
+                        .map(|r| PanelRow {
+                            label: owned(r, "label").unwrap_or_default(),
+                            value: owned(r, "value"),
+                            ..PanelRow::default()
+                        })
+                        .collect(),
+                    ..PanelSection::default()
+                })
+                .collect();
+        }
+        "permissions" => {
+            panel.title = "Permission rules".into();
+            let state = body.get("state").unwrap_or(body);
+            let rules = list(state, "rules");
+            for (behavior, title) in [("allow", "Allow"), ("ask", "Ask"), ("deny", "Deny")] {
+                let rows: Vec<PanelRow> = rules
+                    .iter()
+                    .filter(|r| str_at(r, "behavior") == Some(behavior))
+                    .map(|r| PanelRow {
+                        label: owned(r, "rule").unwrap_or_default(),
+                        value: owned(r, "source"),
+                        detail: r.get("description").map(|d| {
+                            ["prefix", "emphasis", "suffix"]
+                                .iter()
+                                .filter_map(|k| str_at(d, k))
+                                .collect::<String>()
+                        }),
+                        actions: Vec::new(),
+                    })
+                    .collect();
+                if !rows.is_empty() {
+                    panel.sections.push(PanelSection {
+                        title: Some(title.into()),
+                        rows,
+                        ..PanelSection::default()
+                    });
+                }
+            }
+            let dirs: Vec<PanelRow> = list(state, "workspaceDirectories")
+                .iter()
+                .filter_map(|d| {
+                    Some(PanelRow {
+                        label: owned(d, "path")?,
+                        value: owned(d, "source"),
+                        ..PanelRow::default()
+                    })
+                })
+                .collect();
+            if !dirs.is_empty() {
+                panel.sections.push(PanelSection {
+                    title: Some("Additional directories".into()),
+                    rows: dirs,
+                    ..PanelSection::default()
+                });
+            }
+        }
+        "memory" => {
+            panel.title = "Memory".into();
+            let files = list(body, "files")
+                .iter()
+                .filter_map(|f| {
+                    Some(PanelRow {
+                        label: owned(f, "label")?,
+                        value: Some(if f.get("exists").and_then(Value::as_bool) == Some(true) {
+                            "present".into()
+                        } else {
+                            "not created".into()
+                        }),
+                        detail: owned(f, "path"),
+                        actions: Vec::new(),
+                    })
+                })
+                .collect();
+            panel.sections.push(PanelSection {
+                title: Some("Files".into()),
+                rows: files,
+                ..PanelSection::default()
+            });
+            let auto: Vec<PanelRow> = [("auto_memory", "Auto-memory"), ("auto_dream", "Auto-dream")]
+                .iter()
+                .filter_map(|(key, label)| {
+                    let v = body.get(*key)?;
+                    Some(PanelRow {
+                        label: (*label).into(),
+                        value: owned(v, "status"),
+                        detail: text(v, "detail"),
+                        actions: Vec::new(),
+                    })
+                })
+                .collect();
+            if !auto.is_empty() {
+                panel.sections.push(PanelSection {
+                    rows: auto,
+                    ..PanelSection::default()
+                });
+            }
+        }
+        "hooks" => {
+            panel.title = "Hooks".into();
+            let hooks = list(body, "hooks");
+            let mut events: Vec<String> = Vec::new();
+            for h in &hooks {
+                if let Some(e) = owned(h, "event")
+                    && !events.contains(&e)
+                {
+                    events.push(e);
+                }
+            }
+            panel.sections = events
+                .into_iter()
+                .map(|event| PanelSection {
+                    rows: hooks
+                        .iter()
+                        .filter(|h| str_at(h, "event") == Some(event.as_str()))
+                        .map(|h| PanelRow {
+                            label: owned(h, "displayText").unwrap_or_default(),
+                            value: text(h, "matcher"),
+                            detail: owned(h, "sourceLabel"),
+                            actions: Vec::new(),
+                        })
+                        .collect(),
+                    title: Some(event),
+                    actions: Vec::new(),
+                })
+                .collect();
+        }
+        _ => {}
+    }
+    panel
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 fn slash(name: &str, args: &str) -> String {

@@ -58,6 +58,29 @@ client (or a reconnect) adopt a running agent from its log, reading other client
 `acc acp <harness> <cwd>` drives one locally for spikes. Recorded Copilot 1.0.95 and opencode 1.18.35
 sessions under `crates/acc-core/tests/fixtures/acp` are replayed in CI.
 
+## Interactive commands
+
+A TUI's interactive slash commands (pickers, dialogs) don't work headless: harnesses refuse them
+or send them to the model as text. Drivers map them onto the protocol instead, so palette entries
+describe what a client has to draw:
+
+- `CommandEntry::input`: `Option { id }` makes `/model`, `/effort`, `/mode` (and Codex's and ACP's
+  `/permissions`) a picker over `Driver::options`; invoking with the chosen value sets the option.
+  `Choice` is a fixed list (Claude's output styles). Invoking a picker without a value is
+  `DriverError::MissingArgument`, never text for the model.
+- `Event::Panel`: the entry runs a protocol request and the driver answers with a dialog (sections
+  of rows, each with actions). An action is just `Command::Invoke { name, args }`; afterwards the
+  driver fetches the panel again. Panels answer only the client that asked.
+- `Exec::Terminal`: nothing on the wire can run it (Claude's `/doctor`); clients open the
+  harness's TUI with `tui_command`.
+
+| Harness | Pickers | Panels |
+|---|---|---|
+| Claude | model, effort, mode (permission mode), output-style | mcp (reconnect, enable, disable), status, permissions, memory, hooks; reload-plugins |
+| Codex | model, effort, mode, permissions | mcp (reload, OAuth login), status, experimental (toggle) |
+| Cursor, Copilot, opencode | whatever `configOptions` reports | none: ACP has no such requests |
+| pi | model, thinking | session, settings (auto-compaction, queueing), fork (pick a message); export |
+
 ## Daemonless sessions
 
 `acc_core::detached` generates host-side shell scripts: the harness runs under `nohup` with stdin on

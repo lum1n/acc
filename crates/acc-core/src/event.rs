@@ -79,6 +79,10 @@ pub enum Event {
     Notice {
         message: String,
     },
+    /// What a TUI would show in a dialog (MCP servers, status, rules),
+    /// with the actions it offers. Answers a palette entry; a newer panel
+    /// with the same `id` replaces the old one.
+    Panel(Panel),
     TurnCompleted,
     Exited {
         code: Option<i32>,
@@ -146,4 +150,59 @@ pub struct QuotaWindow {
     pub resets_at: Option<u64>,
     /// Harness status such as `allowed`, `allowed_warning` or `rejected`.
     pub status: Option<String>,
+}
+
+/// A dialog's content in a shape any client can draw: sections of rows,
+/// each row with optional actions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Panel {
+    /// The palette entry it answers, e.g. `mcp`.
+    pub id: String,
+    pub title: String,
+    pub sections: Vec<PanelSection>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub rows: Vec<PanelRow>,
+    /// Actions for the section as a whole, such as "Add rule".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<PanelAction>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelRow {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<PanelAction>,
+}
+
+/// A button: runs `Command::Invoke { name: command, args }`. With `prompt`,
+/// the client first asks for text and appends it to `args` after a space.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelAction {
+    pub label: String,
+    pub command: String,
+    pub args: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub destructive: bool,
+}
+
+impl PanelAction {
+    pub fn new(label: impl Into<String>, command: impl Into<String>, args: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            command: command.into(),
+            args: args.into(),
+            ..Self::default()
+        }
+    }
 }

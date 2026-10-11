@@ -611,3 +611,115 @@ fn turn_diff_is_passed_through() {
     );
     assert!(events.iter().any(|e| matches!(e, Event::Native { kind, payload } if kind == "turn_diff" && payload["diff"].as_str().is_some())));
 }
+
+fn invoke(d: &mut CodexDriver, name: &str, args: &str) -> Result<Vec<Value>, DriverError> {
+    d.command(Command::Invoke {
+        name: name.into(),
+        args: args.into(),
+    })
+    .map(|b| sent(&b))
+}
+
+fn panel(events: &[Event]) -> &Panel {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::Panel(p) => Some(p),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no panel in {events:?}"))
+}
+
+#[test]
+fn option_commands_become_pickers() {
+    let mut d = started();
+    for (name, id) in [("model", OptionId::Model), ("effort", OptionId::Effort)] {
+        let entry = d.commands().iter().find(|c| c.name == name).unwrap();
+        assert_eq!(entry.input, CommandInput::Option { id });
+    }
+    let model = option(&d, OptionId::Model).values[0].clone();
+    assert_eq!(invoke(&mut d, "model", &model).unwrap(), Vec::<Value>::new());
+    assert_eq!(
+        option(&d, OptionId::Model).current.as_deref(),
+        Some(model.as_str())
+    );
+    assert!(matches!(
+        invoke(&mut d, "effort", ""),
+        Err(DriverError::MissingArgument(_))
+    ));
+}
+
+#[test]
+fn mcp_panel_lists_servers_and_logs_in() {
+    let mut d = started();
+    let req = invoke(&mut d, "mcp", "").unwrap();
+    assert_eq!(req[0]["method"], "mcpServerStatus/list");
+    assert_eq!(req[0]["params"]["detail"], "toolsAndAuthOnly");
+    // Shapes from `codex app-server generate-ts` (ListMcpServerStatusResponse).
+    let events = feed(
+        &mut d,
+        json!({"id": req[0]["id"], "result": {"data": [
+            {"name": "linear", "tools": {"a": {}, "b": {}}, "resources": [], "resourceTemplates": [], "authStatus": "notLoggedIn"},
+            {"name": "fs", "tools": {}, "resources": [], "resourceTemplates": [], "authStatus": "unsupported"},
+        ], "nextCursor": null}}),
+    );
+    let p = panel(&events);
+    assert_eq!(p.sections[0].rows[0].value.as_deref(), Some("2 tools"));
+    assert_eq!(p.sections[0].rows[0].actions[0].args, "login linear");
+    assert!(p.sections[0].rows[1].actions.is_empty());
+    assert_eq!(p.sections[0].actions[0].args, "reload");
+
+    let login = invoke(&mut d, "mcp", "login linear").unwrap();
+    assert_eq!(login[0]["method"], "mcpServer/oauth/login");
+    assert_eq!(login[0]["params"]["name"], "linear");
+    let events = feed(
+        &mut d,
+        json!({"id": login[0]["id"], "result": {"authorizationUrl": "https://auth.example/x"}}),
+    );
+    assert!(events.contains(&Event::Notice {
+        message: "Open to log in: https://auth.example/x".into()
+    }));
+
+    let reload = invoke(&mut d, "mcp", "reload").unwrap();
+    assert_eq!(reload[0]["method"], "config/mcpServer/reload");
+    feed(&mut d, json!({"id": reload[0]["id"], "result": {}}));
+    assert_eq!(sent(&d.poll_transmit())[0]["method"], "mcpServerStatus/list");
+}
+
+#[test]
+fn experimental_panel_toggles_features() {
+    let mut d = started();
+    let req = invoke(&mut d, "experimental", "").unwrap();
+    let events = feed(
+        &mut d,
+        json!({"id": req[0]["id"], "result": {"data": [
+            {"name": "web_search", "stage": "beta", "displayName": "Web search", "description": "Search the web",
+             "announcement": null, "enabled": false, "defaultEnabled": false},
+            {"name": "internal", "stage": "underDevelopment", "displayName": null, "description": null,
+             "announcement": null, "enabled": false, "defaultEnabled": false},
+        ], "nextCursor": null}}),
+    );
+    let rows = &panel(&events).sections[0].rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "Web search");
+    assert_eq!(rows[0].actions[0].args, "enable web_search");
+
+    let set = invoke(&mut d, "experimental", "enable web_search").unwrap();
+    assert_eq!(set[0]["method"], "experimentalFeature/enablement/set");
+    assert_eq!(set[0]["params"]["enablement"]["web_search"], true);
+}
+
+#[test]
+fn status_panel_shows_account_and_options() {
+    let mut d = started();
+    let req = invoke(&mut d, "status", "").unwrap();
+    assert_eq!(req[0]["method"], "account/read");
+    let events = feed(
+        &mut d,
+        json!({"id": req[0]["id"], "result": {"account": {"type": "chatgpt", "email": "v@example.com", "planType": "pro"}, "requiresOpenaiAuth": true}}),
+    );
+    let rows = &panel(&events).sections[0].rows;
+    assert_eq!(rows[0].value.as_deref(), Some("ChatGPT (v@example.com)"));
+    assert_eq!(rows[1].value.as_deref(), Some("pro"));
+    assert!(rows.iter().any(|r| r.label == "Model"));
+}

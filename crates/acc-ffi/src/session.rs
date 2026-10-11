@@ -28,6 +28,9 @@ pub enum AccError {
     InvalidOption { value: String },
     #[error("the harness has no session yet")]
     NotStarted,
+    /// The palette entry needs input (see `AccCommandEntry::input`).
+    #[error("{message}")]
+    MissingArgument { message: String },
 }
 
 impl From<SessionError> for AccError {
@@ -39,6 +42,9 @@ impl From<SessionError> for AccError {
             }
             SessionError::Driver(DriverError::InvalidOption(value)) => Self::InvalidOption { value },
             SessionError::Driver(DriverError::NotStarted) => Self::NotStarted,
+            SessionError::Driver(e @ DriverError::MissingArgument(_)) => Self::MissingArgument {
+                message: e.to_string(),
+            },
             SessionError::Driver(e @ DriverError::Unsupported { .. }) => Self::Unsupported {
                 message: e.to_string(),
             },
