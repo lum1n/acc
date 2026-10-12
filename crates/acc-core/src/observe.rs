@@ -17,7 +17,7 @@ use crate::event::{Event, Quota, Usage};
 use crate::harness::Harness;
 use crate::multiplexer::{self, Exec, Input, tui};
 use crate::pi;
-use crate::session::Update;
+use crate::session::{Update, completions};
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
 use crate::transcript::Transcript;
 
@@ -277,6 +277,7 @@ impl Observed {
                 }
                 _ => {}
             }
+            out.extend(completions(self.transcript.settle(&event), replay));
             let item = self.transcript.apply(&event);
             out.push(Update { event, item, replay });
         }
@@ -430,18 +431,7 @@ impl Observed {
             {
                 continue;
             }
-            if matches!(event, Event::Exited { .. }) {
-                for change in self.transcript.close_running() {
-                    out.push(Update {
-                        event: Event::ItemCompleted {
-                            id: change.id().to_owned(),
-                            extensions: serde_json::Value::Null,
-                        },
-                        item: Some(change),
-                        replay: false,
-                    });
-                }
-            }
+            out.extend(completions(self.transcript.settle(&event), false));
             out.push(Update {
                 event,
                 item: None,

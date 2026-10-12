@@ -534,6 +534,17 @@ impl ClaudeDriver {
                         extensions: ext,
                     });
                 }
+                // A server tool's result (`web_search_tool_result`, ...).
+                Some(kind) if kind.ends_with("_tool_result") => {
+                    if let Some(id) = owned(&block, "tool_use_id")
+                        && self.open_tools.remove(&id)
+                    {
+                        out.push(Event::ItemCompleted {
+                            id,
+                            extensions: json!({"content": block.get("content").cloned().unwrap_or(Value::Null)}),
+                        });
+                    }
+                }
                 _ => {}
             }
         }

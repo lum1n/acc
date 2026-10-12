@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::event::{Event, ItemId, ItemKind};
 use crate::harness::Harness;
 use crate::item::{ItemDetail, detail};
+use crate::state::RunState;
 use crate::wire::{owned, str_at};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +131,22 @@ impl Transcript {
                 ItemChange::Completed { id: i.id.clone() }
             })
             .collect()
+    }
+
+    /// [`Transcript::close_running`] when `event` leaves nothing running:
+    /// the turn ended, the session went idle (interrupted), finished,
+    /// failed, or the process exited. Harnesses don't always complete
+    /// every tool call they started, which would otherwise spin forever.
+    pub fn settle(&mut self, event: &Event) -> Vec<ItemChange> {
+        let ends = match event {
+            Event::TurnCompleted | Event::Exited { .. } => true,
+            Event::StateChanged(s) => matches!(
+                s.state,
+                RunState::Idle | RunState::Done | RunState::Error | RunState::Exited
+            ),
+            _ => false,
+        };
+        if ends { self.close_running() } else { Vec::new() }
     }
 
     fn slot(&mut self, id: &str, kind: ItemKind) -> (&mut Item, bool) {
@@ -288,6 +305,28 @@ mod tests {
         assert_eq!(item.ext["content"], "exit 1");
         assert_eq!(item.parent.as_deref(), Some("p"));
         assert!(matches!(item.detail(Harness::Claude), ItemDetail::Command { .. }));
+    }
+
+    #[test]
+    fn turn_end_closes_tools_left_running() {
+        let mut t = Transcript::new();
+        t.apply(&Event::ItemStarted {
+            id: "t".into(),
+            kind: ItemKind::ToolCall,
+            extensions: Value::Null,
+        });
+        let working = Event::StateChanged(crate::state::SessionState {
+            state: RunState::Working { progress: None },
+            message: None,
+            source: crate::state::StateSource::Native,
+            observed_at_ms: 0,
+        });
+        assert!(t.settle(&working).is_empty());
+        assert_eq!(
+            t.settle(&Event::TurnCompleted),
+            [ItemChange::Completed { id: "t".into() }]
+        );
+        assert_eq!(t.get("t").unwrap().status, ItemStatus::Completed);
     }
 
     #[test]

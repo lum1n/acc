@@ -210,6 +210,18 @@ impl Observer {
                                     }),
                                 });
                             }
+                            // A server tool's result (`web_search_tool_result`, ...).
+                            Some(kind) if kind.ends_with("_tool_result") => {
+                                let Some(id) = owned(b, "tool_use_id") else {
+                                    continue;
+                                };
+                                out.push(Event::ItemCompleted {
+                                    id,
+                                    extensions: json!({
+                                        "content": b.get("content").cloned().unwrap_or(Value::Null),
+                                    }),
+                                });
+                            }
                             Some("text") => whole_item(
                                 out,
                                 format!("{uuid}:{i}"),

@@ -609,16 +609,7 @@ impl Session {
             observed_at_ms: now_ms,
         }));
         self.apply(events, replay, now_ms, out);
-        for change in self.transcript.close_running() {
-            out.push(Update {
-                event: Event::ItemCompleted {
-                    id: change.id().to_owned(),
-                    extensions: Value::Null,
-                },
-                item: Some(change),
-                replay,
-            });
-        }
+        out.extend(completions(self.transcript.close_running(), replay));
     }
 
     fn apply(&mut self, events: Vec<Event>, replay: bool, now_ms: u64, out: &mut Vec<Update>) {
@@ -681,6 +672,7 @@ impl Session {
                 }
                 _ => {}
             }
+            out.extend(completions(self.transcript.settle(&event), replay));
             let item = self.transcript.apply(&event);
             if self.spec.title.is_none()
                 && let Some(ItemChange::Completed { id }) = &item
@@ -694,6 +686,19 @@ impl Session {
             out.push(Update { event, item, replay });
         }
     }
+}
+
+/// Updates for items [`Transcript`] closed itself, as if the harness had
+/// completed them.
+pub(crate) fn completions(changes: Vec<ItemChange>, replay: bool) -> impl Iterator<Item = Update> {
+    changes.into_iter().map(move |change| Update {
+        event: Event::ItemCompleted {
+            id: change.id().to_owned(),
+            extensions: Value::Null,
+        },
+        item: Some(change),
+        replay,
+    })
 }
 
 fn merge_usage(into: &mut Usage, from: &Usage) {
