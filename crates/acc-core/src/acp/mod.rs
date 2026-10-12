@@ -153,6 +153,19 @@ pub struct AcpDriver {
     open_item: Option<(ItemId, ItemKind)>,
     open_tools: BTreeSet<String>,
     item_seq: u64,
+    /// Prompts this client sent, as items, until the session takes them:
+    /// ACP agents only repeat a prompt when `session/load` replays history.
+    echoes: Vec<Event>,
+    echo_seq: u64,
+    /// Echoed prompts whose turn hasn't ended. An agent that repeats the
+    /// prompt anyway is ignored meanwhile, so it doesn't show twice.
+    echoed_turns: usize,
+    /// Every prompt of the session in order, from the harness's own store
+    /// (see [`Driver::history_script`]), and the next one's index: each turn
+    /// takes one, whether its prompt is replayed, echoed or taken from here.
+    history: Vec<String>,
+    history_next: usize,
+    turn_open: bool,
 
     state: Option<(RunState, Option<String>)>,
 }
@@ -188,6 +201,12 @@ impl AcpDriver {
             open_item: None,
             open_tools: BTreeSet::new(),
             item_seq: 0,
+            echoes: Vec::new(),
+            echo_seq: 0,
+            echoed_turns: 0,
+            history: Vec::new(),
+            history_next: 0,
+            turn_open: false,
             state: None,
         };
         d.rebuild_commands();
@@ -289,6 +308,27 @@ impl AcpDriver {
         Ok(bytes)
     }
 
+    fn echo_prompt(&mut self, text: &str) {
+        self.echo_seq += 1;
+        self.echoed_turns += 1;
+        self.history_next += 1;
+        self.turn_open = true;
+        push_prompt(format!("prompt-{}", self.echo_seq), text, &mut self.echoes);
+    }
+
+    /// A turn whose prompt nobody showed began: show it from the history.
+    fn open_turn(&mut self, out: &mut Vec<Event>) {
+        if self.turn_open {
+            return;
+        }
+        self.turn_open = true;
+        let n = self.history_next;
+        self.history_next += 1;
+        if let Some(text) = self.history.get(n).cloned() {
+            push_prompt(format!("history-{n}"), &text, out);
+        }
+    }
+
     /// Sends `/name args` if the agent advertises one of `names`, or if the
     /// harness is known to handle the first name without advertising it.
     fn slash(&mut self, names: &[&str], args: &str, what: &'static str) -> Result<Vec<u8>, DriverError> {
@@ -368,7 +408,10 @@ impl AcpDriver {
             Pending::Load { session_id } | Pending::Resume { session_id } => {
                 self.on_session_open(session_id, &r, out);
             }
-            Pending::Prompt => self.on_turn_end(&r, out),
+            Pending::Prompt => {
+                self.echoed_turns = self.echoed_turns.saturating_sub(1);
+                self.on_turn_end(&r, out);
+            }
             Pending::SetConfig => {
                 if r.get("configOptions").is_some() {
                     self.opts.absorb_response(&r);
@@ -427,6 +470,8 @@ impl AcpDriver {
                 self.fail(&message, out);
             }
             Pending::Prompt => {
+                self.echoed_turns = self.echoed_turns.saturating_sub(1);
+                self.turn_open = false;
                 self.close_turn_items(out);
                 self.set_state(RunState::Error, Some(message), out);
                 out.push(Event::TurnCompleted);
@@ -492,6 +537,7 @@ impl AcpDriver {
             self.reset_session();
         }
         self.replaying = false;
+        self.turn_open = false;
         self.phase = Phase::Ready;
         self.close_open_item(out);
         self.opts.absorb_response(r);
@@ -518,6 +564,8 @@ impl AcpDriver {
         self.open_tools.clear();
         self.harness_commands.clear();
         self.rebuild_commands();
+        self.history.clear();
+        self.history_next = 0;
     }
 
     /// Completes whatever the turn left open. A cancelled or failed turn can
@@ -536,6 +584,7 @@ impl AcpDriver {
     }
 
     fn on_turn_end(&mut self, r: &Value, out: &mut Vec<Event>) {
+        self.turn_open = false;
         self.close_turn_items(out);
         if let Some(u) = r.get("usage").filter(|u| u.is_object()) {
             let n = |k: &str| u.get(k).and_then(Value::as_u64);
@@ -567,6 +616,9 @@ impl AcpDriver {
             // Another client opened or forked a session; follow it.
             self.on_session_open(sid.to_owned(), r, out);
         } else if r.get("configOptions").is_some() || r.get("modes").is_some() {
+            // Also how another client's `session/load` ends, after the
+            // history it replayed.
+            self.turn_open = false;
             self.opts.absorb_response(r);
             self.options_changed(out);
         }
@@ -686,6 +738,7 @@ impl AcpDriver {
         match kind {
             "agent_message_chunk" => self.chunk(ItemKind::AgentMessage, update, out),
             "agent_thought_chunk" => self.chunk(ItemKind::Reasoning, update, out),
+            "user_message_chunk" if self.echoed_turns > 0 && !self.replaying => {}
             "user_message_chunk" => self.chunk(ItemKind::UserMessage, update, out),
             "tool_call" => self.on_tool_call(update, out),
             "tool_call_update" => self.on_tool_update(update, out),
@@ -743,6 +796,7 @@ impl AcpDriver {
         if self.replaying {
             return;
         }
+        self.open_turn(out);
         let blocked = matches!(self.state, Some((RunState::Blocked { .. }, _)));
         if !blocked || self.permissions.is_empty() {
             self.set_state(RunState::Working { progress: None }, None, out);
@@ -761,6 +815,10 @@ impl AcpDriver {
             .is_some_and(|(id, k)| *k == kind && message_id.is_none_or(|m| m == id));
         if !same {
             self.close_open_item(out);
+            if kind == ItemKind::UserMessage {
+                self.history_next += 1;
+                self.turn_open = true;
+            }
             let id = message_id.map_or_else(
                 || {
                     self.item_seq += 1;
@@ -1009,9 +1067,42 @@ impl Driver for AcpDriver {
         std::mem::take(&mut self.outgoing)
     }
 
+    fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.echoes)
+    }
+
+    /// Copilot keeps every prompt in its own event log; ACP only replays
+    /// them on `session/load`, which would repeat the history to every
+    /// client following the session's output.
+    fn history_script(&self, native_id: &str) -> Option<String> {
+        let safe = !native_id.is_empty() && native_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        (self.harness == Harness::Copilot && safe).then(|| {
+            format!(
+                "grep -F '\"user.message\"' \"$HOME/.copilot/session-state/{native_id}/events.jsonl\" 2>/dev/null || :\n"
+            )
+        })
+    }
+
+    fn on_history(&mut self, output: &str) {
+        self.history = output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("type").and_then(Value::as_str) == Some("user.message"))
+            .filter_map(|v| {
+                v.pointer("/data/content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+    }
+
     fn command(&mut self, cmd: Command) -> Result<Vec<u8>, DriverError> {
         match cmd {
-            Command::Prompt { text } => self.prompt_text(text),
+            Command::Prompt { text } => {
+                let bytes = self.prompt_text(text.clone())?;
+                self.echo_prompt(&text);
+                Ok(bytes)
+            }
             Command::Interrupt => {
                 let sid = self.require_session()?;
                 // The spec requires answering open permission requests with
@@ -1193,6 +1284,22 @@ pub fn launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
         env: Vec::new(),
         protocol: Protocol::Acp,
     }
+}
+
+fn push_prompt(id: ItemId, text: &str, out: &mut Vec<Event>) {
+    out.push(Event::ItemStarted {
+        id: id.clone(),
+        kind: ItemKind::UserMessage,
+        extensions: Value::Null,
+    });
+    out.push(Event::ItemDelta {
+        id: id.clone(),
+        text: text.to_owned(),
+    });
+    out.push(Event::ItemCompleted {
+        id,
+        extensions: Value::Null,
+    });
 }
 
 fn line(v: &Value) -> Vec<u8> {

@@ -197,6 +197,9 @@ impl std::fmt::Debug for Session {
     }
 }
 
+/// Separates the status line from the history in [`Session::status_exec`].
+const HISTORY_MARK: &str = "--acc-history--";
+
 fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
     let resume = if attach { None } else { spec.resume.clone() };
     match spec.harness {
@@ -343,8 +346,19 @@ impl Session {
 
     // ---- execs -------------------------------------------------------------
 
+    /// Checks the session and, for harnesses that keep history their
+    /// protocol won't replay, reads it, so pass the output to
+    /// [`Session::on_status`] before feeding the log.
     pub fn status_exec(&self) -> Exec {
-        Exec::new(self.dir.status_script())
+        let history = self
+            .spec
+            .native_id
+            .as_deref()
+            .and_then(|id| self.driver.history_script(id));
+        match history {
+            Some(h) => Exec::new(format!("{}echo {HISTORY_MARK}\n{h}", self.dir.status_script())),
+            None => Exec::new(self.dir.status_script()),
+        }
     }
 
     /// Follows the log from the current offset, for clients that use one
@@ -379,6 +393,13 @@ impl Session {
 
     /// Applies the output of [`Session::status_exec`].
     pub fn on_status(&mut self, stdout: &str, now_ms: u64) -> Vec<Update> {
+        let (stdout, history) = match stdout.split_once(&format!("\n{HISTORY_MARK}\n")) {
+            Some((status, history)) => (status, Some(history)),
+            None => (stdout, None),
+        };
+        if let Some(history) = history {
+            self.driver.on_history(history);
+        }
         let Some(status) = parse_status(stdout) else {
             return Vec::new();
         };
@@ -408,7 +429,7 @@ impl Session {
 
     /// Feeds bytes from the log, which must start at [`Session::offset`].
     pub fn feed(&mut self, bytes: &[u8], now_ms: u64) -> Vec<Update> {
-        let mut out = Vec::new();
+        let mut out = self.take_updates(now_ms);
         let until = self.replay_until.unwrap_or(u64::MAX);
         let split = if self.offset < until {
             (until - self.offset).min(bytes.len() as u64) as usize
@@ -433,6 +454,18 @@ impl Session {
             let t = self.driver.poll_transmit();
             self.transmit.extend(t);
         }
+        out.extend(self.take_updates(now_ms));
+        out
+    }
+
+    /// What the last command did that the harness won't report, such as the
+    /// prompt of a harness that doesn't repeat it. Call after
+    /// [`Session::command`] to show it at once; otherwise the next
+    /// [`Session::feed`] returns it.
+    pub fn take_updates(&mut self, now_ms: u64) -> Vec<Update> {
+        let mut out = Vec::new();
+        let events = self.driver.take_events();
+        self.apply(events, false, now_ms, &mut out);
         out
     }
 
@@ -867,6 +900,46 @@ mod tests {
     fn exit_known_before_replay_stays_exited() {
         let (a, _) = attached(Harness::Claude, CLAUDE_HI, false);
         assert_eq!(a.state().map(|s| &s.state), Some(&RunState::Exited));
+    }
+
+    #[test]
+    fn copilot_status_reads_the_prompts_its_log_lacks() {
+        let (s, _) = Session::launch(req(Harness::Copilot), "s1", "first", 1).unwrap();
+        let mut spec = s.spec().clone();
+        let a = Session::attach(spec.clone(), "second").unwrap();
+        assert!(!a.status_exec().script.contains(HISTORY_MARK), "no native id yet");
+
+        spec.native_id = Some("c0ffee".into());
+        let mut a = Session::attach(spec, "second").unwrap();
+        assert!(
+            a.status_exec()
+                .script
+                .contains("session-state/c0ffee/events.jsonl")
+        );
+        let log = concat!(
+            r#"{"jsonrpc":"2.0","id":"first-1","result":{"sessionId":"c0ffee"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"c0ffee","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}}"#,
+            "\n",
+        );
+        let status = format!(
+            "alive 7 {}\n{HISTORY_MARK}\n{}\n",
+            log.len(),
+            r#"{"type":"user.message","data":{"content":"say ok"}}"#
+        );
+        a.on_status(&status, 2);
+        assert!(a.is_alive());
+        a.feed(log.as_bytes(), 3);
+        let items: Vec<_> = a
+            .transcript()
+            .items()
+            .iter()
+            .map(|i| (i.kind, i.text.as_str()))
+            .collect();
+        assert_eq!(
+            items,
+            [(ItemKind::UserMessage, "say ok"), (ItemKind::AgentMessage, "ok")]
+        );
     }
 
     #[test]

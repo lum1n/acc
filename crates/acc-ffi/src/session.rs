@@ -150,6 +150,12 @@ impl AccSession {
         Ok(lock(&self.inner).command(command.into())?.into())
     }
 
+    /// What the last command did that the harness won't report (the prompt
+    /// of an ACP agent). Call after `command`; otherwise `feed` returns it.
+    pub fn take_updates(&self, now_ms: u64) -> Vec<AccUpdate> {
+        convert(lock(&self.inner).take_updates(now_ms))
+    }
+
     /// Bytes to write to the harness now (send with `input_exec`).
     pub fn take_transmit(&self) -> Vec<u8> {
         lock(&self.inner).take_transmit()

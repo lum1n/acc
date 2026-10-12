@@ -66,4 +66,21 @@ pub trait Driver: Send {
     fn poll_transmit(&mut self) -> Vec<u8> {
         Vec::new()
     }
+
+    /// Events a command produced without the harness saying so, such as the
+    /// prompt of a harness that doesn't repeat it. Call after
+    /// [`Driver::command`].
+    fn take_events(&mut self) -> Vec<Event> {
+        Vec::new()
+    }
+
+    /// A script printing what the harness keeps of a session that its
+    /// protocol won't replay to a client joining late (prompts, for ACP),
+    /// given the session's native id. Run it before replaying the log and
+    /// pass its output to [`Driver::on_history`].
+    fn history_script(&self, _native_id: &str) -> Option<String> {
+        None
+    }
+
+    fn on_history(&mut self, _output: &str) {}
 }

@@ -327,6 +327,198 @@ fn a_full_turn_with_a_permission_prompt() {
 }
 
 #[test]
+fn prompts_are_echoed_once() {
+    let mut d = ready_copilot();
+    assert!(d.take_events().is_empty());
+    let prompt = one(&d
+        .command(Command::Prompt {
+            text: "fix the build".into(),
+        })
+        .expect("prompt"));
+    assert_eq!(
+        d.take_events(),
+        [
+            Event::ItemStarted {
+                id: "prompt-1".into(),
+                kind: ItemKind::UserMessage,
+                extensions: Value::Null,
+            },
+            Event::ItemDelta {
+                id: "prompt-1".into(),
+                text: "fix the build".into(),
+            },
+            Event::ItemCompleted {
+                id: "prompt-1".into(),
+                extensions: Value::Null,
+            },
+        ]
+    );
+    assert!(d.take_events().is_empty());
+
+    // An agent that repeats the prompt during the turn isn't shown twice.
+    let events = feed(
+        &mut d,
+        &[
+            update("s1", text_chunk("user_message_chunk", "fix the build")),
+            update("s1", text_chunk("agent_message_chunk", "Done.")),
+            result(prompt["id"].clone(), json!({ "stopReason": "end_turn" })),
+        ],
+    );
+    let users = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::ItemStarted {
+                        kind: ItemKind::UserMessage,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    assert_eq!(users(&events), 0);
+
+    // Another client's prompt, once this client's turn is over, is.
+    let events = feed(
+        &mut d,
+        &[update("s1", text_chunk("user_message_chunk", "and the docs"))],
+    );
+    assert_eq!(users(&events), 1);
+
+    // Slash commands ride on prompts but aren't the user's words.
+    d.command(Command::Compact { hint: None }).expect("compact");
+    assert!(d.take_events().is_empty());
+}
+
+/// The user messages in `events`, as `(id, text)`.
+fn prompts(events: &[Event]) -> Vec<(String, String)> {
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ItemStarted {
+                id,
+                kind: ItemKind::UserMessage,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    ids.into_iter()
+        .map(|id| {
+            let text = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ItemDelta { id: i, text } if *i == id => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (id, text)
+        })
+        .collect()
+}
+
+/// Copilot's `events.jsonl` lines for these prompts, with other events between.
+fn copilot_history(texts: &[&str]) -> String {
+    texts
+        .iter()
+        .flat_map(|t| {
+            [
+                json!({ "type": "user.message", "data": { "content": t, "transformedContent": format!("<x/>{t}") } }),
+                json!({ "type": "assistant.turn_start", "data": {} }),
+            ]
+        })
+        .map(|v| format!("{v}\n"))
+        .collect()
+}
+
+#[test]
+fn a_late_client_takes_prompts_from_copilots_history() {
+    let mut d = driver(Harness::Copilot, Start::Attach);
+    assert!(
+        d.history_script("s1")
+            .expect("copilot")
+            .contains("session-state/s1/events.jsonl")
+    );
+    assert!(d.history_script("s1; rm -rf ~").is_none());
+    assert!(
+        driver(Harness::Cursor, Start::Attach)
+            .history_script("s1")
+            .is_none()
+    );
+
+    // The session was resumed: `session/load` replayed two prompts, then
+    // two live turns ran, the second one this client didn't see the end of.
+    d.on_history(&copilot_history(&["one", "two", "three", "four"]));
+    let events = feed(
+        &mut d,
+        &[
+            result("desk-0", init_result(json!({ "loadSession": true }))),
+            update("s1", text_chunk("user_message_chunk", "one")),
+            update("s1", text_chunk("agent_message_chunk", "1")),
+            update("s1", text_chunk("user_message_chunk", "two")),
+            update("s1", text_chunk("agent_message_chunk", "2")),
+            result("desk-1", copilot_session("s1")),
+            update("s1", text_chunk("agent_thought_chunk", "hm")),
+            update("s1", text_chunk("agent_message_chunk", "3")),
+            result("desk-2", json!({ "stopReason": "end_turn" })),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "ls", "kind": "execute" }),
+            ),
+        ],
+    );
+    assert_eq!(
+        prompts(&events),
+        [
+            ("item-1".into(), "one".into()),
+            ("item-3".into(), "two".into()),
+            ("history-2".into(), "three".into()),
+            ("history-3".into(), "four".into()),
+        ]
+    );
+    // Each prompt comes before its turn's first item.
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ItemStarted { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        [
+            "item-1",
+            "item-2",
+            "item-3",
+            "item-4",
+            "history-2",
+            "item-5",
+            "item-6",
+            "history-3",
+            "t1"
+        ]
+    );
+
+    // This client's own prompt is echoed and takes the next slot.
+    feed(&mut d, &[result("desk-3", json!({ "stopReason": "end_turn" }))]);
+    d.command(Command::Prompt { text: "five".into() })
+        .expect("prompt");
+    assert_eq!(prompts(&d.take_events()), [("prompt-1".into(), "five".into())]);
+    d.on_history(&copilot_history(&["one", "two", "three", "four", "five", "six"]));
+    let events = feed(
+        &mut d,
+        &[
+            update("s1", text_chunk("agent_message_chunk", "5")),
+            result("phone-0", json!({ "stopReason": "end_turn" })),
+            update("s1", text_chunk("agent_message_chunk", "6")),
+        ],
+    );
+    assert_eq!(prompts(&events), [("history-5".into(), "six".into())]);
+}
+
+#[test]
 fn split_reads_give_the_same_events() {
     let msgs = [
         update("s1", text_chunk("agent_message_chunk", "héllo ✓")),
