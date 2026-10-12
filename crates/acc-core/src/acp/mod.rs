@@ -151,6 +151,9 @@ pub struct AcpDriver {
     /// Updates for a session whose `session/new` or `session/fork` response
     /// hasn't arrived yet, replayed once it does.
     early: Vec<(String, Value)>,
+    /// Prompts sent before any session has opened, flushed in order once it
+    /// does. Unlike `early`, this holds client commands, not agent traffic.
+    queued_prompts: Vec<(String, Vec<Attachment>)>,
 
     /// The message or thought currently streaming in chunks.
     open_item: Option<(ItemId, ItemKind)>,
@@ -212,6 +215,7 @@ impl AcpDriver {
             commands: Vec::new(),
             permissions: BTreeMap::new(),
             early: Vec::new(),
+            queued_prompts: Vec::new(),
             open_item: None,
             open_tools: BTreeSet::new(),
             unclaimed_subagents: Vec::new(),
@@ -332,6 +336,20 @@ impl AcpDriver {
             json!({ "sessionId": sid, "prompt": prompt }),
             Pending::Prompt,
         );
+        Ok(bytes)
+    }
+
+    /// Checks image support and sends, for a prompt whose session is ready
+    /// (either immediately, or flushed from [`Self::queued_prompts`]).
+    fn try_prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<Vec<u8>, DriverError> {
+        if !attachments.is_empty() && !self.prompt_images {
+            return Err(DriverError::Unsupported {
+                harness: self.harness,
+                what: "images (the agent did not advertise promptCapabilities.image)",
+            });
+        }
+        let bytes = self.prompt(&text, &attachments)?;
+        self.echo_prompt(if text.is_empty() { "[image]" } else { &text });
         Ok(bytes)
     }
 
@@ -515,6 +533,7 @@ impl AcpDriver {
 
     fn fail(&mut self, message: &str, out: &mut Vec<Event>) {
         self.phase = Phase::Failed;
+        self.queued_prompts.clear();
         self.set_state(RunState::Error, Some(message.to_owned()), out);
     }
 
@@ -574,6 +593,8 @@ impl AcpDriver {
         self.opts.absorb_response(r);
         self.opts.rebuild(self.harness);
         self.session_id = Some(session_id.clone());
+        let bytes = self.apply_startup_model();
+        self.outgoing.extend(bytes);
         out.push(Event::SessionStarted {
             harness: self.harness,
             native_id: session_id,
@@ -585,6 +606,11 @@ impl AcpDriver {
         for (sid, msg) in std::mem::take(&mut self.early) {
             if self.session_id.as_deref() == Some(sid.as_str()) {
                 self.on_notification("session/update", &msg, out);
+            }
+        }
+        for (text, attachments) in std::mem::take(&mut self.queued_prompts) {
+            if let Ok(bytes) = self.try_prompt(text, attachments) {
+                self.outgoing.extend(bytes);
             }
         }
     }
@@ -1315,15 +1341,14 @@ impl Driver for AcpDriver {
         match cmd {
             Command::Prompt { text, attachments } => {
                 validate_attachments(&attachments)?;
-                if !attachments.is_empty() && !self.prompt_images {
-                    return Err(DriverError::Unsupported {
-                        harness: self.harness,
-                        what: "images (the agent did not advertise promptCapabilities.image)",
-                    });
+                // No session yet (still handshaking, opening, or waiting on
+                // auth): hold the prompt instead of dropping it, and send it
+                // the moment a session opens.
+                if self.session_id.is_none() && self.phase != Phase::Failed {
+                    self.queued_prompts.push((text, attachments));
+                    return Ok(Vec::new());
                 }
-                let bytes = self.prompt(&text, &attachments)?;
-                self.echo_prompt(if text.is_empty() { "[image]" } else { &text });
-                Ok(bytes)
+                self.try_prompt(text, attachments)
             }
             Command::Interrupt => {
                 let sid = self.require_session()?;
@@ -1438,6 +1463,21 @@ impl AcpDriver {
             }
             _ => Err(DriverError::InvalidOption(name.to_owned())),
         }
+    }
+
+    /// `cfg.model` for a session just opened. Cursor and Copilot already got
+    /// it as a launch flag (see [`launch_spec`]); for agents that only take
+    /// the model as a config option or legacy field (opencode), nothing
+    /// applies it otherwise, so every new session falls back to the agent's
+    /// own default instead of what the caller asked for.
+    fn apply_startup_model(&mut self) -> Vec<u8> {
+        let Some(model) = self.cfg.model.clone() else {
+            return Vec::new();
+        };
+        if self.opts.current_model().as_deref() == Some(model.as_str()) {
+            return Vec::new();
+        }
+        self.set_option(OptionId::Model, model).unwrap_or_default()
     }
 
     fn set_option(&mut self, id: OptionId, value: String) -> Result<Vec<u8>, DriverError> {

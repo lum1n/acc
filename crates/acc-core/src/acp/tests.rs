@@ -11,6 +11,12 @@ fn driver(harness: Harness, start: Start) -> AcpDriver {
     AcpDriver::new(harness, AcpConfig::new("/home/v/proj", start))
 }
 
+fn driver_with_model(harness: Harness, start: Start, model: &str) -> AcpDriver {
+    let mut cfg = AcpConfig::new("/home/v/proj", start);
+    cfg.model = Some(model.to_owned());
+    AcpDriver::new(harness, cfg)
+}
+
 /// Parses NDJSON the driver wrote.
 fn sent(bytes: &[u8]) -> Vec<Value> {
     std::str::from_utf8(bytes)
@@ -172,6 +178,88 @@ fn handshake_opens_a_new_session() {
 
     let ids: Vec<_> = d.options().iter().map(|o| o.id).collect();
     assert_eq!(ids, [OptionId::Mode, OptionId::Model, OptionId::Permission]);
+}
+
+fn opencode_session(session: &str, current_model: &str) -> Value {
+    json!({
+        "sessionId": session,
+        "configOptions": [
+            { "id": "model", "name": "Model", "category": "model", "type": "select",
+              "currentValue": current_model,
+              "options": [
+                { "value": "mock/mock-1", "name": "Mock" },
+                { "value": "github-copilot/claude-sonnet-5", "name": "Sonnet" } ] },
+            { "id": "mode", "name": "Session Mode", "category": "mode", "type": "select",
+              "currentValue": "build",
+              "options": [ { "value": "build", "name": "build" }, { "value": "plan", "name": "plan" } ] }
+        ]
+    })
+}
+
+#[test]
+fn startup_model_is_applied_as_a_config_option_for_opencode() {
+    // opencode takes no `--model` flag (see `launch_spec`); the agent opens
+    // with its own default and the driver has to switch it itself.
+    let mut d = driver_with_model(Harness::Opencode, Start::New, "github-copilot/claude-sonnet-5");
+    let init = one(&d.handshake());
+    feed(&mut d, &[result(init["id"].clone(), init_result(json!({})))]);
+    let new = one(&d.poll_transmit());
+
+    let events = feed(
+        &mut d,
+        &[result(new["id"].clone(), opencode_session("s1", "mock/mock-1"))],
+    );
+    assert!(
+        events.contains(&Event::SessionStarted {
+            harness: Harness::Opencode,
+            native_id: "s1".into(),
+            model: Some("mock/mock-1".into()),
+        }),
+        "reports the model the agent actually opened with"
+    );
+
+    let set = one(&d.poll_transmit());
+    assert_eq!(set["method"], "session/set_config_option");
+    assert_eq!(
+        set["params"],
+        json!({ "sessionId": "s1", "configId": "model", "value": "github-copilot/claude-sonnet-5" })
+    );
+
+    let mut after = opencode_session("s1", "mock/mock-1");
+    after["configOptions"][0]["currentValue"] = json!("github-copilot/claude-sonnet-5");
+    let events = feed(
+        &mut d,
+        &[result(
+            set["id"].clone(),
+            json!({ "configOptions": after["configOptions"] }),
+        )],
+    );
+    assert_eq!(events, [Event::OptionsChanged]);
+    assert_eq!(
+        d.options()
+            .iter()
+            .find(|o| o.id == OptionId::Model)
+            .expect("model")
+            .current
+            .as_deref(),
+        Some("github-copilot/claude-sonnet-5")
+    );
+
+    // A second session (e.g. `Command::New`) opening with the agent's
+    // default again gets switched back to the configured model too.
+    let new2 = one(&d.command(Command::New).expect("new"));
+    let events = feed(
+        &mut d,
+        &[result(new2["id"].clone(), opencode_session("s2", "mock/mock-1"))],
+    );
+    assert!(events.contains(&Event::SessionStarted {
+        harness: Harness::Opencode,
+        native_id: "s2".into(),
+        model: Some("mock/mock-1".into()),
+    }));
+    let set2 = one(&d.poll_transmit());
+    assert_eq!(set2["params"]["sessionId"], "s2");
+    assert_eq!(set2["params"]["value"], "github-copilot/claude-sonnet-5");
 }
 
 #[test]
@@ -837,6 +925,60 @@ fn canonical_commands_use_advertised_slash_commands() {
     // ...except opencode's unlisted /compact.
     let c = one(&bare.command(Command::Compact { hint: None }).expect("compact"));
     assert_eq!(c["params"]["prompt"][0]["text"], "/compact");
+}
+
+#[test]
+fn prompts_sent_before_the_session_opens_are_queued_not_dropped() {
+    let mut d = driver(Harness::Copilot, Start::New);
+    let init = one(&d.handshake());
+
+    // A prompt sent while still handshaking is held, not an error.
+    let bytes = d.command(Command::prompt("hello")).expect("queued");
+    assert!(bytes.is_empty());
+    assert!(d.take_events().is_empty());
+
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(json!({ "loadSession": true })),
+        )],
+    );
+    let new = one(&d.poll_transmit());
+
+    // A second prompt sent while `session/new` is still outstanding queues too.
+    let bytes = d.command(Command::prompt("world")).expect("queued");
+    assert!(bytes.is_empty());
+    assert!(d.take_events().is_empty());
+
+    let events = feed(&mut d, &[result(new["id"].clone(), copilot_session("s1"))]);
+    assert!(events.contains(&Event::SessionStarted {
+        harness: Harness::Copilot,
+        native_id: "s1".into(),
+        model: Some("gpt-5.4".into()),
+    }));
+
+    // Both queued prompts went out, in order, once the session opened.
+    let sent = sent(&d.poll_transmit());
+    let prompts: Vec<_> = sent
+        .into_iter()
+        .filter(|m| m["method"] == "session/prompt")
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0]["params"]["sessionId"], "s1");
+    assert_eq!(prompts[0]["params"]["prompt"][0]["text"], "hello");
+    assert_eq!(prompts[1]["params"]["prompt"][0]["text"], "world");
+
+    // Each was echoed as its own user-message item.
+    let texts: Vec<_> = d
+        .take_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ItemDelta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["hello", "world"]);
 }
 
 #[test]
