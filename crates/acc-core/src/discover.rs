@@ -84,6 +84,14 @@ ps -eo pid=,etime=,args= 2>/dev/null | while read -r pid etime args; do
   fi | grep -E '^(TMUX|TMUX_PANE|ZELLIJ_SESSION_NAME|ZELLIJ_PANE_ID|STY|WINDOW)=' | while read -r kv; do
     printf 'E\t%s\t%s\n' "$pid" "$kv"
   done
+  # Claude records each TUI's session in sessions/<pid>.json: certain even
+  # when several share a project directory. Listed first, so it wins.
+  if [ "$b" = claude ]; then
+    sid=$(sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' "$HOME/.claude/sessions/$pid.json" 2>/dev/null)
+    for t in "$HOME"/.claude/projects/*/"$sid".jsonl; do
+      [ -n "$sid" ] && [ -f "$t" ] && printf 'F\t%s\t%s\t%s\n' "$pid" "$t" "$(wc -c <"$t" | tr -d ' ')" && break
+    done
+  fi
   if [ -d "/proc/$pid/fd" ]; then
     for f in /proc/$pid/fd/*; do readlink "$f" 2>/dev/null; done
   else

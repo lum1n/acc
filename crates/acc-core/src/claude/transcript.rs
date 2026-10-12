@@ -146,7 +146,7 @@ impl Observer {
                 let mut text = String::new();
                 match message.get("content") {
                     Some(Value::String(s)) => {
-                        prompt = !s.starts_with("<local-command");
+                        prompt = !local_input(s);
                         text.push_str(s);
                     }
                     Some(Value::Array(blocks)) => {
@@ -177,7 +177,13 @@ impl Observer {
                 let meta = v.get("isMeta").and_then(Value::as_bool) == Some(true);
                 if prompt && !meta {
                     self.pending_tools.clear();
-                    self.set(RunState::Working { progress: None }, out);
+                    // Esc in the TUI: the turn is over, nothing follows.
+                    let state = if text.starts_with("[Request interrupted by user") {
+                        RunState::Idle
+                    } else {
+                        RunState::Working { progress: None }
+                    };
+                    self.set(state, out);
                     let id = owned(v, "uuid").unwrap_or_else(|| format!("user-{}", text.len()));
                     whole_item(out, id, ItemKind::UserMessage, text, Value::Null);
                 }
@@ -262,6 +268,16 @@ impl Observer {
             observed_at_ms: 0,
         }));
     }
+}
+
+/// Input the TUI handles itself, recorded without starting a turn: slash
+/// commands (`/model`, `/mcp`; a prompt command's turn shows in the
+/// assistant lines that follow), their output, and `!` shell commands.
+fn local_input(s: &str) -> bool {
+    let s = s.trim_start();
+    ["<local-command", "<command-name>", "<command-message>", "<bash-"]
+        .iter()
+        .any(|p| s.starts_with(p))
 }
 
 /// Announces an item that is complete when first seen.
@@ -363,5 +379,24 @@ mod tests {
         o.feed(cut.as_bytes());
         assert_eq!(o.pending_tools(), 1);
         assert!(!o.at_safe_point());
+    }
+
+    #[test]
+    fn local_commands_and_interrupts_end_no_turn_in_working() {
+        let mut o = Observer::new();
+        o.feed(TRANSCRIPT.as_bytes());
+        assert_eq!(o.state(), Some(&RunState::Done));
+        for line in [
+            r#"{"type":"user","uuid":"c1","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}}"#,
+            r#"{"type":"user","uuid":"c2","message":{"role":"user","content":"<local-command-stdout>Set model to opus</local-command-stdout>"}}"#,
+            r#"{"type":"user","uuid":"c3","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
+        ] {
+            o.feed(format!("{line}\n").as_bytes());
+        }
+        assert_eq!(o.state(), Some(&RunState::Done));
+        o.feed(b"{\"type\":\"user\",\"uuid\":\"p\",\"message\":{\"role\":\"user\",\"content\":\"go on\"}}\n");
+        assert_eq!(o.state(), Some(&RunState::Working { progress: None }));
+        o.feed(b"{\"type\":\"user\",\"uuid\":\"i\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user]\"}]}}\n");
+        assert_eq!(o.state(), Some(&RunState::Idle));
     }
 }

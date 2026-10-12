@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use acc_core::discover::{self, ForeignAgent};
-use acc_core::observe::{self, Observed};
+use acc_core::observe::Observed;
 use acc_core::takeover::{self, Takeover, TakeoverAction, TakeoverInput, TakeoverStep};
 
 use crate::session::AccError;
@@ -148,11 +148,11 @@ impl AccObserved {
             .collect()
     }
 
-    /// Call every few seconds with the result of `alive_exec` and, when
+    /// Call every few seconds with the output of `alive_exec` and, when
     /// `screen_exec` returned one, that capture's output.
-    pub fn tick(&self, now_ms: u64, process_alive: bool, screen: Option<String>) -> Vec<AccUpdate> {
+    pub fn tick(&self, now_ms: u64, probe: String, screen: Option<String>) -> Vec<AccUpdate> {
         lock(&self.inner)
-            .tick(now_ms, process_alive, screen.as_deref())
+            .tick(now_ms, &probe, screen.as_deref())
             .into_iter()
             .map(Into::into)
             .collect()
@@ -164,10 +164,10 @@ impl AccObserved {
         lock(&self.inner).screen_exec(now_ms).map(Into::into)
     }
 
-    /// Prints `alive` or `gone`.
+    /// Prints `alive` or `gone`, then what the harness reports about
+    /// itself. Pass the whole output to `tick`.
     pub fn alive_exec(&self) -> AccExec {
-        let pid = lock(&self.inner).agent().pid;
-        AccExec::script(observe::alive_script(pid))
+        lock(&self.inner).probe_exec().into()
     }
 
     pub fn is_readable(&self) -> bool {

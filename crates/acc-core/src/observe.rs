@@ -70,6 +70,21 @@ impl Reader {
         }
     }
 
+    /// Whether the last turn ended, as far as the transcript tells.
+    fn turn_ended(&self) -> bool {
+        match self {
+            Reader::Claude(o) => matches!(o.state(), Some(RunState::Done)) && o.pending_tools() == 0,
+            _ => false,
+        }
+    }
+
+    fn asks_question(&self) -> bool {
+        match self {
+            Reader::Claude(o) => o.pending_tool_names().any(|n| n == "AskUserQuestion"),
+            _ => false,
+        }
+    }
+
     /// What the outstanding tool calls may be waiting on, and whether that is
     /// certain from the transcript alone (`false`: only the screen can tell
     /// a dialog from a slow tool).
@@ -107,6 +122,9 @@ pub struct Observed {
     /// The current block was inferred rather than read, so news from the
     /// transcript ends it.
     inferred_block: bool,
+    /// The harness reports its own state (Claude's `sessions/<pid>.json`),
+    /// so nothing is inferred.
+    reports_status: bool,
 }
 
 impl Observed {
@@ -130,6 +148,7 @@ impl Observed {
             alive: true,
             last_news_ms: 0,
             inferred_block: false,
+            reports_status: false,
             agent,
         }
     }
@@ -286,16 +305,72 @@ impl Observed {
     /// have been answered.
     pub fn screen_exec(&self, now_ms: u64) -> Option<Exec> {
         let pane = self.agent.pane.as_ref()?;
+        if self.reports_status {
+            return None;
+        }
         let check = self.inferred_block || matches!(self.quiet_wait(now_ms), Some((_, false)));
         (self.alive && check).then(|| multiplexer::backend(pane.multiplexer).capture(pane, false))
     }
 
-    /// Periodic check with whether the process still runs and, when
-    /// [`Observed::screen_exec`] asked for one, the captured screen. Infers
-    /// a waiting approval or question from a quiet outstanding tool call
-    /// (confirmed on screen where there is one), and the end of the session
-    /// from the process going away.
-    pub fn tick(&mut self, now_ms: u64, process_alive: bool, screen: Option<&str>) -> Vec<Update> {
+    /// The state the harness reports itself, from the probe's output after
+    /// its first line. Claude Code (2.1+) keeps `status` (busy, idle,
+    /// waiting) and `waitingFor` in `~/.claude/sessions/<pid>.json`.
+    fn reported_state(&self, report: &str, now_ms: u64) -> Option<SessionState> {
+        if self.agent.harness != Harness::Claude {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(report.trim()).ok()?;
+        let reader = self.reader.as_ref();
+        let waiting_for = v.get("waitingFor").and_then(|w| w.as_str());
+        let idle = || {
+            if reader.is_some_and(Reader::turn_ended) {
+                RunState::Done
+            } else {
+                RunState::Idle
+            }
+        };
+        let state = match v.get("status")?.as_str()? {
+            "busy" => RunState::Working { progress: None },
+            "idle" => idle(),
+            "waiting" => match waiting_for {
+                Some("input needed") => RunState::Blocked {
+                    kind: BlockKind::Question,
+                },
+                // The user opened a dialog in the TUI (/mcp, /model): they
+                // are there already.
+                Some("dialog open" | "goal proposal") => idle(),
+                _ if reader.is_some_and(Reader::asks_question) => RunState::Blocked {
+                    kind: BlockKind::Question,
+                },
+                // "permission prompt", "sandbox request", "worker request".
+                _ => RunState::Blocked {
+                    kind: BlockKind::Permission,
+                },
+            },
+            _ => return None,
+        };
+        let message = matches!(state, RunState::Blocked { .. }).then(|| "Waiting in the terminal".to_owned());
+        Some(SessionState {
+            state,
+            message,
+            source: StateSource::Native,
+            observed_at_ms: now_ms,
+        })
+    }
+
+    /// Periodic check with the output of [`Observed::probe_exec`] and, when
+    /// [`Observed::screen_exec`] asked for one, the captured screen. Takes
+    /// the state the harness reports where it does; otherwise infers a
+    /// waiting approval or question from a quiet outstanding tool call
+    /// (confirmed on screen where there is one). Ends the session when the
+    /// process goes away.
+    pub fn tick(&mut self, now_ms: u64, probe: &str, screen: Option<&str>) -> Vec<Update> {
+        let (status, report) = probe.split_once('\n').unwrap_or((probe, ""));
+        let process_alive = status.trim() == "alive";
+        let reported = process_alive
+            .then(|| self.reported_state(report, now_ms))
+            .flatten();
+        self.reports_status = reported.is_some();
         let mut events = Vec::new();
         if !process_alive && self.alive {
             self.alive = false;
@@ -307,6 +382,10 @@ impl Observed {
                 source: StateSource::Native,
                 observed_at_ms: now_ms,
             }));
+        } else if let Some(state) = reported {
+            self.inferred_block = false;
+            // Sent every tick to keep it fresh; unchanged is not news.
+            events.push(Event::StateChanged(state));
         } else if process_alive {
             let on_screen = |kind| match (&self.agent.pane, screen) {
                 (Some(_), Some(text)) => Some(tui::shows_approval(self.agent.harness, text).then_some(kind)),
@@ -372,6 +451,12 @@ impl Observed {
         out
     }
 
+    /// Script for [`Observed::tick`]: whether the process runs, and what
+    /// the harness reports about itself.
+    pub fn probe_exec(&self) -> Exec {
+        Exec::new(probe_script(self.agent.harness, self.agent.pid))
+    }
+
     /// Execs that type `cmd` into the TUI's pane: prompts, interrupt, and
     /// the slash commands each TUI takes. Approvals need a takeover.
     pub fn pane_command(&self, cmd: &Command) -> Result<Vec<Exec>, DriverError> {
@@ -393,6 +478,18 @@ fn working(now_ms: u64) -> SessionState {
         message: None,
         source: StateSource::Transcript,
         observed_at_ms: now_ms,
+    }
+}
+
+/// Script printing `alive` or `gone` for a process, then for Claude its
+/// session record. Pass the output to [`Observed::tick`].
+pub fn probe_script(harness: Harness, pid: u32) -> String {
+    match harness {
+        Harness::Claude => format!(
+            "if kill -0 {pid} 2>/dev/null; then echo alive; cat \"$HOME/.claude/sessions/{pid}.json\" 2>/dev/null; \
+             echo; else echo gone; fi\n"
+        ),
+        _ => alive_script(pid),
     }
 }
 
@@ -486,18 +583,18 @@ mod tests {
         o.feed(until_tool_result().as_bytes(), 1_000);
         assert!(!o.at_safe_point());
         assert!(o.screen_exec(2_000).is_none());
-        assert!(o.tick(2_000, true, None).is_empty());
+        assert!(o.tick(2_000, "alive", None).is_empty());
         let exec = o.screen_exec(6_000).unwrap();
         assert!(exec.script.contains("capture-pane"));
-        assert!(o.tick(6_000, true, Some(RUNNING)).is_empty());
+        assert!(o.tick(6_000, "alive", Some(RUNNING)).is_empty());
         // No capture is no news.
-        assert!(o.tick(7_000, true, None).is_empty());
-        let ups = o.tick(8_000, true, Some(DIALOG));
+        assert!(o.tick(7_000, "alive", None).is_empty());
+        let ups = o.tick(8_000, "alive", Some(DIALOG));
         assert!(blocked(&ups));
         // Approved: the command runs on with the dialog gone.
         assert!(o.screen_exec(9_000).is_some());
-        assert!(working(&o.tick(9_000, true, Some(RUNNING))));
-        let ups = o.tick(10_000, false, None);
+        assert!(working(&o.tick(9_000, "alive", Some(RUNNING))));
+        let ups = o.tick(10_000, "gone", None);
         assert!(ups.iter().any(|u| matches!(u.event, Event::Exited { .. })));
         assert!(!o.is_alive());
     }
@@ -509,7 +606,7 @@ mod tests {
         let mut o = Observed::new(a);
         o.feed(until_tool_result().as_bytes(), 1_000);
         assert!(o.screen_exec(6_000).is_none());
-        assert!(blocked(&o.tick(6_000, true, None)));
+        assert!(blocked(&o.tick(6_000, "alive", None)));
         let ups = o.feed(tool_result().as_bytes(), 7_000);
         assert!(working(&ups));
         assert_eq!(
@@ -517,7 +614,7 @@ mod tests {
             Some(&RunState::Working { progress: None })
         );
         // Quiet again but nothing outstanding: no block.
-        assert!(o.tick(20_000, true, None).is_empty());
+        assert!(o.tick(20_000, "alive", None).is_empty());
     }
 
     #[test]
@@ -527,7 +624,7 @@ mod tests {
         a.args = "claude --dangerously-skip-permissions".into();
         let mut o = Observed::new(a);
         o.feed(until_tool_result().as_bytes(), 1_000);
-        assert!(o.tick(6_000, true, None).is_empty());
+        assert!(o.tick(6_000, "alive", None).is_empty());
     }
 
     #[test]
@@ -536,7 +633,7 @@ mod tests {
         let ask = r#"{"type":"assistant","uuid":"a1","sessionId":"s","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{}}]}}"#;
         o.feed(format!("{ask}\n").as_bytes(), 1_000);
         assert!(o.screen_exec(6_000).is_none());
-        let ups = o.tick(6_000, true, None);
+        let ups = o.tick(6_000, "alive", None);
         assert!(ups.iter().any(|u| matches!(&u.event, Event::StateChanged(s)
             if s.state == RunState::Blocked { kind: BlockKind::Question })));
     }
@@ -548,7 +645,7 @@ mod tests {
         let mut o = Observed::new(a);
         let task = r#"{"type":"assistant","uuid":"a1","sessionId":"s","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Task","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}},{"type":"server_tool_use","id":"w1","name":"web_search","input":{}}]}}"#;
         o.feed(format!("{task}\n").as_bytes(), 1_000);
-        assert!(o.tick(60_000, true, None).is_empty());
+        assert!(o.tick(60_000, "alive", None).is_empty());
     }
 
     #[test]
@@ -562,6 +659,71 @@ mod tests {
                 option_id: "y".into()
             })
             .is_err()
+        );
+    }
+
+    fn claude_report(status: &str, waiting_for: Option<&str>) -> String {
+        let w = waiting_for.map_or(String::new(), |w| format!(r#","waitingFor":"{w}""#));
+        format!("alive\n{{\"pid\":42,\"sessionId\":\"s\",\"status\":\"{status}\"{w}}}\n")
+    }
+
+    fn state_after(o: &mut Observed, at: u64, probe: &str) -> Option<RunState> {
+        o.tick(at, probe, None);
+        o.state().map(|s| s.state.clone())
+    }
+
+    #[test]
+    fn claude_reported_status_wins_over_guesses() {
+        let mut o = Observed::new(agent(0));
+        assert!(o.probe_exec().script.contains(".claude/sessions/42.json"));
+        o.feed(until_tool_result().as_bytes(), 1_000);
+        // A slow tool, reported busy: no screen needed, no block.
+        assert_eq!(
+            state_after(&mut o, 6_000, &claude_report("busy", None)),
+            Some(RunState::Working { progress: None })
+        );
+        assert!(o.screen_exec(6_000).is_none());
+        assert_eq!(
+            state_after(
+                &mut o,
+                9_000,
+                &claude_report("waiting", Some("permission prompt"))
+            ),
+            Some(RunState::Blocked {
+                kind: BlockKind::Permission
+            })
+        );
+        assert_eq!(
+            state_after(&mut o, 12_000, &claude_report("waiting", Some("input needed"))),
+            Some(RunState::Blocked {
+                kind: BlockKind::Question
+            })
+        );
+        // The rest of the turn arrives; the transcript ranks below the report.
+        o.feed(tool_result().as_bytes(), 13_000);
+        let rest: String = CLAUDE
+            .lines()
+            .skip_while(|l| !l.contains("\"tool_result\""))
+            .skip(1)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        o.feed(rest.as_bytes(), 14_000);
+        assert_eq!(
+            state_after(&mut o, 15_000, &claude_report("idle", None)),
+            Some(RunState::Done)
+        );
+        // A dialog the user opened in the TUI is not waiting on them.
+        assert_eq!(
+            state_after(&mut o, 18_000, &claude_report("waiting", Some("dialog open"))),
+            Some(RunState::Done)
+        );
+        // No report (an older Claude): back to the transcript and guesses.
+        assert_eq!(state_after(&mut o, 60_000, "alive\n"), Some(RunState::Done));
+        assert!(!o.reports_status);
+        assert!(
+            o.tick(61_000, "gone\n", None)
+                .iter()
+                .any(|u| matches!(u.event, Event::Exited { .. }))
         );
     }
 }
