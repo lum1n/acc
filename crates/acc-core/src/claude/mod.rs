@@ -1264,7 +1264,19 @@ impl ClaudeDriver {
             ("deny", _) => json!({"behavior": "deny", "message": "The user denied this request."}),
             (_, Some(question)) => {
                 let mut input = p.input.clone();
-                input["answers"] = json!({ question.as_str(): option_id });
+                let answers = crate::question::decode(option_id);
+                let questions = crate::question::parse(&p.input);
+                let mut map = serde_json::Map::new();
+                if questions.is_empty() {
+                    map.insert(question.clone(), json!(answers.concat().join(", ")));
+                }
+                // Several picks to one question are joined, as Claude's own UI does.
+                for (q, a) in questions.iter().zip(&answers) {
+                    if !a.is_empty() {
+                        map.insert(q.question.clone(), json!(a.join(", ")));
+                    }
+                }
+                input["answers"] = Value::Object(map);
                 json!({"behavior": "allow", "updatedInput": input})
             }
             ("allow", None) => json!({"behavior": "allow", "updatedInput": p.input}),

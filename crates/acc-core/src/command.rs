@@ -39,6 +39,7 @@ pub enum Command {
         id: OptionId,
         value: String,
     },
+    /// `option_id` may be [`crate::question::encode`]d answers to every question.
     AnswerPermission {
         request_id: String,
         option_id: String,

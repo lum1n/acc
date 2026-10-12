@@ -354,6 +354,33 @@ fn request_resolved_elsewhere_is_reported() {
 }
 
 #[test]
+fn user_input_answers_every_question() {
+    let mut d = started();
+    feed(
+        &mut d,
+        json!({"id": 7, "method": "item/tool/requestUserInput", "params": {
+        "threadId": THREAD, "turnId": "t1", "itemId": "u2", "isBlocking": true, "autoResolutionMs": null,
+        "questions": [
+            {"id": "q1", "header": "DB", "question": "Which DB?", "isOther": false, "isSecret": false,
+                "options": [{"label": "Postgres", "description": ""}]},
+            {"id": "q2", "header": "Name", "question": "Name it?", "isOther": true, "isSecret": false,
+                "options": null}]}}),
+    );
+    let answers = vec![vec!["Postgres".to_owned()], vec!["acme".to_owned()]];
+    let reply = sent(
+        &d.command(Command::AnswerPermission {
+            request_id: "7".into(),
+            option_id: crate::question::encode(&answers),
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        reply[0]["result"],
+        json!({"answers": {"q1": {"answers": ["Postgres"]}, "q2": {"answers": ["acme"]}}})
+    );
+}
+
+#[test]
 fn user_input_and_permission_grants() {
     let mut d = started();
     feed(

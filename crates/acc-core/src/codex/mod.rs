@@ -747,13 +747,10 @@ impl CodexDriver {
             },
             "item/tool/requestUserInput" => {
                 let mut answers = Map::new();
+                let chosen = crate::question::decode(option_id);
                 for (i, q) in list(&req.params, "questions").enumerate() {
                     if let Some(qid) = owned(q, "id") {
-                        let chosen = if i == 0 {
-                            vec![option_id.to_owned()]
-                        } else {
-                            Vec::new()
-                        };
+                        let chosen = chosen.get(i).cloned().unwrap_or_default();
                         answers.insert(qid, json!({"answers": chosen}));
                     }
                 }

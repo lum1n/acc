@@ -286,6 +286,34 @@ fn ask_user_question_is_a_question_answered_by_allowing() {
 }
 
 #[test]
+fn ask_user_question_answers_every_question() {
+    let mut d = ClaudeDriver::default();
+    let req = json!({"type":"control_request","request_id":"q2","request":{
+        "subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"toolu_q",
+        "input":{"questions":[
+            {"question":"Which DB?","header":"DB","multiSelect":false,
+                "options":[{"label":"Postgres","description":""},{"label":"SQLite","description":""}]},
+            {"question":"Which extras?","header":"Extras","multiSelect":true,
+                "options":[{"label":"Cache","description":""},{"label":"Search","description":""}]}]}}});
+    d.on_output(&wire::line(&req));
+    let answers = vec![
+        vec!["Postgres".to_owned()],
+        vec!["Cache".to_owned(), "Search".to_owned()],
+    ];
+    let bytes = d
+        .command(Command::AnswerPermission {
+            request_id: "q2".into(),
+            option_id: crate::question::encode(&answers),
+        })
+        .unwrap();
+    let result = &sent(&bytes)[0]["response"]["response"];
+    assert_eq!(
+        result["updatedInput"]["answers"],
+        json!({"Which DB?": "Postgres", "Which extras?": "Cache, Search"})
+    );
+}
+
+#[test]
 fn cancel_request_resolves_pending_permission() {
     let mut d = ClaudeDriver::default();
     replay(&mut d, &until_prompt(PERMISSION));

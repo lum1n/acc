@@ -23,6 +23,7 @@
 //!   the per-session item list.
 //! - [`multiplexer`]: locating harnesses inside tmux, zellij, screen and Rex.
 //! - [`acp`]: the Agent Client Protocol driver (Cursor, Copilot, opencode).
+//! - [`question`]: multi-part questions and how to answer all of them.
 
 pub mod claude;
 pub mod codex;
@@ -40,6 +41,7 @@ pub mod ndjson;
 pub mod observe;
 pub mod osc7501;
 pub mod pi;
+pub mod question;
 pub mod session;
 pub mod shell;
 pub mod state;
