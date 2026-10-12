@@ -25,7 +25,8 @@ pub use options::{ConfigOption, ConfigValue};
 use options::{OptionState, Route, set_config_params};
 
 use crate::command::{
-    Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, offer, offer_option,
+    Attachment, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, offer,
+    offer_option, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Usage};
@@ -134,6 +135,8 @@ pub struct AcpDriver {
 
     // From `initialize`.
     load_session: bool,
+    /// `promptCapabilities.image`: whether `session/prompt` may carry images.
+    prompt_images: bool,
     resume_session: bool,
     fork_session: bool,
     auth_methods: Vec<(String, String)>,
@@ -188,6 +191,7 @@ impl AcpDriver {
             outgoing: Vec::new(),
             phase: if attach { Phase::Ready } else { Phase::Initializing },
             load_session: false,
+            prompt_images: false,
             resume_session: false,
             fork_session: false,
             auth_methods: Vec::new(),
@@ -298,11 +302,20 @@ impl AcpDriver {
         }
     }
 
-    fn prompt_text(&mut self, text: String) -> Result<Vec<u8>, DriverError> {
+    /// `session/prompt` with text and image blocks. An image-only prompt
+    /// carries no text block.
+    fn prompt(&mut self, text: &str, attachments: &[Attachment]) -> Result<Vec<u8>, DriverError> {
         let sid = self.require_session()?;
+        let mut prompt = Vec::new();
+        if !text.is_empty() || attachments.is_empty() {
+            prompt.push(json!({ "type": "text", "text": text }));
+        }
+        for a in attachments {
+            prompt.push(json!({ "type": "image", "mimeType": a.media_type, "data": a.data }));
+        }
         let bytes = self.request(
             "session/prompt",
-            json!({ "sessionId": sid, "prompt": [{ "type": "text", "text": text }] }),
+            json!({ "sessionId": sid, "prompt": prompt }),
             Pending::Prompt,
         );
         Ok(bytes)
@@ -345,7 +358,7 @@ impl AcpDriver {
         } else {
             format!("/{name} {args}")
         };
-        self.prompt_text(text)
+        self.prompt(&text, &[])
     }
 
     fn answer_permission(&mut self, rpc_id: Value, outcome: Value) {
@@ -516,6 +529,10 @@ impl AcpDriver {
         let session_caps = caps.get("sessionCapabilities").unwrap_or(&Value::Null);
         let has = |k: &str| session_caps.get(k).is_some_and(|v| !v.is_null());
         self.load_session = caps.get("loadSession").and_then(Value::as_bool).unwrap_or(false);
+        self.prompt_images = caps
+            .pointer("/promptCapabilities/image")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.resume_session = has("resume");
         self.fork_session = has("fork");
         self.auth_methods = r
@@ -1098,9 +1115,16 @@ impl Driver for AcpDriver {
 
     fn command(&mut self, cmd: Command) -> Result<Vec<u8>, DriverError> {
         match cmd {
-            Command::Prompt { text } => {
-                let bytes = self.prompt_text(text.clone())?;
-                self.echo_prompt(&text);
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                if !attachments.is_empty() && !self.prompt_images {
+                    return Err(DriverError::Unsupported {
+                        harness: self.harness,
+                        what: "images (the agent did not advertise promptCapabilities.image)",
+                    });
+                }
+                let bytes = self.prompt(&text, &attachments)?;
+                self.echo_prompt(if text.is_empty() { "[image]" } else { &text });
                 Ok(bytes)
             }
             Command::Interrupt => {
@@ -1212,7 +1236,7 @@ impl AcpDriver {
                 } else {
                     format!("/{name} {args}")
                 };
-                self.prompt_text(text)
+                self.prompt(&text, &[])
             }
             _ => Err(DriverError::InvalidOption(name.to_owned())),
         }

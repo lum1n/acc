@@ -177,11 +177,7 @@ fn handshake_opens_a_new_session() {
 #[test]
 fn a_full_turn_with_a_permission_prompt() {
     let mut d = ready_copilot();
-    let prompt = one(&d
-        .command(Command::Prompt {
-            text: "fix the build".into(),
-        })
-        .expect("prompt"));
+    let prompt = one(&d.command(Command::prompt("fix the build")).expect("prompt"));
     assert_eq!(prompt["method"], "session/prompt");
     assert_eq!(prompt["params"]["sessionId"], "s1");
     assert_eq!(
@@ -330,11 +326,7 @@ fn a_full_turn_with_a_permission_prompt() {
 fn prompts_are_echoed_once() {
     let mut d = ready_copilot();
     assert!(d.take_events().is_empty());
-    let prompt = one(&d
-        .command(Command::Prompt {
-            text: "fix the build".into(),
-        })
-        .expect("prompt"));
+    let prompt = one(&d.command(Command::prompt("fix the build")).expect("prompt"));
     assert_eq!(
         d.take_events(),
         [
@@ -503,8 +495,7 @@ fn a_late_client_takes_prompts_from_copilots_history() {
 
     // This client's own prompt is echoed and takes the next slot.
     feed(&mut d, &[result("desk-3", json!({ "stopReason": "end_turn" }))]);
-    d.command(Command::Prompt { text: "five".into() })
-        .expect("prompt");
+    d.command(Command::prompt("five")).expect("prompt");
     assert_eq!(prompts(&d.take_events()), [("prompt-1".into(), "five".into())]);
     d.on_history(&copilot_history(&["one", "two", "three", "four", "five", "six"]));
     let events = feed(
@@ -526,9 +517,7 @@ fn split_reads_give_the_same_events() {
         result("acc-1", json!({ "stopReason": "end_turn" })),
     ];
     let mut whole = ready_copilot();
-    whole
-        .command(Command::Prompt { text: "x".into() })
-        .expect("prompt");
+    whole.command(Command::prompt("x")).expect("prompt");
     let expected = feed(&mut whole, &msgs);
 
     let mut bytes = Vec::new();
@@ -538,7 +527,7 @@ fn split_reads_give_the_same_events() {
     }
     for size in [1, 2, 7, 64] {
         let mut d = ready_copilot();
-        d.command(Command::Prompt { text: "x".into() }).expect("prompt");
+        d.command(Command::prompt("x")).expect("prompt");
         let got: Vec<_> = bytes.chunks(size).flat_map(|c| d.on_output(c)).collect();
         assert_eq!(got, expected, "chunk size {size}");
     }
@@ -699,7 +688,7 @@ fn auth_required_blocks_until_authenticated() {
 #[test]
 fn interrupt_cancels_open_permission_requests() {
     let mut d = ready_copilot();
-    d.command(Command::Prompt { text: "go".into() }).expect("prompt");
+    d.command(Command::prompt("go")).expect("prompt");
     feed(
         &mut d,
         &[
@@ -928,9 +917,7 @@ fn attach_follows_another_clients_session() {
     );
     assert_eq!(events.last(), Some(&Event::TurnCompleted));
 
-    let p = one(&d
-        .command(Command::Prompt { text: "next".into() })
-        .expect("prompt"));
+    let p = one(&d.command(Command::prompt("next")).expect("prompt"));
     assert_eq!(p["id"], "phone-3f2a-0");
 }
 
@@ -1067,4 +1054,55 @@ fn opencode_lists_its_unadvertised_compact() {
         })
         .expect("compact"));
     assert_eq!(c["params"]["prompt"][0]["text"], "/compact keep notes");
+}
+
+#[test]
+fn images_need_the_agents_prompt_capability() {
+    let png = Attachment::from_bytes("image/png", b"PNG");
+    let with_image = || Command::Prompt {
+        text: String::new(),
+        attachments: vec![png.clone()],
+    };
+    // `ready_copilot` advertises no promptCapabilities.
+    let mut d = ready_copilot();
+    assert!(matches!(
+        d.command(with_image()),
+        Err(DriverError::Unsupported { .. })
+    ));
+
+    let mut d = driver(Harness::Copilot, Start::New);
+    let init = one(&d.handshake());
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(
+                json!({ "loadSession": true, "promptCapabilities": { "image": true, "audio": false } }),
+            ),
+        )],
+    );
+    let new = one(&d.poll_transmit());
+    feed(&mut d, &[result(new["id"].clone(), copilot_session("s1"))]);
+    d.take_events();
+    let prompt = one(&d.command(with_image()).expect("prompt"));
+    assert_eq!(
+        prompt["params"]["prompt"],
+        json!([{ "type": "image", "mimeType": "image/png", "data": "UE5H" }])
+    );
+    assert_eq!(
+        prompts(&d.take_events()),
+        [("prompt-1".to_owned(), "[image]".to_owned())]
+    );
+
+    let both = one(&d
+        .command(Command::Prompt {
+            text: "and this".into(),
+            attachments: vec![png.clone()],
+        })
+        .expect("prompt"));
+    assert_eq!(
+        both["params"]["prompt"][0],
+        json!({ "type": "text", "text": "and this" })
+    );
+    assert_eq!(both["params"]["prompt"][1]["type"], "image");
 }

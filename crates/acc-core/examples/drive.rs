@@ -102,7 +102,7 @@ fn main() {
                 println!("{}", serde_json::to_string(d.options()).unwrap());
                 continue;
             }
-            _ => Command::Prompt { text: line.clone() },
+            _ => Command::prompt(line.clone()),
         };
         match d.command(cmd) {
             Ok(bytes) => write(&stdin, &bytes),

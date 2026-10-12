@@ -153,12 +153,7 @@ fn recorded_turn_streams_user_item_and_retry_state() {
     );
 
     // A prompt during a running turn steers it.
-    let steer = sent(
-        &d.command(Command::Prompt {
-            text: "also this".into(),
-        })
-        .unwrap(),
-    );
+    let steer = sent(&d.command(Command::prompt("also this")).unwrap());
     assert_eq!(steer[0]["method"], "turn/steer");
     assert_eq!(
         steer[0]["params"]["expectedTurnId"],
@@ -198,7 +193,7 @@ fn prompt_sends_turn_start_with_pending_option_changes_once() {
         Err(DriverError::InvalidOption(":root".into()))
     );
 
-    let first = sent(&d.command(Command::Prompt { text: "go".into() }).unwrap());
+    let first = sent(&d.command(Command::prompt("go")).unwrap());
     let p = &first[0]["params"];
     assert_eq!(first[0]["method"], "turn/start");
     assert_eq!(p["threadId"], THREAD);
@@ -216,7 +211,7 @@ fn prompt_sends_turn_start_with_pending_option_changes_once() {
         &mut d,
         json!({"method": "turn/completed", "params": {"threadId": THREAD, "turn": {"id": "t1", "status": "completed"}}}),
     );
-    let second = sent(&d.command(Command::Prompt { text: "again".into() }).unwrap());
+    let second = sent(&d.command(Command::prompt("again")).unwrap());
     assert!(second[0]["params"].get("effort").is_none());
     assert_eq!(option(&d, OptionId::Mode).current.as_deref(), Some("plan"));
 }
@@ -557,10 +552,7 @@ fn resumed_history_is_replayed_as_items() {
 #[test]
 fn prompt_before_thread_is_not_started() {
     let mut d = CodexDriver::default();
-    assert_eq!(
-        d.command(Command::Prompt { text: "x".into() }),
-        Err(DriverError::NotStarted)
-    );
+    assert_eq!(d.command(Command::prompt("x")), Err(DriverError::NotStarted));
 }
 
 #[test]
@@ -722,4 +714,51 @@ fn status_panel_shows_account_and_options() {
     assert_eq!(rows[0].value.as_deref(), Some("ChatGPT (v@example.com)"));
     assert_eq!(rows[1].value.as_deref(), Some("pro"));
     assert!(rows.iter().any(|r| r.label == "Model"));
+}
+
+#[test]
+fn prompts_with_images_are_data_url_inputs() {
+    let mut d = started();
+    let png = Attachment::from_bytes("image/png", b"PNG");
+    let first = sent(
+        &d.command(Command::Prompt {
+            text: "what is this".into(),
+            attachments: vec![png.clone()],
+        })
+        .unwrap(),
+    );
+    assert_eq!(first[0]["method"], "turn/start");
+    assert_eq!(
+        first[0]["params"]["input"],
+        json!([
+            {"type": "text", "text": "what is this", "text_elements": []},
+            {"type": "image", "url": "data:image/png;base64,UE5H"},
+        ])
+    );
+    // Mid-turn the same input steers; an image-only prompt has no text item.
+    feed(
+        &mut d,
+        json!({"method": "turn/started", "params": {"threadId": THREAD, "turn": {"id": "t1"}}}),
+    );
+    let steer = sent(
+        &d.command(Command::Prompt {
+            text: String::new(),
+            attachments: vec![png],
+        })
+        .unwrap(),
+    );
+    assert_eq!(steer[0]["method"], "turn/steer");
+    assert_eq!(
+        steer[0]["params"]["input"],
+        json!([{"type": "image", "url": "data:image/png;base64,UE5H"}])
+    );
+    let events = feed(
+        &mut d,
+        json!({"method": "item/started", "params": {"threadId": THREAD, "turnId": "t1",
+        "item": {"type": "userMessage", "id": "u9", "content": [{"type": "image", "url": "data:image/png;base64,UE5H"}]}}}),
+    );
+    assert!(events.contains(&Event::ItemDelta {
+        id: "u9".into(),
+        text: "[image]".into()
+    }));
 }

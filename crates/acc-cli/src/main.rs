@@ -21,7 +21,8 @@ usage:
                                         they run in), one JSON object per line
   acc acp <harness> <cwd> [--resume ID] [--model M] [--program PATH]
                                         drive an ACP harness (cursor, copilot, opencode);
-                                        stdin lines are JSON commands or prompt text
+                                        stdin lines are JSON commands (prompts may carry
+                                        image attachments) or prompt text
   acc osc7501                           read terminal bytes on stdin, print OSC 7501 messages as JSON
   acc script launch <harness> <id> <cwd> [resume-id]
   acc script attach <id> [offset]

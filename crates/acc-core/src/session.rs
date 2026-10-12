@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::acp::{AcpConfig, AcpDriver, Start, launch_spec as acp_launch};
 use crate::claude::{ClaudeConfig, ClaudeDriver};
 use crate::codex::{CodexConfig, CodexDriver};
-use crate::command::{Apply, Command, CommandEntry, OptionDef, OptionId};
+use crate::command::{Apply, Attachment, Command, CommandEntry, OptionDef, OptionId};
 use crate::detached::{SessionDir, Status, parse_status};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
@@ -58,6 +58,9 @@ pub struct LaunchRequest {
     pub title: Option<String>,
     /// First prompt, sent as soon as the harness can take it.
     pub prompt: Option<String>,
+    /// Images sent with the first prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     /// The session this one continues (fork) or replaces (restart).
     pub parent: Option<String>,
     /// Set when the new session replaces `parent`, which should be stopped.
@@ -180,7 +183,7 @@ pub struct Session {
     permissions: Vec<Permission>,
     transmit: Vec<u8>,
     /// First prompt, held until the harness has a session to take it.
-    pending_prompt: Option<String>,
+    pending_prompt: Option<Command>,
     spec_dirty: bool,
     exited: bool,
 }
@@ -285,7 +288,11 @@ impl Session {
         }
         let exec = Exec::new(dir.launch_script_with_spec(&spec.launch, &spec.cwd, Some(&spec.to_json())));
         let mut transmit = driver.handshake();
-        let mut pending_prompt = req.prompt.filter(|p| !p.trim().is_empty());
+        let has_text = req.prompt.as_deref().is_some_and(|p| !p.trim().is_empty());
+        let mut pending_prompt = (has_text || !req.attachments.is_empty()).then(|| Command::Prompt {
+            text: req.prompt.unwrap_or_default(),
+            attachments: req.attachments,
+        });
         if harness == Harness::Pi
             && let Some(model) = &spec.model
         {
@@ -295,9 +302,9 @@ impl Session {
             })?);
         }
         if prompt_before_session(harness)
-            && let Some(text) = pending_prompt.take()
+            && let Some(prompt) = pending_prompt.take()
         {
-            transmit.extend(driver.command(Command::Prompt { text })?);
+            transmit.extend(driver.command(prompt)?);
         }
         let session = Self {
             dir,
@@ -506,6 +513,7 @@ impl Session {
             fork,
             title: self.spec.title.clone(),
             prompt: None,
+            attachments: Vec::new(),
             parent: Some(self.spec.id.clone()),
             replaces_parent: !fork,
             origin: self.spec.origin.clone(),
@@ -634,8 +642,8 @@ impl Session {
                     if model.is_some() && self.spec.model.is_none() {
                         self.spec.model.clone_from(model);
                     }
-                    if !replay && let Some(text) = self.pending_prompt.take() {
-                        match self.driver.command(Command::Prompt { text }) {
+                    if !replay && let Some(prompt) = self.pending_prompt.take() {
+                        match self.driver.command(prompt) {
                             Ok(bytes) => self.transmit.extend(bytes),
                             Err(e) => out.push(Update {
                                 event: Event::Notice {
@@ -837,6 +845,26 @@ mod tests {
         s.feed(CODEX_HANDSHAKE.as_bytes(), 1);
         let t = String::from_utf8(s.take_transmit()).unwrap();
         assert!(t.contains("turn/start") && t.contains("\"go\""));
+    }
+
+    #[test]
+    fn launch_sends_images_with_or_without_text() {
+        let png = Attachment::from_bytes("image/png", b"PNG");
+        let mut r = req(Harness::Claude);
+        r.attachments = vec![png.clone()];
+        let (mut s, _) = Session::launch(r, "c2", "ph", 5).unwrap();
+        let t = String::from_utf8(s.take_transmit()).unwrap();
+        assert!(t.contains("\"type\":\"image\"") && t.contains("UE5H"));
+
+        // Codex holds the whole prompt, images included, until it has a thread.
+        let mut r = req(Harness::Codex);
+        r.prompt = Some("go".into());
+        r.attachments = vec![png];
+        let (mut s, _) = Session::launch(r, "x2", "t", 0).unwrap();
+        assert!(!String::from_utf8(s.take_transmit()).unwrap().contains("image"));
+        s.feed(CODEX_HANDSHAKE.as_bytes(), 1);
+        let t = String::from_utf8(s.take_transmit()).unwrap();
+        assert!(t.contains("turn/start") && t.contains("data:image/png;base64,UE5H"));
     }
 
     #[test]

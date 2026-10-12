@@ -36,8 +36,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::{Value, json};
 
 use crate::command::{
-    Apply, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
-    offer_option, split_verb,
+    Apply, Attachment, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
+    offer_option, split_verb, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
 use crate::event::{
@@ -84,6 +84,9 @@ const PANELS: [(&str, &str, &str); 5] = [
 /// so ACC runs it itself: `set_permission_mode` into plan mode, the
 /// description as the first prompt, and `get_plan` to show the plan.
 const PLAN_DESCRIPTION: &str = "Enable plan mode or view the current session plan";
+
+/// Shown for a user message that is only images.
+const IMAGE_PLACEHOLDER: &str = "[image]";
 
 /// Launch-time settings. Everything else changes at runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -220,9 +223,29 @@ impl ClaudeDriver {
     }
 
     fn user_text(text: &str) -> Vec<u8> {
+        Self::user_content(Value::String(text.to_owned()))
+    }
+
+    /// A user message with images: Anthropic content blocks. The API refuses
+    /// an empty text block, so an image-only prompt carries none.
+    fn user_blocks(text: &str, attachments: &[Attachment]) -> Vec<u8> {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+        for a in attachments {
+            content.push(json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": a.media_type, "data": a.data},
+            }));
+        }
+        Self::user_content(Value::Array(content))
+    }
+
+    fn user_content(content: Value) -> Vec<u8> {
         wire::line(&json!({
             "type": "user",
-            "message": {"role": "user", "content": text},
+            "message": {"role": "user", "content": content},
             "parent_tool_use_id": null,
             "session_id": "",
         }))
@@ -570,6 +593,7 @@ impl ClaudeDriver {
         let content = v.pointer("/message/content").cloned().unwrap_or(Value::Null);
         if let Some(blocks) = content.as_array() {
             let mut text = String::new();
+            let mut images = 0;
             for block in blocks {
                 match str_at(block, "type") {
                     Some("tool_result") => {
@@ -588,11 +612,14 @@ impl ClaudeDriver {
                         }
                     }
                     Some("text") => text.push_str(str_at(block, "text").unwrap_or_default()),
+                    Some("image") => images += 1,
                     _ => {}
                 }
             }
             if !text.is_empty() {
                 self.user_message(v, &text, out);
+            } else if images > 0 {
+                self.user_message(v, IMAGE_PLACEHOLDER, out);
             }
         } else if let Some(text) = content.as_str() {
             if let Some(output) = local_command_output(text) {
@@ -1328,7 +1355,14 @@ impl Driver for ClaudeDriver {
             what,
         };
         Ok(match cmd {
-            Command::Prompt { text } => Self::user_text(&text),
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                if attachments.is_empty() {
+                    Self::user_text(&text)
+                } else {
+                    Self::user_blocks(&text, &attachments)
+                }
+            }
             Command::Interrupt => self.control(json!({"subtype": "interrupt"}), Pending::Other),
             Command::Compact { hint } => Self::user_text(&slash("compact", hint.as_deref().unwrap_or(""))),
             Command::New => Self::user_text("/clear"),

@@ -23,6 +23,10 @@ pub enum DriverError {
     InvalidOption(String),
     #[error("this command needs {0}")]
     MissingArgument(&'static str),
+    /// An image too large, not an image, or not decodable; see
+    /// [`crate::command::validate_attachments`].
+    #[error("attachment rejected: {0}")]
+    AttachmentRejected(String),
 }
 
 /// Translates between one harness protocol and ACC's model.

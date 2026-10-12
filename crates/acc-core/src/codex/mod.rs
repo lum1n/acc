@@ -35,8 +35,8 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::command::{
-    Apply, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, offer_option,
-    split_verb,
+    Apply, Attachment, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
+    offer_option, split_verb, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
 use crate::event::{
@@ -1169,7 +1169,15 @@ impl Driver for CodexDriver {
             what,
         };
         match cmd {
-            Command::Prompt { text } => self.turn(vec![text_input(&text)]),
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                let mut input = Vec::new();
+                if !text.is_empty() || attachments.is_empty() {
+                    input.push(text_input(&text));
+                }
+                input.extend(attachments.iter().map(image_input));
+                self.turn(input)
+            }
             Command::Interrupt => match (self.thread_id.clone(), self.turn_id.clone()) {
                 (Some(thread), Some(turn)) => Ok(self.request(
                     "turn/interrupt",
@@ -1307,6 +1315,13 @@ fn text_input(text: &str) -> Value {
     json!({"type": "text", "text": text, "text_elements": []})
 }
 
+/// An image input item as 0.128 takes it: a data URL. (Upstream `main`
+/// renames `url` to `image_url`; `localImage` with a host path is the other
+/// option, but ACC's images live on the client.)
+fn image_input(a: &Attachment) -> Value {
+    json!({"type": "image", "url": a.data_url()})
+}
+
 fn list<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
     v.get(key).and_then(Value::as_array).into_iter().flatten()
 }
@@ -1361,7 +1376,12 @@ fn initial_text(item: &Value) -> Option<String> {
     match str_at(item, "type")? {
         "userMessage" => {
             let text: Vec<&str> = list(item, "content").filter_map(|c| str_at(c, "text")).collect();
-            (!text.is_empty()).then(|| text.join("\n"))
+            if text.is_empty() {
+                let images =
+                    list(item, "content").any(|c| matches!(str_at(c, "type"), Some("image" | "localImage")));
+                return images.then(|| "[image]".to_owned());
+            }
+            Some(text.join("\n"))
         }
         "commandExecution" => owned(item, "command").map(|c| format!("$ {c}\n")),
         _ => None,

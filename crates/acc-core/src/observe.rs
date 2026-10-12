@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn pane_commands_are_tmux_keystrokes() {
         let o = Observed::new(agent(0));
-        let execs = o.pane_command(&Command::Prompt { text: "go on".into() }).unwrap();
+        let execs = o.pane_command(&Command::prompt("go on")).unwrap();
         assert!(execs[0].script.contains("send-keys") && execs[0].script.contains("'go on'"));
         assert!(
             o.pane_command(&Command::AnswerPermission {

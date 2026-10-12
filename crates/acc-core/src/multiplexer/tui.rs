@@ -42,7 +42,9 @@ pub fn inputs(harness: Harness, cmd: &Command) -> Result<Vec<Input>, DriverError
         }
     };
     match (harness, cmd) {
-        (_, Command::Prompt { text }) => Ok(submit(text)),
+        (_, Command::Prompt { text, attachments }) if attachments.is_empty() => Ok(submit(text)),
+        // Images only travel over the headless protocols.
+        (h, Command::Prompt { .. }) => Err(unsupported(h, "images from a pane")),
         (_, Command::Invoke { name, args }) => slash(with_arg(name.trim_start_matches('/'), args)),
         (Harness::Pi | Harness::Claude | Harness::Codex, Command::Interrupt) => {
             Ok(vec![Input::Keys(vec![Key::Escape])])
@@ -177,12 +179,21 @@ mod tests {
     #[test]
     fn prompts_type_or_paste() {
         assert_eq!(
-            inputs(Harness::Cursor, &Command::Prompt { text: "hi".into() }).unwrap(),
+            inputs(Harness::Cursor, &Command::prompt("hi")).unwrap(),
             [Input::Text("hi".into()), Input::Keys(vec![Key::Enter])]
         );
         assert!(matches!(
-            inputs(Harness::Pi, &Command::Prompt { text: "a\nb".into() }).unwrap()[0],
+            inputs(Harness::Pi, &Command::prompt("a\nb")).unwrap()[0],
             Input::Paste(_)
+        ));
+        // A pane takes keystrokes, never an image.
+        let with_image = Command::Prompt {
+            text: "look".into(),
+            attachments: vec![crate::command::Attachment::from_bytes("image/png", b"PNG")],
+        };
+        assert!(matches!(
+            inputs(Harness::Pi, &with_image),
+            Err(DriverError::Unsupported { .. })
         ));
     }
 

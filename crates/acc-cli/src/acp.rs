@@ -1,6 +1,7 @@
 //! `acc acp`: drives an ACP harness as a local child process. Events go to
-//! stdout as NDJSON; each stdin line is a JSON `Command`, or plain text sent
-//! as a prompt. For spikes on real hosts, e.g. `ssh host acc acp copilot ~/p`.
+//! stdout as NDJSON; each stdin line is a JSON `Command` (a `prompt` may carry
+//! base64 `attachments`), or plain text sent as a prompt. For spikes on real
+//! hosts, e.g. `ssh host acc acp copilot ~/p`.
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::process::{Command as Proc, ExitCode, Stdio};
@@ -101,9 +102,7 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
                 if line.is_empty() {
                     continue;
                 }
-                let cmd = serde_json::from_str::<Command>(line).unwrap_or_else(|_| Command::Prompt {
-                    text: line.to_owned(),
-                });
+                let cmd = serde_json::from_str::<Command>(line).unwrap_or_else(|_| Command::prompt(line));
                 match driver.command(cmd) {
                     Ok(bytes) => write(&bytes).map_err(|e| e.to_string())?,
                     Err(e) => eprintln!("acc: {e}"),

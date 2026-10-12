@@ -5,7 +5,8 @@
 //! every shape.
 
 use acc_core::command::{
-    Apply, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec as CmdExec, OptionDef, OptionId,
+    Apply, Attachment, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec as CmdExec,
+    OptionDef, OptionId,
 };
 use acc_core::detached::{FeedEntry, FeedPath, Listing, Status};
 use acc_core::event::{
@@ -669,11 +670,37 @@ impl From<&CommandEntry> for AccCommandEntry {
     }
 }
 
+/// An image sent with a prompt: raw bytes and their type (`image/png`,
+/// `image/jpeg`, `image/gif`, `image/webp`). At most 5 MiB each and 10 MiB per
+/// prompt, else `AccError::AttachmentRejected`; resize larger photos first.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccAttachment {
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+impl From<AccAttachment> for Attachment {
+    fn from(a: AccAttachment) -> Self {
+        Attachment::from_bytes(a.media_type, &a.data)
+    }
+}
+
+impl From<Attachment> for AccAttachment {
+    fn from(a: Attachment) -> Self {
+        Self {
+            data: a.bytes(),
+            media_type: a.media_type,
+        }
+    }
+}
+
 /// Commands ACC offers on every harness.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum AccCommand {
     Prompt {
         text: String,
+        /// Images sent with the text (see [`AccAttachment`]).
+        attachments: Vec<AccAttachment>,
     },
     Interrupt,
     Compact {
@@ -707,7 +734,10 @@ pub enum AccCommand {
 impl From<AccCommand> for Command {
     fn from(c: AccCommand) -> Self {
         match c {
-            AccCommand::Prompt { text } => Command::Prompt { text },
+            AccCommand::Prompt { text, attachments } => Command::Prompt {
+                text,
+                attachments: attachments.into_iter().map(Into::into).collect(),
+            },
             AccCommand::Interrupt => Command::Interrupt,
             AccCommand::Compact { hint } => Command::Compact { hint },
             AccCommand::New => Command::New,
@@ -825,6 +855,9 @@ pub struct AccLaunchRequest {
     pub fork: bool,
     pub title: Option<String>,
     pub prompt: Option<String>,
+    /// Images sent with `prompt`.
+    #[uniffi(default = [])]
+    pub attachments: Vec<AccAttachment>,
     pub parent: Option<String>,
     pub replaces_parent: bool,
     pub origin: AccOrigin,
@@ -844,6 +877,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             fork: r.fork,
             title: r.title,
             prompt: r.prompt,
+            attachments: r.attachments.into_iter().map(Into::into).collect(),
             parent: r.parent,
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),
@@ -863,6 +897,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             fork: r.fork,
             title: r.title,
             prompt: r.prompt,
+            attachments: r.attachments.into_iter().map(Into::into).collect(),
             parent: r.parent,
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),

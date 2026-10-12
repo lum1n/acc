@@ -45,6 +45,16 @@ every protocol is tested by replaying recorded sessions.
 Drivers pin the harness versions they support and fall back to ACP or observe-only for unknown
 versions. Unknown events are kept as `Event::Unrecognized`, never fatal.
 
+**Images.** `Command::Prompt` and `LaunchRequest` carry `Attachment`s: images inline as base64, so
+nothing is copied to the host first and the bytes ride the same stdin path as text. Every
+harness takes them in its prompt: Claude as Anthropic `image` content blocks, Codex as
+`{"type":"image","url":"data:..."}` input items (0.128; upstream renames `url` to `image_url`),
+ACP as `image` blocks when the agent advertised `promptCapabilities.image` (Cursor, Copilot and
+opencode do; otherwise `DriverError::Unsupported`), pi as the prompt's `images`. Harnesses echo
+the prompt into the session log, where a line over 16 MiB is dropped, so `validate_attachments`
+rejects an image over 5 MiB or a prompt over 10 MiB (`DriverError::AttachmentRejected`); clients
+resize first. Transcripts show a prompt's text, or `[image]` when it had none.
+
 ### ACP driver (Cursor, Copilot, opencode)
 
 `acc_core::acp::AcpDriver` speaks ACP protocol version 1 (`@agentclientprotocol/sdk` 1.8.0). It
@@ -144,8 +154,8 @@ capture, send text/paste/keys, spawn, kill, watch) and parses their output; noth
 | Rex | `rex events --json`, native program-status records | yes, for every harness that emits it |
 
 `multiplexer::tui` turns ACC commands into keystrokes for co-driving a harness TUI in its pane (pi
-fully; prompts, interrupt and common slash commands for Claude and Codex). Approval dialogs in a
-pane still need per-harness screen matching. The Rex backend follows Rex's docs and is unverified
+fully; prompts, interrupt and common slash commands for Claude and Codex; never images, which only
+the headless protocols carry). Approval dialogs in a pane still need per-harness screen matching. The Rex backend follows Rex's docs and is unverified
 until Rex ships a server outside the macOS app. Tests drive real tmux, zellij and screen in CI.
 
 

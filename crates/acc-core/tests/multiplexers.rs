@@ -417,14 +417,7 @@ fn pi_tui_in_tmux() {
         drain(&mut states);
         states.contains(&RunState::Idle)
     });
-    for input in tui::inputs(
-        Harness::Pi,
-        &AccCommand::Prompt {
-            text: "list files".into(),
-        },
-    )
-    .unwrap()
-    {
+    for input in tui::inputs(Harness::Pi, &AccCommand::prompt("list files")).unwrap() {
         env.run(&b.send(&pane, &input));
     }
     eventually("pi to report working then done", || {

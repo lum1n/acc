@@ -168,6 +168,7 @@ impl Takeover {
                 fork: false,
                 title: None,
                 prompt: None,
+                attachments: Vec::new(),
                 parent: None,
                 replaces_parent: false,
                 origin: Origin::TakenOver {

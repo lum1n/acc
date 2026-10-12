@@ -6,7 +6,7 @@
 
 use acc_core::Harness;
 use acc_core::acp::{AcpConfig, AcpDriver, Start};
-use acc_core::command::{Command, OptionId};
+use acc_core::command::{Attachment, Command, OptionId};
 use acc_core::driver::Driver;
 use acc_core::event::{Event, ItemKind};
 use acc_core::state::{BlockKind, RunState};
@@ -55,7 +55,7 @@ fn replay_as_launcher(harness: Harness, out_log: &str) -> (Vec<Event>, Vec<u8>) 
                 match &ev {
                     Event::SessionStarted { .. } => {
                         written.extend(d.poll_transmit());
-                        written.extend(d.command(Command::Prompt { text: PROMPT.into() }).unwrap());
+                        written.extend(d.command(Command::prompt(PROMPT)).unwrap());
                     }
                     Event::PermissionRequested {
                         request_id, options, ..
@@ -187,8 +187,18 @@ fn attach_replays_another_clients_log() {
             })
             .is_err()
         );
-        let next: Value =
-            serde_json::from_slice(&d.command(Command::Prompt { text: "next".into() }).unwrap()).unwrap();
+        let next: Value = serde_json::from_slice(&d.command(Command::prompt("next")).unwrap()).unwrap();
         assert_eq!(next["id"], "phone-1-0");
+        // Both recorded agents advertise `promptCapabilities.image`, which the
+        // attaching client learned from the replayed `initialize` reply.
+        let with_image = d
+            .command(Command::Prompt {
+                text: "and this?".into(),
+                attachments: vec![Attachment::from_bytes("image/png", b"PNG")],
+            })
+            .unwrap();
+        let with_image: Value = serde_json::from_slice(&with_image).unwrap();
+        assert_eq!(with_image["params"]["prompt"][1]["type"], "image");
+        assert_eq!(with_image["params"]["prompt"][1]["mimeType"], "image/png");
     }
 }

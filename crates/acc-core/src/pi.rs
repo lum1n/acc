@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::command::{
-    Apply, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, split_verb,
+    Apply, Attachment, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
+    split_verb, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Usage};
@@ -500,7 +501,7 @@ impl PiDriver {
                     kind: ItemKind::UserMessage,
                     extensions: Value::Null,
                 });
-                let text = content_text(msg.get("content"));
+                let text = user_text(msg.get("content"));
                 if !text.is_empty() {
                     out.push(Event::ItemDelta { id, text });
                 }
@@ -684,11 +685,21 @@ impl PiDriver {
         Ok(line)
     }
 
-    fn prompt(&mut self, text: String) -> Vec<u8> {
-        if let Some(bytes) = self.builtin(&text) {
+    fn prompt(&mut self, text: String, attachments: &[Attachment]) -> Vec<u8> {
+        // A slash command with an image attached is a prompt for the model.
+        if attachments.is_empty()
+            && let Some(bytes) = self.builtin(&text)
+        {
             return bytes;
         }
         let mut body = obj(json!({ "type": "prompt", "message": text }));
+        if !attachments.is_empty() {
+            let images: Vec<Value> = attachments
+                .iter()
+                .map(|a| json!({ "type": "image", "data": a.data, "mimeType": a.media_type }))
+                .collect();
+            body.insert("images".into(), Value::Array(images));
+        }
         if self.streaming {
             // Like pressing Enter in pi's TUI while it works.
             body.insert("streamingBehavior".into(), Value::String("steer".into()));
@@ -753,8 +764,8 @@ impl PiDriver {
                 }
                 self.request(body, Pending::Plain)
             }
-            (name, "") => self.prompt(format!("/{name}")),
-            (name, args) => self.prompt(format!("/{name} {args}")),
+            (name, "") => self.prompt(format!("/{name}"), &[]),
+            (name, args) => self.prompt(format!("/{name} {args}"), &[]),
         })
     }
 
@@ -845,7 +856,10 @@ impl Driver for PiDriver {
 
     fn command(&mut self, cmd: Command) -> Result<Vec<u8>, DriverError> {
         Ok(match cmd {
-            Command::Prompt { text } => self.prompt(text),
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                self.prompt(text, &attachments)
+            }
             Command::Interrupt => self.simple("abort"),
             Command::Compact { hint } => self.compact(hint.as_deref()),
             Command::New => self.simple("new_session"),
@@ -1104,6 +1118,21 @@ fn content_text(content: Option<&Value>) -> String {
     }
 }
 
+/// What to show for a user message: its text, or `[image]` when it is only images.
+fn user_text(content: Option<&Value>) -> String {
+    let text = content_text(content);
+    let images = content.and_then(Value::as_array).is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+    });
+    if text.is_empty() && images {
+        "[image]".to_owned()
+    } else {
+        text
+    }
+}
+
 /// Adds one assistant message's usage to the running totals. pi's context
 /// fill is the last response's total tokens.
 fn add_usage(total: &mut Usage, u: &Value) {
@@ -1211,7 +1240,7 @@ impl Transcript {
                         });
                         out.push(Event::ItemDelta {
                             id: id.clone(),
-                            text: content_text(msg.get("content")),
+                            text: user_text(msg.get("content")),
                         });
                         out.push(Event::ItemCompleted {
                             id,
@@ -1472,9 +1501,7 @@ mod tests {
     #[test]
     fn builtins_map_to_rpc_and_others_are_prompts() {
         let mut d = PiDriver::new();
-        let one = |d: &mut PiDriver, text: &str| {
-            sent(&d.command(Command::Prompt { text: text.into() }).unwrap()).remove(0)
-        };
+        let one = |d: &mut PiDriver, text: &str| sent(&d.command(Command::prompt(text)).unwrap()).remove(0);
         assert_eq!(
             one(&mut d, "/compact keep the API notes")["customInstructions"],
             "keep the API notes"
@@ -1497,6 +1524,47 @@ mod tests {
 
         d.on_output(b"{\"type\":\"agent_start\"}\n");
         assert_eq!(one(&mut d, "also check tests")["streamingBehavior"], "steer");
+    }
+
+    #[test]
+    fn prompts_with_images_carry_them_and_skip_builtins() {
+        let mut d = PiDriver::new();
+        let png = Attachment::from_bytes("image/png", b"PNG");
+        let p = sent(
+            &d.command(Command::Prompt {
+                text: "what is this".into(),
+                attachments: vec![png.clone()],
+            })
+            .unwrap(),
+        )
+        .remove(0);
+        assert_eq!(p["type"], "prompt");
+        assert_eq!(p["message"], "what is this");
+        assert_eq!(
+            p["images"],
+            json!([{ "type": "image", "data": "UE5H", "mimeType": "image/png" }])
+        );
+        // A slash command with an image is for the model, not an RPC.
+        let c = sent(
+            &d.command(Command::Prompt {
+                text: "/compact".into(),
+                attachments: vec![png],
+            })
+            .unwrap(),
+        )
+        .remove(0);
+        assert_eq!(c["type"], "prompt");
+        assert_eq!(c["images"].as_array().unwrap().len(), 1);
+
+        // pi echoes the user message; image-only shows as `[image]`.
+        let events = d.on_output(
+            br#"{"type":"message_start","message":{"role":"user","content":[{"type":"image","data":"UE5H","mimeType":"image/png"}]}}
+"#,
+        );
+        assert!(events.contains(&Event::ItemDelta {
+            id: "u1".into(),
+            text: "[image]".into()
+        }));
     }
 
     #[test]

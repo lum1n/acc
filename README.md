@@ -62,7 +62,7 @@ ssh.stream(feed.exec()) { bytes in                        // one channel follows
     if !out.isEmpty { ssh.run(session.inputExec(bytes: out)) }
   }
 }
-switch try session.command(command: .prompt(text: "fix the tests")) {
+switch try session.command(command: .prompt(text: "fix the tests", attachments: [])) {
 case .send(let bytes): ssh.run(session.inputExec(bytes: bytes))
 case .relaunch(let request): /* e.g. Claude fork: start `request` as a new session */
 }

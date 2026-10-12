@@ -317,7 +317,7 @@ fn commands_map_to_text_or_control_requests() {
     let mut d = ClaudeDriver::default();
     replay(&mut d, HI);
 
-    let prompt = sent(&d.command(Command::Prompt { text: "hello".into() }).unwrap());
+    let prompt = sent(&d.command(Command::prompt("hello")).unwrap());
     assert_eq!(prompt[0]["type"], "user");
     assert_eq!(prompt[0]["message"]["content"], "hello");
 
@@ -781,4 +781,53 @@ fn plan_open_outside_plan_mode_enters_it_then_shows_the_plan() {
     let next = sent(&d.poll_transmit());
     assert_eq!(next.len(), 1);
     assert_eq!(next[0]["request"]["subtype"], "get_plan");
+}
+
+#[test]
+fn prompts_with_images_are_content_blocks() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let png = Attachment::from_bytes("image/png", b"PNG");
+    let prompt = sent(
+        &d.command(Command::Prompt {
+            text: "what is this".into(),
+            attachments: vec![png.clone()],
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        prompt[0]["message"]["content"],
+        json!([
+            {"type": "text", "text": "what is this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "UE5H"}},
+        ])
+    );
+    // The API refuses an empty text block, so an image-only prompt has none.
+    let only = sent(
+        &d.command(Command::Prompt {
+            text: String::new(),
+            attachments: vec![png],
+        })
+        .unwrap(),
+    );
+    assert_eq!(only[0]["message"]["content"].as_array().unwrap().len(), 1);
+    assert!(matches!(
+        d.command(Command::Prompt {
+            text: String::new(),
+            attachments: vec![Attachment::from_bytes(
+                "image/png",
+                &vec![0; Attachment::MAX_BYTES + 1]
+            )],
+        }),
+        Err(DriverError::AttachmentRejected(_))
+    ));
+
+    // Replayed from the log, an image-only prompt still shows as a user item.
+    let echoed = json!({"type": "user", "uuid": "img-1", "session_id": "s", "message": {"role": "user",
+        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "UE5H"}}]}});
+    let events = d.on_output(format!("{echoed}\n").as_bytes());
+    assert!(events.contains(&Event::ItemDelta {
+        id: "img-1".into(),
+        text: "[image]".into()
+    }));
 }

@@ -31,6 +31,10 @@ pub enum AccError {
     /// The palette entry needs input (see `AccCommandEntry::input`).
     #[error("{message}")]
     MissingArgument { message: String },
+    /// An image the harnesses or the session log can't carry (over 5 MiB,
+    /// over 10 MiB per prompt, or not an image). Resize and retry.
+    #[error("{message}")]
+    AttachmentRejected { message: String },
 }
 
 impl From<SessionError> for AccError {
@@ -46,6 +50,9 @@ impl From<SessionError> for AccError {
                 message: e.to_string(),
             },
             SessionError::Driver(e @ DriverError::Unsupported { .. }) => Self::Unsupported {
+                message: e.to_string(),
+            },
+            SessionError::Driver(e @ DriverError::AttachmentRejected(_)) => Self::AttachmentRejected {
                 message: e.to_string(),
             },
             e => Self::InvalidSession {
@@ -342,6 +349,7 @@ mod tests {
             fork: false,
             title: None,
             prompt: Some("hi".into()),
+            attachments: vec![],
             parent: None,
             replaces_parent: false,
             origin: AccOrigin::Started,
@@ -367,6 +375,55 @@ mod tests {
             AccOutbound::Relaunch { .. }
         ));
         assert!(b.options().iter().any(|o| o.id == AccOptionId::Model));
+    }
+
+    #[test]
+    fn images_cross_as_bytes_and_oversized_ones_are_rejected() {
+        let req = AccLaunchRequest {
+            harness: AccHarness::Claude,
+            cwd: "/w".into(),
+            model: None,
+            permission: None,
+            resume: None,
+            fork: false,
+            title: None,
+            prompt: None,
+            attachments: vec![],
+            parent: None,
+            replaces_parent: false,
+            origin: AccOrigin::Started,
+            launcher: None,
+        };
+        let id = new_session_id(AccHarness::Claude, vec![8; 15]);
+        let s = AccSession::launch(req, id, "ph".into(), 1).unwrap();
+        s.take_transmit();
+        let png = AccAttachment {
+            media_type: "image/png".into(),
+            data: b"PNG".to_vec(),
+        };
+        let AccOutbound::Send { bytes } = s
+            .command(AccCommand::Prompt {
+                text: "look".into(),
+                attachments: vec![png],
+            })
+            .unwrap()
+        else {
+            panic!("prompts are sent, not relaunched");
+        };
+        let line = String::from_utf8(bytes).unwrap();
+        assert!(line.contains("\"type\":\"image\"") && line.contains("\"data\":\"UE5H\""));
+
+        let huge = AccAttachment {
+            media_type: "image/png".into(),
+            data: vec![0; 5 * 1024 * 1024 + 1],
+        };
+        assert!(matches!(
+            s.command(AccCommand::Prompt {
+                text: String::new(),
+                attachments: vec![huge],
+            }),
+            Err(AccError::AttachmentRejected { .. })
+        ));
     }
 
     #[test]
