@@ -155,6 +155,16 @@ pub struct AcpDriver {
     /// The message or thought currently streaming in chunks.
     open_item: Option<(ItemId, ItemKind)>,
     open_tools: BTreeSet<String>,
+    /// Subagent tool calls that haven't been matched to a child session
+    /// yet, oldest first, with the child session they run in themselves
+    /// (`None` for the main conversation's).
+    unclaimed_subagents: Vec<(String, Option<String>)>,
+    /// Subagent tool calls whose kind has been reported.
+    subagent_tools: BTreeSet<String>,
+    /// Child session id → the subagent tool call it runs for.
+    child_sessions: BTreeMap<String, String>,
+    /// The message or thought streaming in each child session.
+    child_open: BTreeMap<String, (ItemId, ItemKind)>,
     item_seq: u64,
     /// Prompts this client sent, as items, until the session takes them:
     /// ACP agents only repeat a prompt when `session/load` replays history.
@@ -204,6 +214,10 @@ impl AcpDriver {
             early: Vec::new(),
             open_item: None,
             open_tools: BTreeSet::new(),
+            unclaimed_subagents: Vec::new(),
+            subagent_tools: BTreeSet::new(),
+            child_sessions: BTreeMap::new(),
+            child_open: BTreeMap::new(),
             item_seq: 0,
             echoes: Vec::new(),
             echo_seq: 0,
@@ -579,6 +593,10 @@ impl AcpDriver {
         self.permissions.clear();
         self.open_item = None;
         self.open_tools.clear();
+        self.unclaimed_subagents.clear();
+        self.subagent_tools.clear();
+        self.child_sessions.clear();
+        self.child_open.clear();
         self.harness_commands.clear();
         self.rebuild_commands();
         self.history.clear();
@@ -589,6 +607,12 @@ impl AcpDriver {
     /// leave tool calls without a final status.
     fn close_turn_items(&mut self, out: &mut Vec<Event>) {
         self.close_open_item(out);
+        for (_, (id, _)) in std::mem::take(&mut self.child_open) {
+            out.push(Event::ItemCompleted {
+                id,
+                extensions: Value::Null,
+            });
+        }
         for id in std::mem::take(&mut self.open_tools) {
             out.push(Event::ItemCompleted {
                 id,
@@ -667,7 +691,7 @@ impl AcpDriver {
         if let Some(tid) = &tool_call_id
             && !self.open_tools.contains(tid)
         {
-            self.start_tool(tid.clone(), tool, out);
+            self.start_tool(tid.clone(), tool, None, out);
         }
         let options: Vec<PermissionOption> = params
             .get("options")
@@ -752,6 +776,10 @@ impl AcpDriver {
             return;
         };
         let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+        if let Some(child) = update.pointer("/_meta/opencode~1child-session") {
+            self.on_child_update(kind, child, update, out);
+            return;
+        }
         match kind {
             "agent_message_chunk" => self.chunk(ItemKind::AgentMessage, update, out),
             "agent_thought_chunk" => self.chunk(ItemKind::Reasoning, update, out),
@@ -846,6 +874,7 @@ impl AcpDriver {
             out.push(Event::ItemStarted {
                 id: id.clone(),
                 kind,
+                parent: None,
                 extensions: Value::Null,
             });
             self.open_item = Some((id, kind));
@@ -875,19 +904,175 @@ impl AcpDriver {
         }
     }
 
-    fn start_tool(&mut self, id: String, update: &Value, out: &mut Vec<Event>) {
-        self.close_open_item(out);
-        let kind = match update.get("kind").and_then(Value::as_str) {
-            Some("execute") => ItemKind::CommandExecution,
-            Some("edit" | "delete" | "move") => ItemKind::FileChange,
-            _ => ItemKind::ToolCall,
+    fn start_tool(
+        &mut self,
+        id: String,
+        update: &Value,
+        parent: Option<(String, String)>,
+        out: &mut Vec<Event>,
+    ) {
+        match &parent {
+            Some((child, _)) => self.close_child_item(child, out),
+            None => self.close_open_item(out),
+        }
+        let kind = if crate::item::acp_is_subagent(update) {
+            self.note_subagent(&id, parent.as_ref().map(|(c, _)| c.clone()));
+            ItemKind::Subagent
+        } else {
+            match update.get("kind").and_then(Value::as_str) {
+                Some("execute") => ItemKind::CommandExecution,
+                Some("edit" | "delete" | "move") => ItemKind::FileChange,
+                _ => ItemKind::ToolCall,
+            }
         };
         self.open_tools.insert(id.clone());
         out.push(Event::ItemStarted {
             id,
             kind,
+            parent: parent.map(|(_, item)| item),
             extensions: strip_tag(update),
         });
+    }
+
+    /// Records a subagent tool call, so the child session that shows up
+    /// next under its session can be matched to it.
+    fn note_subagent(&mut self, id: &str, session: Option<String>) {
+        if self.subagent_tools.insert(id.to_owned()) {
+            self.unclaimed_subagents.push((id.to_owned(), session));
+        }
+    }
+
+    /// A tool call first reported without what identifies it as a subagent
+    /// (opencode sends the input in a later update): report its kind now.
+    fn upgrade_to_subagent(
+        &mut self,
+        id: &str,
+        update: &Value,
+        session: Option<String>,
+        out: &mut Vec<Event>,
+    ) {
+        if self.subagent_tools.contains(id) || !crate::item::acp_is_subagent(update) {
+            return;
+        }
+        self.note_subagent(id, session);
+        out.push(Event::ItemStarted {
+            id: id.to_owned(),
+            kind: ItemKind::Subagent,
+            parent: None,
+            extensions: strip_tag(update),
+        });
+    }
+
+    /// The subagent tool call a child session runs for. opencode streams a
+    /// child session's updates under the parent's session id, marked with
+    /// `_meta["opencode/child-session"] = {id, parentID, depth, title}`,
+    /// before the tool's result names the session: the first update claims
+    /// the oldest unmatched subagent call of its parent session.
+    fn subagent_for(&mut self, child: &str, parent_session: Option<&str>) -> Option<String> {
+        if let Some(item) = self.child_sessions.get(child) {
+            return Some(item.clone());
+        }
+        let ours = |s: &Option<String>| match (s, parent_session) {
+            (None, None) => true,
+            (None, Some(p)) => self.session_id.as_deref() == Some(p),
+            (Some(s), Some(p)) => s == p,
+            (Some(_), None) => false,
+        };
+        let i = self.unclaimed_subagents.iter().position(|(_, s)| ours(s))?;
+        let (item, _) = self.unclaimed_subagents.remove(i);
+        self.child_sessions.insert(child.to_owned(), item.clone());
+        Some(item)
+    }
+
+    fn on_child_update(&mut self, kind: &str, meta: &Value, update: &Value, out: &mut Vec<Event>) {
+        let Some(child) = meta.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            return;
+        };
+        let parent_session = meta.get("parentID").and_then(Value::as_str);
+        let Some(parent) = self.subagent_for(&child, parent_session) else {
+            // No subagent call to hang it on; keep it visible as native.
+            out.push(native(kind, update));
+            return;
+        };
+        if !self.replaying {
+            self.working(out);
+        }
+        match kind {
+            "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" => {
+                let item_kind = match kind {
+                    "agent_message_chunk" => ItemKind::AgentMessage,
+                    "agent_thought_chunk" => ItemKind::Reasoning,
+                    _ => ItemKind::UserMessage,
+                };
+                let message_id = update.get("messageId").and_then(Value::as_str);
+                let same = self
+                    .child_open
+                    .get(&child)
+                    .is_some_and(|(id, k)| *k == item_kind && message_id.is_none_or(|m| m == id));
+                if !same {
+                    self.close_child_item(&child, out);
+                    let id = message_id.map_or_else(
+                        || {
+                            self.item_seq += 1;
+                            format!("item-{}", self.item_seq)
+                        },
+                        str::to_owned,
+                    );
+                    out.push(Event::ItemStarted {
+                        id: id.clone(),
+                        kind: item_kind,
+                        parent: Some(parent.clone()),
+                        extensions: Value::Null,
+                    });
+                    self.child_open.insert(child.clone(), (id, item_kind));
+                }
+                let Some((id, _)) = self.child_open.get(&child) else {
+                    return;
+                };
+                let content = update.get("content").unwrap_or(&Value::Null);
+                match content.get("text").and_then(Value::as_str) {
+                    Some(text) if content.get("type").and_then(Value::as_str) == Some("text") => {
+                        out.push(Event::ItemDelta {
+                            id: id.clone(),
+                            text: text.to_owned(),
+                        });
+                    }
+                    _ => out.push(Event::ItemUpdated {
+                        id: id.clone(),
+                        extensions: content.clone(),
+                    }),
+                }
+            }
+            "tool_call" | "tool_call_update" => {
+                let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+                    out.push(native(kind, update));
+                    return;
+                };
+                if self.open_tools.contains(id) {
+                    self.upgrade_to_subagent(id, update, Some(child.clone()), out);
+                    if !is_final(update) {
+                        out.push(Event::ItemUpdated {
+                            id: id.to_owned(),
+                            extensions: strip_tag(update),
+                        });
+                    }
+                } else {
+                    self.start_tool(id.to_owned(), update, Some((child, parent)), out);
+                }
+                self.finish_tool_if_done(id, update, out);
+            }
+            // Usage, plans and the rest of a child session are its own.
+            _ => out.push(native(kind, update)),
+        }
+    }
+
+    fn close_child_item(&mut self, child: &str, out: &mut Vec<Event>) {
+        if let Some((id, _)) = self.child_open.remove(child) {
+            out.push(Event::ItemCompleted {
+                id,
+                extensions: Value::Null,
+            });
+        }
     }
 
     fn on_tool_call(&mut self, update: &Value, out: &mut Vec<Event>) {
@@ -897,12 +1082,13 @@ impl AcpDriver {
         };
         self.working(out);
         if self.open_tools.contains(id) {
+            self.upgrade_to_subagent(id, update, None, out);
             out.push(Event::ItemUpdated {
                 id: id.to_owned(),
                 extensions: strip_tag(update),
             });
         } else {
-            self.start_tool(id.to_owned(), update, out);
+            self.start_tool(id.to_owned(), update, None, out);
         }
         self.finish_tool_if_done(id, update, out);
     }
@@ -926,8 +1112,9 @@ impl AcpDriver {
         }
         self.working(out);
         if !self.open_tools.contains(id) {
-            self.start_tool(id.to_owned(), update, out);
+            self.start_tool(id.to_owned(), update, None, out);
         } else if !is_final(update) {
+            self.upgrade_to_subagent(id, update, None, out);
             out.push(Event::ItemUpdated {
                 id: id.to_owned(),
                 extensions: strip_tag(update),
@@ -938,6 +1125,17 @@ impl AcpDriver {
 
     fn finish_tool_if_done(&mut self, id: &str, update: &Value, out: &mut Vec<Event>) {
         if is_final(update) && self.open_tools.remove(id) {
+            // A finished subagent: its child session's last message is done.
+            let children: Vec<String> = self
+                .child_sessions
+                .iter()
+                .filter(|(_, item)| *item == id)
+                .map(|(c, _)| c.clone())
+                .collect();
+            for child in children {
+                self.close_child_item(&child, out);
+            }
+            self.unclaimed_subagents.retain(|(t, _)| t != id);
             out.push(Event::ItemCompleted {
                 id: id.to_owned(),
                 extensions: strip_tag(update),
@@ -1314,6 +1512,7 @@ fn push_prompt(id: ItemId, text: &str, out: &mut Vec<Event>) {
     out.push(Event::ItemStarted {
         id: id.clone(),
         kind: ItemKind::UserMessage,
+        parent: None,
         extensions: Value::Null,
     });
     out.push(Event::ItemDelta {

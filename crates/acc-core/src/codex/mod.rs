@@ -137,6 +137,10 @@ pub struct CodexDriver {
     profiles: Vec<String>,
     overrides: Overrides,
     skills: Vec<Skill>,
+    /// Subagent threads: child thread id → the collab item that spawned it.
+    child_threads: HashMap<String, String>,
+    /// `spawnAgent` items that haven't named their thread yet, oldest first.
+    unclaimed_spawns: Vec<String>,
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
     transmit: Vec<u8>,
@@ -168,6 +172,8 @@ impl CodexDriver {
             profiles: Vec::new(),
             overrides: Overrides::default(),
             skills: Vec::new(),
+            child_threads: HashMap::new(),
+            unclaimed_spawns: Vec::new(),
             commands: Vec::new(),
             options: Vec::new(),
             transmit: Vec::new(),
@@ -451,10 +457,13 @@ impl CodexDriver {
             "item/started" => {
                 if let Some(item) = p.get("item") {
                     let ext = self.item_ext(item, &p);
+                    self.adopt_children(item);
+                    let parent = self.parent_for(&p);
                     if let (Some(id), Some(kind)) = (owned(item, "id"), item_kind(item)) {
                         out.push(Event::ItemStarted {
                             id: id.clone(),
                             kind,
+                            parent,
                             extensions: ext,
                         });
                         // User messages and some others have no delta stream.
@@ -465,6 +474,9 @@ impl CodexDriver {
                 }
             }
             "item/completed" => {
+                if let Some(item) = p.get("item") {
+                    self.adopt_children(item);
+                }
                 if let Some(item) = p.get("item")
                     && let (Some(id), Some(_)) = (owned(item, "id"), item_kind(item))
                 {
@@ -520,6 +532,36 @@ impl CodexDriver {
                     && self.requests.remove(&id).is_some()
                 {
                     out.push(Event::PermissionResolved { request_id: id });
+                }
+            }
+            // A subagent's thread: its items carry its own thread id.
+            "thread/started"
+                if p.pointer("/thread/id").and_then(Value::as_str) != self.thread_id.as_deref() =>
+            {
+                let thread = p.get("thread").cloned().unwrap_or(Value::Null);
+                let spawn = thread
+                    .pointer("/source/subAgent/thread_spawn")
+                    .or_else(|| thread.pointer("/source/subagent/thread_spawn"));
+                if let (Some(child), Some(spawn)) = (owned(&thread, "id"), spawn)
+                    && str_at(spawn, "parent_thread_id").is_some_and(|t| {
+                        Some(t) == self.thread_id.as_deref() || self.child_threads.contains_key(t)
+                    })
+                {
+                    // The spawn item may not name its thread until it completes.
+                    if !self.child_threads.contains_key(&child) && !self.unclaimed_spawns.is_empty() {
+                        let item = self.unclaimed_spawns.remove(0);
+                        self.child_threads.insert(child.clone(), item);
+                    }
+                    out.push(Event::Native {
+                        kind: "subagent_thread".into(),
+                        payload: json!({
+                            "threadId": child,
+                            "parentThreadId": spawn.get("parent_thread_id"),
+                            "nickname": spawn.get("agent_nickname"),
+                            "role": spawn.get("agent_role"),
+                            "parentItemId": self.child_threads.get(&child),
+                        }),
+                    });
                 }
             }
             "model/rerouted" if ours => {
@@ -596,6 +638,37 @@ impl CodexDriver {
         }
     }
 
+    /// Remembers which collab item spawned which thread, so the child
+    /// thread's items can name it as their parent.
+    fn adopt_children(&mut self, item: &Value) {
+        if str_at(item, "type") != Some("collabAgentToolCall") || str_at(item, "tool") != Some("spawnAgent") {
+            return;
+        }
+        let Some(id) = owned(item, "id") else { return };
+        let mut named = false;
+        for child in list(item, "receiverThreadIds").filter_map(Value::as_str) {
+            named = true;
+            self.child_threads
+                .entry(child.to_owned())
+                .or_insert_with(|| id.clone());
+        }
+        let claimed = self.child_threads.values().any(|v| *v == id);
+        if named || claimed {
+            self.unclaimed_spawns.retain(|s| *s != id);
+        } else if !self.unclaimed_spawns.contains(&id) {
+            self.unclaimed_spawns.push(id);
+        }
+    }
+
+    /// The collab item whose thread an item belongs to, for subagent items.
+    fn parent_for(&self, params: &Value) -> Option<String> {
+        let thread = str_at(params, "threadId")?;
+        if Some(thread) == self.thread_id.as_deref() {
+            return None;
+        }
+        self.child_threads.get(thread).cloned()
+    }
+
     fn item_ext(&self, item: &Value, params: &Value) -> Value {
         let mut ext = item.clone();
         if let Some(thread) = str_at(params, "threadId")
@@ -615,6 +688,7 @@ impl CodexDriver {
         out.push(Event::ItemStarted {
             id: id.clone(),
             kind,
+            parent: None,
             extensions: Value::Null,
         });
         if let Some(text) = initial_text(item).or_else(|| final_text(item)) {
@@ -1363,6 +1437,7 @@ fn item_kind(item: &Value) -> Option<ItemKind> {
         "reasoning" => ItemKind::Reasoning,
         "commandExecution" => ItemKind::CommandExecution,
         "fileChange" => ItemKind::FileChange,
+        "collabAgentToolCall" => ItemKind::Subagent,
         "hookPrompt" | "functionCallOutput" => return None,
         _ => ItemKind::ToolCall,
     })

@@ -213,7 +213,7 @@ impl PiDriver {
                 out.push(Event::ItemStarted {
                     id,
                     kind: tool_kind(&tool),
-                    extensions: json!({ "tool": tool, "args": v.get("args").cloned().unwrap_or(Value::Null) }),
+                    parent: None, extensions: json!({ "tool": tool, "args": v.get("args").cloned().unwrap_or(Value::Null) }),
                 });
             }
             "tool_execution_update" => self.resume_working(out),
@@ -234,6 +234,7 @@ impl PiDriver {
                     out.push(Event::ItemStarted {
                         id: id.clone(),
                         kind: ItemKind::CommandExecution,
+                        parent: None,
                         extensions: Value::Null,
                     });
                 }
@@ -411,6 +412,7 @@ impl PiDriver {
                     out.push(Event::ItemStarted {
                         id: item.clone(),
                         kind: ItemKind::CommandExecution,
+                        parent: None,
                         extensions: Value::Null,
                     });
                 }
@@ -499,6 +501,7 @@ impl PiDriver {
                 out.push(Event::ItemStarted {
                     id: id.clone(),
                     kind: ItemKind::UserMessage,
+                    parent: None,
                     extensions: Value::Null,
                 });
                 let text = user_text(msg.get("content"));
@@ -516,6 +519,7 @@ impl PiDriver {
                 out.push(Event::ItemStarted {
                     id,
                     kind: ItemKind::AgentMessage,
+                    parent: None,
                     extensions: Value::Null,
                 });
             }
@@ -540,6 +544,7 @@ impl PiDriver {
             Some("thinking_start") => out.push(Event::ItemStarted {
                 id: reasoning,
                 kind: ItemKind::Reasoning,
+                parent: None,
                 extensions: Value::Null,
             }),
             Some("thinking_delta") => out.push(Event::ItemDelta {
@@ -1100,6 +1105,8 @@ fn tool_kind(tool: &str) -> ItemKind {
     match tool {
         "bash" | "powershell" => ItemKind::CommandExecution,
         "edit" | "write" => ItemKind::FileChange,
+        // The pi-subagents extension's tool.
+        "subagent" => ItemKind::Subagent,
         _ => ItemKind::ToolCall,
     }
 }
@@ -1236,6 +1243,7 @@ impl Transcript {
                         out.push(Event::ItemStarted {
                             id: id.clone(),
                             kind: ItemKind::UserMessage,
+                            parent: None,
                             extensions: Value::Null,
                         });
                         out.push(Event::ItemDelta {
@@ -1271,6 +1279,7 @@ impl Transcript {
         out.push(Event::ItemStarted {
             id: id.clone(),
             kind: ItemKind::AgentMessage,
+            parent: None,
             extensions: Value::Null,
         });
         let text = content_text(msg.get("content"));
@@ -1294,6 +1303,7 @@ impl Transcript {
                 out.push(Event::ItemStarted {
                     id: call,
                     kind: tool_kind(&tool),
+                    parent: None,
                     extensions: json!({ "tool": tool, "args": block.get("arguments") }),
                 });
             }

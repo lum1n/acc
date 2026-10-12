@@ -168,6 +168,9 @@ impl Harness {
                     "--replay-user-messages",
                     "--permission-prompt-tool",
                     "stdio",
+                    // Subagents' text and thinking too, not only their tool
+                    // calls, as frames with `parent_tool_use_id` (2.1.280+).
+                    "--forward-subagent-text",
                 ]);
                 if let Some(id) = resume {
                     a.extend(s(&["--resume", id]));

@@ -244,6 +244,7 @@ fn turn_lifecycle_and_sticky_done() {
     assert!(events.contains(&Event::ItemStarted {
         id: "a1".into(),
         kind: ItemKind::AgentMessage,
+        parent: None,
         extensions: json!({"type": "agentMessage", "id": "a1", "text": ""})
     }));
     assert!(events.contains(&Event::ItemDelta {
@@ -788,4 +789,100 @@ fn prompts_with_images_are_data_url_inputs() {
         id: "u9".into(),
         text: "[image]".into()
     }));
+}
+
+/// Frames shaped by the 0.128 app-server types (`collabAgentToolCall`,
+/// `SessionSource.subAgent.thread_spawn`); not recorded, as no account was
+/// logged in.
+#[test]
+fn collab_spawn_is_a_subagent_and_child_thread_items_belong_to_it() {
+    use crate::item::ItemDetail;
+    use crate::transcript::Transcript;
+    let mut d = started();
+    let child = "019a0000-0000-7000-8000-00000000c41d";
+    let mut t = Transcript::new();
+    let apply = |events: Vec<Event>, t: &mut Transcript| {
+        for e in &events {
+            t.apply(e);
+        }
+        events
+    };
+    let spawn = json!({"type": "collabAgentToolCall", "id": "call_spawn", "tool": "spawnAgent",
+        "status": "inProgress", "senderThreadId": THREAD, "receiverThreadIds": [],
+        "prompt": "Count the lines in README.txt", "model": "gpt-6.1-sol", "reasoningEffort": null,
+        "agentsStates": {}});
+    apply(
+        feed(
+            &mut d,
+            json!({"method": "item/started", "params": {"threadId": THREAD, "turnId": "t1", "item": spawn}}),
+        ),
+        &mut t,
+    );
+    // The child thread starts before the spawn item names it.
+    let ev = apply(
+        feed(
+            &mut d,
+            json!({"method": "thread/started", "params": {"thread": {"id": child,
+        "source": {"subAgent": {"thread_spawn": {"parent_thread_id": THREAD, "depth": 1,
+            "agent_path": null, "agent_nickname": "Lovelace", "agent_role": "explorer"}}}}}}),
+        ),
+        &mut t,
+    );
+    assert!(ev.iter().any(|e| matches!(e, Event::Native { kind, payload }
+        if kind == "subagent_thread" && payload["parentItemId"] == "call_spawn")));
+    let ev = apply(
+        feed(
+            &mut d,
+            json!({"method": "item/started", "params": {"threadId": child, "turnId": "c1",
+        "item": {"type": "commandExecution", "id": "child_cmd", "command": "wc -l README.txt", "cwd": "/w",
+            "status": "inProgress", "aggregatedOutput": null, "exitCode": null}}}),
+        ),
+        &mut t,
+    );
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::ItemStarted { id, parent: Some(p), .. }
+        if id == "child_cmd" && p == "call_spawn"))
+    );
+    // The child's turn doesn't move the parent's state.
+    let ev = feed(
+        &mut d,
+        json!({"method": "turn/completed", "params": {"threadId": child,
+        "turn": {"id": "c1", "items": [], "status": "completed"}}}),
+    );
+    assert!(
+        !ev.iter()
+            .any(|e| matches!(e, Event::TurnCompleted | Event::StateChanged(_)))
+    );
+    let mut done = spawn.clone();
+    done["status"] = json!("completed");
+    done["receiverThreadIds"] = json!([child]);
+    done["agentsStates"] = json!({child: {"status": "completed", "message": "3 lines"}});
+    apply(
+        feed(
+            &mut d,
+            json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": "t1", "item": done}}),
+        ),
+        &mut t,
+    );
+
+    let sub = t.get("call_spawn").unwrap();
+    assert_eq!(sub.kind, ItemKind::Subagent);
+    let ItemDetail::Subagent {
+        child: c,
+        status,
+        output,
+        prompt,
+        model,
+        ..
+    } = sub.detail(Harness::Codex)
+    else {
+        panic!()
+    };
+    assert_eq!(c.as_deref(), Some(child));
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert_eq!(output.as_deref(), Some("3 lines"));
+    assert_eq!(prompt.as_deref(), Some("Count the lines in README.txt"));
+    assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(t.children("call_spawn").count(), 1);
 }

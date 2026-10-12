@@ -333,6 +333,7 @@ fn prompts_are_echoed_once() {
             Event::ItemStarted {
                 id: "prompt-1".into(),
                 kind: ItemKind::UserMessage,
+                parent: None,
                 extensions: Value::Null,
             },
             Event::ItemDelta {

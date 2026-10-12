@@ -223,7 +223,7 @@ fn permission_round_trip_matches_recording() {
 
     // The Bash tool item opened with its input and closed by the denied result.
     assert!(events.iter().any(|e| matches!(e,
-        Event::ItemStarted { id, kind: ItemKind::CommandExecution, extensions }
+        Event::ItemStarted { id, kind: ItemKind::CommandExecution, parent: None, extensions }
             if id == "toolu_01ADx3kHAMjJRN8Qvy9H8avv" && extensions["input"]["command"] == "touch acc-probe.txt")));
     assert!(events.iter().any(|e| matches!(e,
         Event::ItemCompleted { id, extensions } if id == "toolu_01ADx3kHAMjJRN8Qvy9H8avv" && extensions["is_error"] == true)));
@@ -445,6 +445,7 @@ fn unstreamed_assistant_text_is_announced_whole() {
             Event::ItemStarted {
                 id: "m1:0".into(),
                 kind: ItemKind::AgentMessage,
+                parent: None,
                 extensions: Value::Null
             },
             Event::ItemDelta {
@@ -858,4 +859,83 @@ fn prompts_with_images_are_content_blocks() {
         id: "img-1".into(),
         text: "[image]".into()
     }));
+}
+
+/// Claude Code 2.1.280 with `--forward-subagent-text`: a foreground and a
+/// background `Agent` call to Explore, the background one finishing first.
+const SUBAGENTS: &str = include_str!("../../tests/fixtures/claude/subagents.ndjson");
+
+#[test]
+fn subagents_are_items_with_their_conversations() {
+    use crate::item::ItemDetail;
+    use crate::transcript::{ItemStatus, Transcript};
+    let mut d = ClaudeDriver::default();
+    let mut t = Transcript::new();
+    let mut background_running_after_launch = false;
+    for line in SUBAGENTS.split_inclusive('\n') {
+        for e in d.on_output(line.as_bytes()) {
+            t.settle(&e);
+            t.apply(&e);
+        }
+        if line.contains("Async agent launched") {
+            background_running_after_launch =
+                t.get("toolu_01EJj1wwkNi2uz6whj1RpML9").map(|i| i.status) == Some(ItemStatus::Running);
+        }
+    }
+    assert!(
+        background_running_after_launch,
+        "a background launch isn't the agent's result"
+    );
+    let subs: Vec<_> = t.subagents().collect();
+    assert_eq!(subs.len(), 2);
+    for sub in &subs {
+        assert_eq!(sub.status, ItemStatus::Completed);
+        let ItemDetail::Subagent {
+            agent,
+            child,
+            status,
+            output,
+            prompt,
+            ..
+        } = sub.detail(Harness::Claude)
+        else {
+            panic!("subagent detail")
+        };
+        assert_eq!(agent.as_deref(), Some("Explore"));
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert!(prompt.is_some());
+        assert!(child.is_some_and(|c| c.starts_with('a')));
+        let output = output.unwrap();
+        assert!(!output.contains("Subagent hand-back"), "{output}");
+        // Each subagent's own conversation: its tool call and its answer.
+        // (Claude forwards the prompt frame only for foreground agents; the
+        // detail carries it either way.)
+        let kinds: Vec<_> = t.children(&sub.id).map(|i| i.kind).collect();
+        assert!(kinds.contains(&ItemKind::CommandExecution), "{kinds:?}");
+        assert!(kinds.contains(&ItemKind::AgentMessage), "{kinds:?}");
+    }
+    let fg = t.get("toolu_01WqrBFboSUXpcf1Bb8qoLzE").unwrap();
+    let ItemDetail::Subagent { output, child, .. } = fg.detail(Harness::Claude) else {
+        panic!()
+    };
+    assert_eq!(child.as_deref(), Some("adc9fb778705a136d"));
+    assert!(output.unwrap().starts_with("Here are all the files"));
+    assert!(t.children(&fg.id).any(|i| i.kind == ItemKind::UserMessage));
+    let bg = t.get("toolu_01EJj1wwkNi2uz6whj1RpML9").unwrap();
+    let ItemDetail::Subagent { output, .. } = bg.detail(Harness::Claude) else {
+        panic!()
+    };
+    assert!(output.unwrap().contains("3 lines"));
+    // Subagent frames neither start turns nor count towards the main context.
+    assert!(t.top_level().all(|i| i.parent.is_none()));
+    assert_eq!(
+        t.top_level().filter(|i| i.kind == ItemKind::UserMessage).count(),
+        1
+    );
+}
+
+#[test]
+fn launch_forwards_subagent_text() {
+    let spec = ClaudeDriver::default().launch(None);
+    assert!(spec.args.iter().any(|a| a == "--forward-subagent-text"));
 }

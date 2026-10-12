@@ -31,7 +31,7 @@
 
 pub mod transcript;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
@@ -156,8 +156,11 @@ pub struct ClaudeDriver {
     pending: HashMap<String, Pending>,
     permissions: HashMap<String, PendingPermission>,
     open: HashMap<String, OpenMessage>,
-    /// Tool-use items waiting for their result.
-    open_tools: HashSet<String>,
+    /// Tool-use items waiting for their result, with their kind.
+    open_tools: HashMap<String, ItemKind>,
+    /// Background tasks (subagents, shells, monitors) by task id: the
+    /// `task_*` frames merged, so each update carries the whole record.
+    tasks: HashMap<String, Value>,
     /// Usage of the latest top-level assistant message (context fill).
     last_context: Option<u64>,
     context_window: Option<u64>,
@@ -192,7 +195,8 @@ impl ClaudeDriver {
             pending: HashMap::new(),
             permissions: HashMap::new(),
             open: HashMap::new(),
-            open_tools: HashSet::new(),
+            open_tools: HashMap::new(),
+            tasks: HashMap::new(),
             last_context: None,
             context_window: None,
             models: Vec::new(),
@@ -413,22 +417,16 @@ impl ClaudeDriver {
                     });
                 }
             }
+            Some("task_started" | "task_progress" | "task_updated" | "task_notification") => {
+                self.on_task(v, out)
+            }
+            Some("background_tasks_changed") => out.push(Event::Native {
+                kind: "background_tasks".into(),
+                payload: json!({"tasks": v.get("tasks").cloned().unwrap_or_else(|| json!([]))}),
+            }),
             Some(
-                "post_turn_summary"
-                | "task_summary"
-                | "hook_started"
-                | "hook_progress"
-                | "hook_response"
-                | "task_started"
-                | "task_updated"
-                | "task_progress"
-                | "task_notification"
-                | "background_tasks_changed"
-                | "files_persisted"
-                | "informational"
-                | "memory_recall"
-                | "thinking_tokens"
-                | "notification",
+                "post_turn_summary" | "task_summary" | "hook_started" | "hook_progress" | "hook_response"
+                | "files_persisted" | "informational" | "memory_recall" | "thinking_tokens" | "notification",
             ) => {}
             _ => out.push(Event::Unrecognized { raw: raw.to_owned() }),
         }
@@ -439,6 +437,61 @@ impl ClaudeDriver {
             BlockKind::Question
         } else {
             BlockKind::Permission
+        }
+    }
+
+    /// A background task's lifecycle (`task_started`, `task_progress`,
+    /// `task_updated` with a patch, `task_notification` at the end). Tasks
+    /// behind a tool call (subagents) update that item under `task`; the
+    /// rest (ambient monitors, background shells) pass through as native
+    /// events. A subagent launched in the background stays running until
+    /// its notification, whatever its tool result said.
+    fn on_task(&mut self, v: &Value, out: &mut Vec<Event>) {
+        let Some(task_id) = owned(v, "task_id") else {
+            return;
+        };
+        let subtype = str_at(v, "subtype").unwrap_or_default().to_owned();
+        let patch = if subtype == "task_updated" {
+            v.get("patch").cloned().unwrap_or(Value::Null)
+        } else {
+            v.clone()
+        };
+        let task = self
+            .tasks
+            .entry(task_id.clone())
+            .or_insert_with(|| json!({"task_id": task_id}));
+        if let (Some(t), Some(p)) = (task.as_object_mut(), patch.as_object()) {
+            for (k, val) in p {
+                if matches!(k.as_str(), "type" | "subtype" | "uuid" | "session_id") || val.is_null() {
+                    continue;
+                }
+                t.insert(k.clone(), val.clone());
+            }
+            if subtype == "task_started" {
+                t.insert("status".into(), json!("running"));
+            }
+        }
+        let task = task.clone();
+        let done = subtype == "task_notification";
+        match owned(&task, "tool_use_id") {
+            Some(tool) if done && self.open_tools.remove(&tool).is_some() => {
+                let failed = matches!(str_at(&task, "status"), Some("failed" | "stopped"));
+                out.push(Event::ItemCompleted {
+                    id: tool,
+                    extensions: json!({"task": task, "is_error": failed}),
+                });
+            }
+            Some(tool) => out.push(Event::ItemUpdated {
+                id: tool,
+                extensions: json!({"task": task}),
+            }),
+            None => out.push(Event::Native {
+                kind: subtype.clone(),
+                payload: task,
+            }),
+        }
+        if done {
+            self.tasks.remove(&task_id);
         }
     }
 
@@ -473,7 +526,8 @@ impl ClaudeDriver {
                         out.push(Event::ItemStarted {
                             id: item_id,
                             kind,
-                            extensions: parent_ext(v),
+                            parent: parent_of(v),
+                            extensions: Value::Null,
                         });
                     }
                     _ => open.blocks.push_back(item_id),
@@ -539,7 +593,8 @@ impl ClaudeDriver {
                             out.push(Event::ItemStarted {
                                 id: fallback.clone(),
                                 kind,
-                                extensions: parent_ext(v),
+                                parent: parent_of(v),
+                                extensions: Value::Null,
                             });
                             if let Some(text) = text {
                                 out.push(Event::ItemDelta {
@@ -558,22 +613,21 @@ impl ClaudeDriver {
                 Some("tool_use" | "server_tool_use") => {
                     let id = owned(&block, "id").or(streamed).unwrap_or(fallback);
                     let name = str_at(&block, "name").unwrap_or_default();
-                    let mut ext =
+                    let ext =
                         json!({"name": name, "input": block.get("input").cloned().unwrap_or(Value::Null)});
-                    if let Some(parent) = v.get("parent_tool_use_id").filter(|p| !p.is_null()) {
-                        ext["parent_tool_use_id"] = parent.clone();
-                    }
-                    self.open_tools.insert(id.clone());
+                    let kind = tool_kind(name);
+                    self.open_tools.insert(id.clone(), kind);
                     out.push(Event::ItemStarted {
                         id,
-                        kind: tool_kind(name),
+                        kind,
+                        parent: parent_of(v),
                         extensions: ext,
                     });
                 }
                 // A server tool's result (`web_search_tool_result`, ...).
                 Some(kind) if kind.ends_with("_tool_result") => {
                     if let Some(id) = owned(&block, "tool_use_id")
-                        && self.open_tools.remove(&id)
+                        && self.open_tools.remove(&id).is_some()
                     {
                         out.push(Event::ItemCompleted {
                             id,
@@ -601,14 +655,29 @@ impl ClaudeDriver {
                             continue;
                         };
                         self.resolve_tool(&id, out);
-                        if self.open_tools.remove(&id) {
-                            out.push(Event::ItemCompleted {
-                                id,
-                                extensions: json!({
-                                    "is_error": block.get("is_error").cloned().unwrap_or(Value::Bool(false)),
-                                    "content": block.get("content").cloned().unwrap_or(Value::Null),
-                                }),
-                            });
+                        let Some(kind) = self.open_tools.get(&id).copied() else {
+                            continue;
+                        };
+                        let mut ext = json!({
+                            "is_error": block.get("is_error").cloned().unwrap_or(Value::Bool(false)),
+                            "content": block.get("content").cloned().unwrap_or(Value::Null),
+                        });
+                        // The structured result names the agent (`agentId`,
+                        // `agentType`, usage) and whether it only launched.
+                        let result = v.get("tool_use_result").filter(|r| r.is_object());
+                        if kind == ItemKind::Subagent
+                            && let Some(result) = result
+                        {
+                            ext["result"] = result.clone();
+                        }
+                        let launched =
+                            result.is_some_and(|r| r.get("isAsync").and_then(Value::as_bool) == Some(true));
+                        if launched {
+                            // Still running: its `task_notification` completes it.
+                            out.push(Event::ItemUpdated { id, extensions: ext });
+                        } else {
+                            self.open_tools.remove(&id);
+                            out.push(Event::ItemCompleted { id, extensions: ext });
                         }
                     }
                     Some("text") => text.push_str(str_at(block, "text").unwrap_or_default()),
@@ -622,6 +691,11 @@ impl ClaudeDriver {
                 self.user_message(v, IMAGE_PLACEHOLDER, out);
             }
         } else if let Some(text) = content.as_str() {
+            if text.trim_start().starts_with("<task-notification>") {
+                // A background task's report, fed to the model as a user
+                // message; the `task_notification` frame already closed it.
+                return;
+            }
             if let Some(output) = local_command_output(text) {
                 out.push(Event::Notice {
                     message: output.to_owned(),
@@ -640,13 +714,16 @@ impl ClaudeDriver {
             self.next_request += 1;
             format!("user-{}", self.next_request)
         });
+        let parent = parent_of(v);
         // Older CLIs without session-state frames: a prompt starts a turn.
-        if !self.native_state_events {
+        // A subagent's prompt is the parent's tool call at work, not a turn.
+        if !self.native_state_events && parent.is_none() {
             self.set_state(RunState::Working { progress: None }, None, out);
         }
         out.push(Event::ItemStarted {
             id: id.clone(),
             kind: ItemKind::UserMessage,
+            parent,
             extensions: Value::Null,
         });
         out.push(Event::ItemDelta {
@@ -1700,15 +1777,38 @@ pub(crate) fn tool_kind(name: &str) -> ItemKind {
     match name {
         "Bash" | "PowerShell" => ItemKind::CommandExecution,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ItemKind::FileChange,
+        // `Task` is what 2.0 called `Agent`.
+        "Agent" | "Task" => ItemKind::Subagent,
         _ => ItemKind::ToolCall,
     }
 }
 
-fn parent_ext(v: &Value) -> Value {
-    match v.get("parent_tool_use_id") {
-        Some(p) if !p.is_null() => json!({"parent_tool_use_id": p}),
-        _ => Value::Null,
-    }
+/// The `Agent` call a subagent's frame belongs to, when it is one.
+fn parent_of(v: &Value) -> Option<String> {
+    owned(v, "parent_tool_use_id")
+}
+
+/// A background task's report as Claude feeds it to the model (and writes
+/// it to the transcript): `<task-notification>` with the tool call, status
+/// and result. Returns the `Agent` call's id and the fields as a `task`
+/// record shaped like the stream-json `task_notification` frame.
+pub(crate) fn task_notification(text: &str) -> Option<(String, Value)> {
+    let body = text.trim_start().strip_prefix("<task-notification>")?;
+    let tag = |name: &str| {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let start = body.find(&open)? + open.len();
+        let end = body[start..].find(&close)? + start;
+        Some(body[start..end].trim().to_owned())
+    };
+    let tool = tag("tool-use-id")?;
+    let task = json!({
+        "task_id": tag("task-id"),
+        "status": tag("status"),
+        "summary": tag("result").or_else(|| tag("summary")),
+        "output_file": tag("output-file"),
+    });
+    Some((tool, task))
 }
 
 /// Output of a local slash command, which Claude echoes as a user message.

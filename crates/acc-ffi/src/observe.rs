@@ -129,15 +129,7 @@ impl AccObserved {
 
     /// The transcript to follow (with a fan-in), from what was read so far.
     pub fn feed_entry(&self) -> Option<AccFeedEntry> {
-        lock(&self.inner).feed_entry().map(|e| AccFeedEntry {
-            key: e.key,
-            path: match e.path {
-                acc_core::detached::FeedPath::File(path) => AccFeedPath::File { path },
-                acc_core::detached::FeedPath::SessionLog(id) => AccFeedPath::SessionLog { id },
-                acc_core::detached::FeedPath::SessionExit(id) => AccFeedPath::SessionExit { id },
-            },
-            offset: e.offset,
-        })
+        lock(&self.inner).feed_entry().map(feed_entry)
     }
 
     pub fn feed(&self, bytes: Vec<u8>, now_ms: u64) -> Vec<AccUpdate> {
@@ -146,6 +138,60 @@ impl AccObserved {
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    /// While a subagent runs (or one was just reported), a script that finds
+    /// subagent transcripts not followed yet; call on every tick and pass
+    /// its output to `on_children`. Claude and Codex keep them; others don't.
+    pub fn children_exec(&self, now_ms: u64) -> Option<AccExec> {
+        lock(&self.inner).children_exec(now_ms).map(Into::into)
+    }
+
+    /// The output of `children_exec`. True when there are new transcripts
+    /// to follow: restart the fan-in with `feed_entry` and
+    /// `child_feed_entries`.
+    pub fn on_children(&self, stdout: String) -> bool {
+        lock(&self.inner).on_children(&stdout)
+    }
+
+    /// The subagent transcripts to follow next to `feed_entry`.
+    pub fn child_feed_entries(&self) -> Vec<AccFeedEntry> {
+        lock(&self.inner)
+            .child_feed_entries()
+            .into_iter()
+            .map(feed_entry)
+            .collect()
+    }
+
+    /// Bytes of a subagent transcript, from fan-in lines with one of the
+    /// `child_feed_entries` keys. Its items carry the `Subagent` item as `parent`.
+    pub fn feed_child(&self, key: String, bytes: Vec<u8>, now_ms: u64) -> Vec<AccUpdate> {
+        lock(&self.inner)
+            .feed_child(&key, &bytes, now_ms)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// The main conversation: items that didn't run inside a subagent.
+    pub fn top_level_items(&self) -> Vec<AccItem> {
+        let o = lock(&self.inner);
+        let h = o.agent().harness;
+        o.transcript().top_level().map(|i| item(i, h)).collect()
+    }
+
+    /// The child conversation of the `Subagent` item `parent`.
+    pub fn children(&self, parent: String) -> Vec<AccItem> {
+        let o = lock(&self.inner);
+        let h = o.agent().harness;
+        o.transcript().children(&parent).map(|i| item(i, h)).collect()
+    }
+
+    /// Every subagent run in the session.
+    pub fn subagents(&self) -> Vec<AccItem> {
+        let o = lock(&self.inner);
+        let h = o.agent().harness;
+        o.transcript().subagents().map(|i| item(i, h)).collect()
     }
 
     /// Call every few seconds with the output of `alive_exec` and, when
@@ -227,6 +273,18 @@ impl AccObserved {
             .map_err(|e| AccError::Unsupported {
                 message: e.to_string(),
             })
+    }
+}
+
+fn feed_entry(e: acc_core::detached::FeedEntry) -> AccFeedEntry {
+    AccFeedEntry {
+        key: e.key,
+        path: match e.path {
+            acc_core::detached::FeedPath::File(path) => AccFeedPath::File { path },
+            acc_core::detached::FeedPath::SessionLog(id) => AccFeedPath::SessionLog { id },
+            acc_core::detached::FeedPath::SessionExit(id) => AccFeedPath::SessionExit { id },
+        },
+        offset: e.offset,
     }
 }
 

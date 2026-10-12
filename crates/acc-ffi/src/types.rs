@@ -44,7 +44,7 @@ mirror_enum!(
 );
 mirror_enum!(AccBlockKind <=> BlockKind { Permission, Question, Auth });
 mirror_enum!(AccStateSource <=> StateSource { Heuristic, ScreenMatch, Transcript, Osc7501, Native });
-mirror_enum!(AccItemKind <=> ItemKind { UserMessage, AgentMessage, Reasoning, ToolCall, CommandExecution, FileChange });
+mirror_enum!(AccItemKind <=> ItemKind { UserMessage, AgentMessage, Reasoning, ToolCall, CommandExecution, FileChange, Subagent });
 mirror_enum!(AccItemStatus <=> ItemStatus { Running, Completed, Failed });
 mirror_enum!(AccOptionId <=> OptionId { Model, Effort, Mode, Permission });
 mirror_enum!(AccApply <=> Apply { Live, NextTurn, Restart });
@@ -211,6 +211,8 @@ pub enum AccEvent {
     ItemStarted {
         id: String,
         kind: AccItemKind,
+        /// The `Subagent` item this one runs inside, for child conversations.
+        parent: Option<String>,
         extensions_json: String,
     },
     ItemDelta {
@@ -272,9 +274,15 @@ impl From<Event> for AccEvent {
                 model,
             },
             Event::StateChanged(s) => Self::StateChanged { state: s.into() },
-            Event::ItemStarted { id, kind, extensions } => Self::ItemStarted {
+            Event::ItemStarted {
+                id,
+                kind,
+                parent,
+                extensions,
+            } => Self::ItemStarted {
                 id,
                 kind: kind.into(),
+                parent,
                 extensions_json: json(&extensions),
             },
             Event::ItemDelta { id, text } => Self::ItemDelta { id, text },
@@ -436,12 +444,43 @@ pub enum AccItemDetail {
     FileChange {
         files: Vec<AccFileDiff>,
     },
+    /// A run of another agent. Its child conversation is `children(id)`.
+    Subagent {
+        /// Agent type or name (Claude `subagent_type`, opencode agent, Codex nickname).
+        agent: Option<String>,
+        description: String,
+        prompt: Option<String>,
+        /// The harness's id for the child conversation.
+        child: Option<String>,
+        /// The harness's own status word (`running`, `completed`, ...).
+        status: Option<String>,
+        /// The final report, or the latest summary while it runs.
+        output: Option<String>,
+        model: Option<String>,
+    },
 }
 
 impl From<ItemDetail> for AccItemDetail {
     fn from(d: ItemDetail) -> Self {
         match d {
             ItemDetail::Text => Self::Text,
+            ItemDetail::Subagent {
+                agent,
+                description,
+                prompt,
+                child,
+                status,
+                output,
+                model,
+            } => Self::Subagent {
+                agent,
+                description,
+                prompt,
+                child,
+                status,
+                output,
+                model,
+            },
             ItemDetail::Tool {
                 name,
                 title,

@@ -23,6 +23,8 @@ use crate::transcript::Transcript;
 
 /// After this long without news, a lower-fidelity state source may override.
 const STALE_MS: u64 = 30_000;
+/// How often to look for subagent transcripts while a subagent runs.
+const CHILD_POLL_MS: u64 = 2_000;
 /// An outstanding tool call this quiet in a live TUI may be waiting on the
 /// user: the transcript doesn't record approval dialogs.
 const PROMPT_QUIET_MS: u64 = 4_000;
@@ -54,6 +56,34 @@ enum Reader {
 }
 
 impl Reader {
+    /// A reader for a subagent's transcript, under the item `parent`.
+    fn for_child(&self, parent: String) -> Option<Reader> {
+        match self {
+            Reader::Claude(_) => Some(Reader::Claude(claude::transcript::Observer::for_subagent(parent))),
+            Reader::Codex(_) => Some(Reader::Codex(codex::rollout::Observer::for_child(parent))),
+            Reader::Pi(_) => None,
+        }
+    }
+
+    /// Subagent ids learned since the last call, with their parent item.
+    fn take_new_children(&mut self) -> Vec<(String, String)> {
+        match self {
+            Reader::Claude(o) => o.take_new_agents(),
+            Reader::Codex(o) => o.take_new_children(),
+            Reader::Pi(_) => Vec::new(),
+        }
+    }
+
+    /// Whether a subagent is running whose transcript may not be known yet.
+    fn subagent_running(&self) -> bool {
+        match self {
+            Reader::Claude(o) => {
+                o.background_agents() > 0 || o.pending_tool_names().any(|n| matches!(n, "Agent" | "Task"))
+            }
+            _ => false,
+        }
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
         match self {
             Reader::Claude(o) => o.feed(bytes),
@@ -104,6 +134,17 @@ impl Reader {
     }
 }
 
+/// A subagent's transcript followed next to the session's.
+#[derive(Debug)]
+struct Child {
+    key: String,
+    path: String,
+    /// The harness's id for it (Claude agent id, Codex thread id).
+    id: String,
+    offset: u64,
+    reader: Reader,
+}
+
 /// A foreign harness, followed through its transcript.
 #[derive(Debug)]
 pub struct Observed {
@@ -125,6 +166,11 @@ pub struct Observed {
     /// The harness reports its own state (Claude's `sessions/<pid>.json`),
     /// so nothing is inferred.
     reports_status: bool,
+    children: Vec<Child>,
+    /// Subagent ids whose transcript hasn't been found yet, with the item
+    /// they belong to.
+    unlocated: Vec<(String, String)>,
+    last_child_check_ms: Option<u64>,
 }
 
 impl Observed {
@@ -149,8 +195,142 @@ impl Observed {
             last_news_ms: 0,
             inferred_block: false,
             reports_status: false,
+            children: Vec::new(),
+            unlocated: Vec::new(),
+            last_child_check_ms: None,
             agent,
         }
+    }
+
+    // ---- subagents -----------------------------------------------------------
+
+    /// A script that finds subagent transcripts not followed yet, while one
+    /// may exist (a subagent is running, or one was just reported). Pass its
+    /// output to [`Observed::on_children`]. Claude keeps them next to the
+    /// session (`<session>/subagents/agent-<id>.jsonl`), Codex as rollouts of
+    /// their own; pi and the ACP harnesses keep none.
+    pub fn children_exec(&mut self, now_ms: u64) -> Option<Exec> {
+        let reader = self.reader.as_mut()?;
+        self.unlocated.extend(reader.take_new_children());
+        let followed = |id: &str, children: &[Child]| children.iter().any(|c| c.id == id);
+        self.unlocated.retain(|(id, _)| !followed(id, &self.children));
+        let due = self
+            .last_child_check_ms
+            .is_none_or(|t| now_ms.saturating_sub(t) >= CHILD_POLL_MS);
+        let wanted = !self.unlocated.is_empty() || reader.subagent_running();
+        if !(due && wanted) {
+            return None;
+        }
+        self.last_child_check_ms = Some(now_ms);
+        match reader {
+            Reader::Claude(_) => {
+                let path = &self.agent.transcript.as_ref()?.path;
+                Some(Exec::new(claude::transcript::subagents_script(path)))
+            }
+            Reader::Codex(_) => {
+                let script: String = self
+                    .unlocated
+                    .iter()
+                    .map(|(thread, _)| codex::rollout::locate_script(thread))
+                    .collect();
+                (!script.is_empty()).then(|| Exec::new(script))
+            }
+            Reader::Pi(_) => None,
+        }
+    }
+
+    /// Takes the output of [`Observed::children_exec`]. Returns true when
+    /// new transcripts are to be followed: restart the fan-in with
+    /// [`Observed::feed_entry`] and [`Observed::child_feed_entries`].
+    pub fn on_children(&mut self, stdout: &str) -> bool {
+        let Some(reader) = self.reader.as_ref() else {
+            return false;
+        };
+        let found: Vec<(String, String, Option<String>)> = match reader {
+            Reader::Claude(_) => claude::transcript::parse_subagents(stdout)
+                .into_iter()
+                .map(|f| (f.agent_id, f.path, f.tool_use_id))
+                .collect(),
+            Reader::Codex(_) => stdout
+                .lines()
+                .map(str::trim)
+                .filter_map(|p| {
+                    Some((
+                        codex::rollout::thread_id_from_path(p)?.to_owned(),
+                        p.to_owned(),
+                        None,
+                    ))
+                })
+                .collect(),
+            Reader::Pi(_) => Vec::new(),
+        };
+        let mut added = false;
+        for (id, path, tool) in found {
+            if self.children.iter().any(|c| c.id == id) {
+                continue;
+            }
+            // The meta file names the call (Claude), or the parent's tool
+            // result did.
+            let parent = tool.or_else(|| {
+                self.unlocated
+                    .iter()
+                    .find(|(u, _)| *u == id)
+                    .map(|(_, p)| p.clone())
+            });
+            let Some(parent) = parent else { continue };
+            let Some(child_reader) = reader.for_child(parent) else {
+                continue;
+            };
+            self.unlocated.retain(|(u, _)| *u != id);
+            self.children.push(Child {
+                key: format!("{}.sub.{}", self.agent.key(), sanitize_key(&id)),
+                path,
+                id,
+                offset: 0,
+                reader: child_reader,
+            });
+            added = true;
+        }
+        added
+    }
+
+    /// The subagent transcripts to follow alongside [`Observed::feed_entry`].
+    pub fn child_feed_entries(&self) -> Vec<FeedEntry> {
+        self.children
+            .iter()
+            .map(|c| FeedEntry {
+                key: c.key.clone(),
+                path: FeedPath::File(c.path.clone()),
+                offset: c.offset,
+            })
+            .collect()
+    }
+
+    /// Bytes of the subagent transcript followed under fan-in `key`.
+    /// Returns nothing for a key that isn't one of this agent's children.
+    pub fn feed_child(&mut self, key: &str, bytes: &[u8], now_ms: u64) -> Vec<Update> {
+        let replay = self.is_replaying();
+        let Some(child) = self.children.iter_mut().find(|c| c.key == key) else {
+            return Vec::new();
+        };
+        child.offset += bytes.len() as u64;
+        let events = child.reader.feed(bytes);
+        if !events.is_empty() {
+            self.last_news_ms = now_ms;
+        }
+        let mut out = Vec::new();
+        for event in events {
+            // A child's state and usage aren't the session's.
+            if matches!(
+                event,
+                Event::StateChanged(_) | Event::Usage(_) | Event::Quota(_) | Event::SessionStarted { .. }
+            ) {
+                continue;
+            }
+            let item = self.transcript.apply(&event);
+            out.push(Update { event, item, replay });
+        }
+        out
     }
 
     pub fn agent(&self) -> &ForeignAgent {
@@ -462,6 +642,20 @@ impl Observed {
     }
 }
 
+/// A fan-in key part from a harness id (`[A-Za-z0-9_.:-]`).
+fn sanitize_key(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_.:-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect()
+}
+
 fn working(now_ms: u64) -> SessionState {
     SessionState {
         state: RunState::Working { progress: None },
@@ -650,6 +844,59 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    const SUB_PARENT: &str =
+        include_str!("../tests/fixtures/claude/subagents/71b44a93-af51-4778-825f-a5a38dbf869a.jsonl");
+    const SUB_FG: &str = include_str!(
+        "../tests/fixtures/claude/subagents/71b44a93-af51-4778-825f-a5a38dbf869a/subagents/agent-adc9fb778705a136d.jsonl"
+    );
+    const SUB_FG_META: &str = include_str!(
+        "../tests/fixtures/claude/subagents/71b44a93-af51-4778-825f-a5a38dbf869a/subagents/agent-adc9fb778705a136d.meta.json"
+    );
+
+    #[test]
+    fn subagent_transcripts_are_found_and_followed() {
+        let mut a = agent(0);
+        a.pane = None;
+        a.transcript.as_mut().unwrap().path = "/h/.claude/projects/-tmp-acc-sub-spike/s.jsonl".into();
+        let mut o = Observed::new(a);
+        // Nothing to look for before any subagent runs.
+        assert!(o.children_exec(0).is_none());
+        // The foreground Agent call starts: its transcript is looked for at once.
+        let start = SUB_PARENT
+            .lines()
+            .position(|l| l.contains("\"name\":\"Agent\""))
+            .unwrap();
+        let head: String = SUB_PARENT
+            .lines()
+            .take(start + 1)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        o.feed(head.as_bytes(), 1_000);
+        let exec = o.children_exec(1_000).expect("look for the subagent's file");
+        assert!(
+            exec.script
+                .contains("/h/.claude/projects/-tmp-acc-sub-spike/s/subagents")
+        );
+        assert!(o.children_exec(1_500).is_none(), "throttled");
+        let listing = format!(
+            "/h/.claude/projects/-tmp-acc-sub-spike/s/subagents/agent-adc9fb778705a136d.jsonl\t{}\t{}\n",
+            SUB_FG.len(),
+            SUB_FG_META.trim()
+        );
+        assert!(o.on_children(&listing));
+        assert!(!o.on_children(&listing), "already followed");
+        let entries = o.child_feed_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "tui-claude-42.sub.adc9fb778705a136d");
+        assert!(crate::detached::fan_in_script(&entries).contains("agent-adc9fb778705a136d.jsonl"));
+        let ups = o.feed_child(&entries[0].key, SUB_FG.as_bytes(), 2_000);
+        assert!(ups.iter().all(|u| !matches!(u.event, Event::StateChanged(_))));
+        let parent = "toolu_01WqrBFboSUXpcf1Bb8qoLzE";
+        assert!(o.transcript().children(parent).count() >= 3);
+        assert_eq!(o.child_feed_entries()[0].offset, SUB_FG.len() as u64);
+        assert!(o.feed_child("other", b"x\n", 2_000).is_empty());
     }
 
     fn claude_report(status: &str, waiting_for: Option<&str>) -> String {

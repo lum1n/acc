@@ -35,6 +35,24 @@ pub enum ItemDetail {
     FileChange {
         files: Vec<FileDiff>,
     },
+    /// A run of another agent: what it was asked and what it reported. The
+    /// child conversation's items carry this item's id as their `parent`.
+    Subagent {
+        /// The agent type or name (Claude's `subagent_type`, opencode's
+        /// agent, a Codex nickname or role), when known.
+        agent: Option<String>,
+        /// One-line summary of the task.
+        description: String,
+        prompt: Option<String>,
+        /// The harness's id for the child conversation: Claude agent id,
+        /// Codex thread id, opencode session id.
+        child: Option<String>,
+        /// The harness's own status word (`running`, `completed`, ...).
+        status: Option<String>,
+        /// The agent's final report, or its latest summary while it runs.
+        output: Option<String>,
+        model: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,8 +460,69 @@ fn tool(name: &str, input: &Value, output: Option<String>) -> ItemDetail {
     }
 }
 
+/// Text the hand-back frame of a Claude subagent wraps its report in, after
+/// which every line of the report is indented by two spaces.
+const HAND_BACK_MARK: &str = "The report follows:\n";
+
+/// The report inside a Claude subagent's tool result. Claude 2.1 wraps it
+/// in a "[Subagent hand-back]" preamble and indents it; older versions
+/// return it bare. A background launch's acknowledgement is no report.
+fn claude_report(text: &str) -> Option<String> {
+    if text.starts_with("Async agent launched successfully") {
+        return None;
+    }
+    let report = match text.split_once(HAND_BACK_MARK) {
+        Some((_, rest)) => rest
+            .lines()
+            .map(|l| l.strip_prefix("  ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => text.to_owned(),
+    };
+    Some(report.trim().to_owned()).filter(|r| !r.is_empty())
+}
+
+/// A Claude `Agent`/`Task` call. The input names the agent and task; the
+/// driver merges `task_*` frames under `task` and the structured result
+/// (`toolUseResult`) under `result`.
+fn claude_subagent(ext: &Value, text: &str) -> ItemDetail {
+    let null = Value::Null;
+    let input = ext.get("input").unwrap_or(&null);
+    let task = ext.get("task").unwrap_or(&null);
+    let result = ext.get("result").unwrap_or(&null);
+    let report = ext
+        .get("content")
+        .and_then(content_text)
+        .or_else(|| (!text.is_empty()).then(|| text.to_owned()))
+        .and_then(|t| claude_report(&t));
+    let status = owned(task, "status")
+        .or_else(|| owned(result, "status"))
+        .or_else(|| {
+            (ext.get("is_error").and_then(Value::as_bool) == Some(true)).then(|| "failed".to_owned())
+        });
+    ItemDetail::Subagent {
+        agent: owned(input, "subagent_type")
+            .or_else(|| owned(task, "subagent_type"))
+            .or_else(|| owned(result, "agentType")),
+        description: owned(input, "description")
+            .or_else(|| owned(task, "description"))
+            .or_else(|| owned(result, "description"))
+            .unwrap_or_default(),
+        prompt: owned(input, "prompt")
+            .or_else(|| owned(task, "prompt"))
+            .or_else(|| owned(result, "prompt")),
+        child: owned(result, "agentId").or_else(|| owned(task, "task_id")),
+        status,
+        output: report.or_else(|| owned(task, "summary")),
+        model: owned(result, "resolvedModel"),
+    }
+}
+
 fn claude(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     let name = str_at(ext, "name").unwrap_or("tool");
+    if kind == ItemKind::Subagent {
+        return claude_subagent(ext, text);
+    }
     let input = ext.get("input").cloned().unwrap_or(Value::Null);
     let output = ext.get("content").and_then(content_text);
     match (kind, name) {
@@ -496,7 +575,58 @@ fn claude(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     }
 }
 
+/// A Codex collab tool call (`spawn_agent`, `wait_agent`, `send_input`,
+/// `close_agent`, `resume_agent`), as the app-server's `collabAgentToolCall`
+/// item. The driver merges the child thread's nickname or role as `agent`.
+fn codex_subagent(ext: &Value, text: &str) -> ItemDetail {
+    let tool = str_at(ext, "tool").unwrap_or("spawnAgent");
+    let child = ext
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .and_then(|r| r.first())
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let state = child
+        .as_deref()
+        .and_then(|c| ext.pointer(&format!("/agentsStates/{}", escape_pointer(c))));
+    let description = match tool {
+        "spawnAgent" => "Spawn agent",
+        "sendInput" => "Send input to agent",
+        "wait" => "Wait for agent",
+        "closeAgent" => "Close agent",
+        "resumeAgent" => "Resume agent",
+        other => other,
+    };
+    let description = match owned(ext, "agent") {
+        Some(name) => format!("{description} {name}"),
+        None => description.to_owned(),
+    };
+    ItemDetail::Subagent {
+        agent: owned(ext, "agent"),
+        description,
+        prompt: owned(ext, "prompt"),
+        child,
+        status: state
+            .and_then(|s| owned(s, "status"))
+            .or_else(|| owned(ext, "childStatus"))
+            .or_else(|| owned(ext, "status")),
+        output: state
+            .and_then(|s| owned(s, "message"))
+            .filter(|m| !m.is_empty())
+            .or_else(|| (!text.is_empty()).then(|| text.to_owned())),
+        model: owned(ext, "model"),
+    }
+}
+
+/// Escapes a JSON Pointer reference token (RFC 6901).
+fn escape_pointer(s: &str) -> String {
+    s.replace('~', "~0").replace('/', "~1")
+}
+
 fn codex(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
+    if kind == ItemKind::Subagent {
+        return codex_subagent(ext, text);
+    }
     match str_at(ext, "type") {
         Some("commandExecution") => {
             let command = match ext.get("command") {
@@ -579,6 +709,30 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     let name = str_at(ext, "tool").unwrap_or("tool");
     let args = ext.get("args").cloned().unwrap_or(Value::Null);
     let output = ext.get("result").and_then(content_text);
+    if kind == ItemKind::Subagent {
+        // pi-subagents: `{agent, task}`; batches and chains carry `tasks`.
+        let first = args
+            .get("tasks")
+            .and_then(Value::as_array)
+            .and_then(|t| t.first());
+        let task = owned(&args, "task")
+            .or_else(|| owned(&args, "prompt"))
+            .or_else(|| first.and_then(|t| owned(t, "task")));
+        let failed = ext.get("is_error").and_then(Value::as_bool) == Some(true);
+        return ItemDetail::Subagent {
+            agent: owned(&args, "agent").or_else(|| first.and_then(|t| owned(t, "agent"))),
+            description: owned(&args, "description")
+                .or_else(|| task.as_deref().map(|t| crate::wire::one_line(t, 160)))
+                .unwrap_or_default(),
+            prompt: task,
+            child: None,
+            status: output
+                .as_ref()
+                .map(|_| if failed { "failed" } else { "completed" }.to_owned()),
+            output: output.or_else(|| (!text.is_empty()).then(|| text.to_owned())),
+            model: None,
+        };
+    }
     match (kind, name) {
         (ItemKind::CommandExecution, _) => ItemDetail::Command {
             command: owned(&args, "command")
@@ -630,6 +784,80 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     }
 }
 
+/// Whether an ACP tool call runs another agent: opencode's `task` (input
+/// `subagent_type`/`agent`, `description`, `prompt`), and agents that name
+/// the tool `subagent`, `task` or `Task` with an agent and a prompt.
+pub(crate) fn acp_is_subagent(update: &Value) -> bool {
+    let input = update.get("rawInput").unwrap_or(&Value::Null);
+    let title = str_at(update, "title").unwrap_or_default();
+    let named = |k: &str| input.get(k).is_some_and(|v| v.is_string());
+    (named("subagent_type") && (named("prompt") || named("description")))
+        || (named("agent") && (named("task") || named("prompt")))
+        || matches!(title, "task" | "Task" | "subagent" | "Subagent" | "Agent")
+        || title.ends_with(" Subagent")
+        || title.contains(" Subagent \u{2014} ")
+}
+
+/// A subagent tool's output: opencode 2.0 wraps the report in
+/// `<subagent sessionID="…" state="…">`, 1.x starts with `task_id: ses_…`
+/// and wraps it in `<task_result>`. Other agents return the report bare.
+fn acp_task_output(text: &str) -> (Option<String>, Option<String>) {
+    let attr = |tag: &str, name: &str| {
+        let open = text.find(tag)?;
+        let head = &text[open..open + text[open..].find('>')?];
+        let start = head.find(&format!("{name}=\""))? + name.len() + 2;
+        head[start..].split('"').next().map(str::to_owned)
+    };
+    let child = attr("<subagent", "sessionID").or_else(|| {
+        text.lines()
+            .find_map(|l| l.strip_prefix("task_id: "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_owned)
+    });
+    let inner = |open: &str, close: &str| {
+        let start = text.find(open)?;
+        let body = &text[start..];
+        let body = &body[body.find('>')? + 1..];
+        Some(body.split(close).next().unwrap_or(body))
+    };
+    let report = inner("<subagent", "</subagent>")
+        .or_else(|| inner("<task_result", "</task_result>"))
+        .unwrap_or(text)
+        .trim();
+    (child, (!report.is_empty()).then(|| report.to_owned()))
+}
+
+fn acp_subagent(ext: &Value, output: Option<String>, text: &str) -> ItemDetail {
+    let null = Value::Null;
+    let input = ext.get("rawInput").unwrap_or(&null);
+    let raw_out = ext.get("rawOutput").unwrap_or(&null);
+    let (child_in_text, report) = output.as_deref().map(acp_task_output).unwrap_or_default();
+    let child = raw_out
+        .pointer("/metadata/sessionID")
+        .or_else(|| raw_out.pointer("/metadata/sessionId"))
+        .or_else(|| raw_out.get("sessionId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(child_in_text);
+    let title = owned(ext, "title").filter(|t| !t.is_empty());
+    ItemDetail::Subagent {
+        agent: owned(input, "subagent_type").or_else(|| owned(input, "agent")),
+        description: owned(input, "description").or(title).unwrap_or_default(),
+        prompt: owned(input, "prompt").or_else(|| owned(input, "task")),
+        child,
+        status: raw_out
+            .pointer("/metadata/status")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| owned(ext, "status")),
+        output: report.or_else(|| (!text.is_empty()).then(|| text.to_owned())),
+        model: raw_out
+            .pointer("/metadata/model/modelID")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
 fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     let content: &[Value] = ext
         .get("content")
@@ -658,6 +886,9 @@ fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
         .join("\n");
     let raw_out = ext.get("rawOutput").and_then(content_text);
     let output = if output.is_empty() { raw_out } else { Some(output) };
+    if kind == ItemKind::Subagent {
+        return acp_subagent(ext, output, text);
+    }
     let input = ext.get("rawInput").cloned().unwrap_or(Value::Null);
     let title = owned(ext, "title").unwrap_or_default();
     if kind == ItemKind::CommandExecution || str_at(ext, "kind") == Some("execute") {
@@ -797,6 +1028,84 @@ mod tests {
                 ("c.txt", FileChangeKind::Delete, 0, 0),
             ]
         );
+    }
+
+    #[test]
+    fn claude_subagent_detail_unwraps_the_hand_back() {
+        let ext = json!({"name": "Agent",
+            "input": {"subagent_type": "Explore", "description": "Find it", "prompt": "Look for x"},
+            "content": [{"type": "text", "text": "[Subagent hand-back] preamble. The report follows:\n  Found x\n  in a.rs"}],
+            "result": {"status": "completed", "agentId": "a1", "resolvedModel": "claude-haiku-4-5"}});
+        assert_eq!(
+            detail(Harness::Claude, ItemKind::Subagent, &ext, ""),
+            ItemDetail::Subagent {
+                agent: Some("Explore".into()),
+                description: "Find it".into(),
+                prompt: Some("Look for x".into()),
+                child: Some("a1".into()),
+                status: Some("completed".into()),
+                output: Some("Found x\nin a.rs".into()),
+                model: Some("claude-haiku-4-5".into()),
+            }
+        );
+        // A background launch: no report yet, the task frames' summary instead.
+        let ext = json!({"name": "Agent", "input": {"description": "Bg"},
+            "content": [{"type": "text", "text": "Async agent launched successfully. agentId: a2"}],
+            "task": {"task_id": "a2", "status": "running", "summary": "Reading files"}});
+        let ItemDetail::Subagent {
+            output,
+            status,
+            child,
+            ..
+        } = detail(Harness::Claude, ItemKind::Subagent, &ext, "")
+        else {
+            panic!()
+        };
+        assert_eq!(output.as_deref(), Some("Reading files"));
+        assert_eq!(status.as_deref(), Some("running"));
+        assert_eq!(child.as_deref(), Some("a2"));
+    }
+
+    #[test]
+    fn acp_subagent_outputs_of_both_opencode_versions() {
+        let v1 = "task_id: ses_abc (for resuming to continue this task if needed)\n\n<task_result>\nDone.\n</task_result>";
+        assert_eq!(
+            acp_task_output(v1),
+            (Some("ses_abc".into()), Some("Done.".into()))
+        );
+        let v2 = "<subagent sessionID=\"ses_def\" state=\"completed\">\nFiles: a\n</subagent>";
+        assert_eq!(
+            acp_task_output(v2),
+            (Some("ses_def".into()), Some("Files: a".into()))
+        );
+        assert_eq!(acp_task_output("plain"), (None, Some("plain".into())));
+        assert!(acp_is_subagent(&json!({"title": "subagent", "rawInput": {}})));
+        assert!(acp_is_subagent(
+            &json!({"title": "x", "rawInput": {"subagent_type": "general", "prompt": "p"}})
+        ));
+        assert!(!acp_is_subagent(
+            &json!({"title": "read", "rawInput": {"path": "a"}})
+        ));
+    }
+
+    #[test]
+    fn pi_subagent_tool() {
+        let ext = json!({"tool": "subagent", "args": {"agent": "scout", "task": "Map the repo"},
+            "result": {"content": [{"type": "text", "text": "Mapped."}]}, "is_error": false});
+        let ItemDetail::Subagent {
+            agent,
+            prompt,
+            output,
+            status,
+            ..
+        } = detail(Harness::Pi, ItemKind::Subagent, &ext, "")
+        else {
+            panic!()
+        };
+        assert_eq!(agent.as_deref(), Some("scout"));
+        assert_eq!(prompt.as_deref(), Some("Map the repo"));
+        assert_eq!(output.as_deref(), Some("Mapped."));
+        assert_eq!(status.as_deref(), Some("completed"));
     }
 
     #[test]

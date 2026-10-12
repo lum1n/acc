@@ -200,6 +200,27 @@ impl AccSession {
         s.transcript().get(&id).map(|i| item(i, h))
     }
 
+    /// The main conversation: items that didn't run inside a subagent.
+    pub fn top_level_items(&self) -> Vec<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().top_level().map(|i| item(i, h)).collect()
+    }
+
+    /// The child conversation of the `Subagent` item `parent`.
+    pub fn children(&self, parent: String) -> Vec<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().children(&parent).map(|i| item(i, h)).collect()
+    }
+
+    /// Every subagent run in the session.
+    pub fn subagents(&self) -> Vec<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().subagents().map(|i| item(i, h)).collect()
+    }
+
     pub fn usage(&self) -> AccUsage {
         lock(&self.inner).usage().clone().into()
     }
@@ -424,6 +445,50 @@ mod tests {
             }),
             Err(AccError::AttachmentRejected { .. })
         ));
+    }
+
+    #[test]
+    fn subagents_cross_the_ffi() {
+        const SUB: &[u8] = include_bytes!("../../acc-core/tests/fixtures/claude/subagents.ndjson");
+        let req = AccLaunchRequest {
+            harness: AccHarness::Claude,
+            cwd: "/w".into(),
+            model: None,
+            permission: None,
+            resume: None,
+            fork: false,
+            title: None,
+            prompt: None,
+            attachments: vec![],
+            parent: None,
+            replaces_parent: false,
+            origin: AccOrigin::Started,
+            launcher: None,
+        };
+        let s = AccSession::launch(
+            req,
+            new_session_id(AccHarness::Claude, vec![9; 15]),
+            "ph".into(),
+            1,
+        )
+        .unwrap();
+        let b = AccSession::attach(s.spec().json, "desk".into()).unwrap();
+        b.on_status(format!("exited 0 {}", SUB.len()), 2);
+        let ups = b.feed(SUB.to_vec(), 3);
+        assert!(
+            ups.iter()
+                .any(|u| matches!(&u.event, AccEvent::ItemStarted { parent: Some(_), .. }))
+        );
+        let subs = b.subagents();
+        assert_eq!(subs.len(), 2);
+        assert!(subs.iter().all(|i| i.kind == AccItemKind::Subagent));
+        let AccItemDetail::Subagent { agent, child, .. } = &subs[0].detail else {
+            panic!("subagent detail")
+        };
+        assert_eq!(agent.as_deref(), Some("Explore"));
+        assert!(child.is_some());
+        assert!(!b.children(subs[0].id.clone()).is_empty());
+        assert!(b.top_level_items().iter().all(|i| i.parent.is_none()));
     }
 
     #[test]

@@ -202,3 +202,66 @@ fn attach_replays_another_clients_log() {
         assert_eq!(with_image["params"]["prompt"][1]["mimeType"], "image/png");
     }
 }
+
+/// opencode 2.0.14 against a real model: one `subagent` call to the
+/// `explore` agent, whose child session streams under the parent's session
+/// id with `_meta["opencode/child-session"]`.
+const OPENCODE_SUBAGENT: &str = include_str!("fixtures/acp/opencode-2.0.14-subagent.out.ndjson");
+
+#[test]
+fn opencode_subagent_and_its_child_session() {
+    use acc_core::item::ItemDetail;
+    use acc_core::transcript::Transcript;
+    let mut d = AcpDriver::new(
+        Harness::Opencode,
+        AcpConfig::new("/tmp/acc-sub-spike", Start::Attach),
+    );
+    let mut t = Transcript::new();
+    for line in OPENCODE_SUBAGENT.split_inclusive('\n') {
+        for e in d.on_output(line.as_bytes()) {
+            t.settle(&e);
+            t.apply(&e);
+        }
+    }
+    let subs: Vec<_> = t.subagents().collect();
+    assert_eq!(subs.len(), 1, "{:?}", t.items());
+    let sub = subs[0];
+    let ItemDetail::Subagent {
+        agent,
+        description,
+        prompt,
+        child,
+        status,
+        output,
+        ..
+    } = sub.detail(Harness::Opencode)
+    else {
+        panic!("subagent detail")
+    };
+    assert_eq!(agent.as_deref(), Some("explore"));
+    assert_eq!(description, "List directory files");
+    assert!(prompt.unwrap().starts_with("List the files"));
+    assert_eq!(child.as_deref(), Some("ses_ed041c0e2ffeOlPhTtPjxjVhMz"));
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert!(output.unwrap().starts_with("Files in /tmp/acc-sub-spike"));
+
+    let children: Vec<_> = t.children(&sub.id).map(|i| (i.kind, i.text.as_str())).collect();
+    assert_eq!(children[0].0, ItemKind::ToolCall);
+    assert_eq!(
+        children[1],
+        (
+            ItemKind::AgentMessage,
+            "Files in /tmp/acc-sub-spike:\n- main.rs\n- README.txt"
+        )
+    );
+    // The main conversation's answer isn't the child's.
+    assert!(
+        t.top_level()
+            .any(|i| i.kind == ItemKind::AgentMessage && i.text.starts_with("The subagent found"))
+    );
+    assert!(
+        t.items()
+            .iter()
+            .all(|i| i.status != acc_core::transcript::ItemStatus::Running)
+    );
+}

@@ -30,6 +30,10 @@ pub enum Event {
     ItemStarted {
         id: ItemId,
         kind: ItemKind,
+        /// The subagent run this item belongs to (its [`ItemKind::Subagent`]
+        /// item in the same transcript), when it isn't the main conversation's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ItemId>,
         #[serde(default, skip_serializing_if = "Value::is_null")]
         extensions: Value,
     },
@@ -109,6 +113,10 @@ pub enum ItemKind {
     ToolCall,
     CommandExecution,
     FileChange,
+    /// A tool call that runs another agent (Claude's `Agent`, Codex's
+    /// collab tools, opencode's `task`, pi's `subagent`). Items of the child
+    /// conversation carry this item's id as their `parent`.
+    Subagent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

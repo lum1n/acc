@@ -6,6 +6,8 @@
 //! usage with nothing installed on the host, and tells ACC when the thread is
 //! at a safe point to take over with `thread/resume`.
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use crate::claude::transcript::whole_item;
@@ -45,6 +47,14 @@ pub struct Observer {
     framer: LineFramer,
     started: bool,
     state: Option<RunState>,
+    /// The spawning item a child thread's rollout belongs to.
+    parent: Option<String>,
+    /// Child threads this rollout spawned: thread id → `spawn_agent` call id.
+    children: HashMap<String, String>,
+    child_order: Vec<String>,
+    announced: usize,
+    /// `spawn_agent` calls waiting for their output (which names the thread).
+    spawning: HashMap<String, Value>,
 }
 
 impl Default for Observer {
@@ -59,7 +69,32 @@ impl Observer {
             framer: LineFramer::new(wire::MAX_FRAME),
             started: false,
             state: None,
+            parent: None,
+            children: HashMap::new(),
+            child_order: Vec::new(),
+            announced: 0,
+            spawning: HashMap::new(),
         }
+    }
+
+    /// A reader for a child thread's rollout, whose items belong to the
+    /// `spawn_agent` call `parent` in the parent's transcript.
+    pub fn for_child(parent: impl Into<String>) -> Self {
+        Self {
+            parent: Some(parent.into()),
+            ..Self::new()
+        }
+    }
+
+    /// Child threads spawned since the last call: `(thread id, call id)`.
+    /// Locate their rollouts with [`locate_script`].
+    pub fn take_new_children(&mut self) -> Vec<(String, String)> {
+        let new = self.child_order[self.announced..]
+            .iter()
+            .filter_map(|t| Some((t.clone(), self.children.get(t)?.clone())))
+            .collect();
+        self.announced = self.child_order.len();
+        new
     }
 
     pub fn state(&self) -> Option<&RunState> {
@@ -90,7 +125,7 @@ impl Observer {
         let p = v.get("payload").cloned().unwrap_or(Value::Null);
         match str_at(v, "type") {
             Some("response_item") => self.item(&p, v, out),
-            Some("session_meta") if !self.started => {
+            Some("session_meta") if !self.started && self.parent.is_none() => {
                 if let Some(id) = owned(&p, "id") {
                     self.started = true;
                     out.push(Event::SessionStarted {
@@ -123,7 +158,7 @@ impl Observer {
                         out,
                     );
                 }
-                Some("token_count") => self.token_count(&p, out),
+                Some("token_count") if self.parent.is_none() => self.token_count(&p, out),
                 _ => {}
             },
             _ => {}
@@ -158,13 +193,20 @@ impl Observer {
                 // Context Codex injects as user messages isn't the user's.
                 let injected = text.trim_start().starts_with('<') || text.starts_with("# AGENTS.md");
                 if !text.is_empty() && !(kind == ItemKind::UserMessage && injected) {
-                    whole_item(out, id, kind, text, Value::Null);
+                    whole_item(out, id, kind, self.parent.clone(), text, Value::Null);
                 }
             }
             Some("reasoning") => {
                 let text = text_of("summary");
                 if !text.is_empty() {
-                    whole_item(out, id, ItemKind::Reasoning, text, Value::Null);
+                    whole_item(
+                        out,
+                        id,
+                        ItemKind::Reasoning,
+                        self.parent.clone(),
+                        text,
+                        Value::Null,
+                    );
                 }
             }
             Some("function_call" | "custom_tool_call" | "local_shell_call") => {
@@ -189,6 +231,25 @@ impl Observer {
                         ItemKind::CommandExecution,
                         json!({"type": "commandExecution", "command": command, "cwd": args.get("workdir")}),
                     )
+                } else if let Some(tool) = collab_tool(name) {
+                    if tool == "spawnAgent" {
+                        self.spawning.insert(call.clone(), args.clone());
+                    }
+                    let target = args
+                        .get("id")
+                        .or_else(|| args.get("agent_id"))
+                        .or_else(|| args.get("target"))
+                        .and_then(Value::as_str)
+                        .map(|t| vec![Value::String(t.to_owned())])
+                        .unwrap_or_default();
+                    (
+                        ItemKind::Subagent,
+                        json!({"type": "collabAgentToolCall", "tool": tool,
+                               "prompt": args.get("message").or_else(|| args.get("prompt")).or_else(|| args.get("task")),
+                               "agent": args.get("agent_type").or_else(|| args.get("nickname")).or_else(|| args.get("task_name")),
+                               "model": args.get("model"),
+                               "receiverThreadIds": target}),
+                    )
                 } else if name == "apply_patch" {
                     let patch = str_at(p, "input")
                         .or_else(|| str_at(&args, "input"))
@@ -211,6 +272,7 @@ impl Observer {
                 out.push(Event::ItemStarted {
                     id: call,
                     kind,
+                    parent: None,
                     extensions: ext,
                 });
             }
@@ -230,6 +292,27 @@ impl Observer {
                     .cloned()
                     .unwrap_or(Value::Null);
                 let failed = exit.as_i64().is_some_and(|c| c != 0);
+                if let Some(_args) = self.spawning.remove(&call) {
+                    // `spawn_agent` answers with the new agent's thread id.
+                    let thread = owned(&parsed, "agent_id")
+                        .or_else(|| owned(&parsed, "id"))
+                        .or_else(|| owned(&parsed, "thread_id"))
+                        .or_else(|| thread_id_in(&output));
+                    if let Some(t) = &thread
+                        && !self.children.contains_key(t)
+                    {
+                        self.children.insert(t.clone(), call.clone());
+                        self.child_order.push(t.clone());
+                    }
+                    out.push(Event::ItemCompleted {
+                        id: call,
+                        extensions: json!({
+                            "receiverThreadIds": thread.map(|t| vec![t]).unwrap_or_default(),
+                            "status": "completed",
+                        }),
+                    });
+                    return;
+                }
                 out.push(Event::ItemCompleted {
                     id: call,
                     extensions: json!({
@@ -282,6 +365,17 @@ impl Observer {
     }
 
     fn set(&mut self, state: RunState, out: &mut Vec<Event>) {
+        if let Some(parent) = &self.parent {
+            // A child thread's turn ending is its parent call's report.
+            if matches!(state, RunState::Done | RunState::Error) {
+                out.push(Event::ItemUpdated {
+                    id: parent.clone(),
+                    extensions: json!({"childStatus": if state == RunState::Done { "completed" } else { "errored" }}),
+                });
+            }
+            self.state = Some(state);
+            return;
+        }
         if self.state.as_ref() == Some(&state) {
             return;
         }
@@ -293,6 +387,32 @@ impl Observer {
             observed_at_ms: 0,
         }));
     }
+}
+
+/// The app-server name of a collab tool the model calls by its function name.
+fn collab_tool(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "spawn_agent" => "spawnAgent",
+        "send_input" | "send_message" | "assign_agent_task" => "sendInput",
+        "wait_agent" | "wait" => "wait",
+        "close_agent" => "closeAgent",
+        "resume_agent" => "resumeAgent",
+        _ => return None,
+    })
+}
+
+/// The first UUID-shaped word in a tool output (a thread id).
+fn thread_id_in(text: &str) -> Option<String> {
+    text.split(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
+        .find(|w| w.len() == 36 && w.bytes().filter(|b| *b == b'-').count() == 4)
+        .map(str::to_owned)
+}
+
+/// The thread a child rollout's `session_meta` says spawned it.
+pub fn parent_thread(session_meta: &Value) -> Option<&str> {
+    session_meta
+        .pointer("/payload/source/subagent/thread_spawn/parent_thread_id")
+        .and_then(Value::as_str)
 }
 
 #[cfg(test)]
@@ -406,6 +526,72 @@ mod tests {
         assert_eq!(q.plan.as_deref(), Some("pro"));
         assert_eq!(q.windows.len(), 1);
         assert_eq!(q.windows[0].used_percent, Some(12.5));
+    }
+
+    /// Shaped from the 0.128 binary's tool names; not recorded.
+    #[test]
+    fn spawn_agent_is_a_subagent_and_names_its_thread() {
+        let child = "019a0000-0000-7000-8000-00000000c41d";
+        let lines = [
+            json!({"type": "response_item", "payload": {"type": "function_call", "name": "spawn_agent",
+                "call_id": "c9", "arguments": "{\"message\":\"Count lines\",\"agent_type\":\"explorer\"}"}}),
+            json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c9",
+                "output": format!("{{\"agent_id\":\"{child}\",\"nickname\":\"Lovelace\"}}")}}),
+        ];
+        let mut o = Observer::new();
+        let mut t = crate::transcript::Transcript::new();
+        for l in &lines {
+            for e in o.feed(format!("{l}\n").as_bytes()) {
+                t.apply(&e);
+            }
+        }
+        let item = t.get("c9").unwrap();
+        assert_eq!(item.kind, ItemKind::Subagent);
+        let crate::item::ItemDetail::Subagent {
+            agent,
+            child: c,
+            prompt,
+            ..
+        } = item.detail(Harness::Codex)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (agent.as_deref(), prompt.as_deref()),
+            (Some("explorer"), Some("Count lines"))
+        );
+        assert_eq!(c.as_deref(), Some(child));
+        assert_eq!(o.take_new_children(), [(child.to_owned(), "c9".to_owned())]);
+        assert!(o.take_new_children().is_empty());
+
+        // The child's rollout: its items hang off the spawn call.
+        let mut c = Observer::for_child("c9");
+        let child_lines = [
+            json!({"type": "session_meta", "payload": {"id": child, "source": {"subagent": {"thread_spawn": {"parent_thread_id": "p", "depth": 1}}}}}),
+            json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "m1",
+                "content": [{"type": "output_text", "text": "3 lines"}]}}),
+            json!({"type": "event_msg", "payload": {"type": "task_complete"}}),
+        ];
+        assert_eq!(parent_thread(&child_lines[0]), Some("p"));
+        let mut events = Vec::new();
+        for l in &child_lines {
+            events.extend(c.feed(format!("{l}\n").as_bytes()));
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::SessionStarted { .. } | Event::StateChanged(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ItemStarted { parent: Some(p), .. } if p == "c9"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ItemUpdated { id, .. } if id == "c9"))
+        );
     }
 
     #[test]

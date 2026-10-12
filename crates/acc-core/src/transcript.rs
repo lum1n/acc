@@ -110,6 +110,24 @@ impl Transcript {
         self.items.is_empty()
     }
 
+    /// The items of the main conversation: everything not inside a subagent run.
+    pub fn top_level(&self) -> impl Iterator<Item = &Item> {
+        self.items.iter().filter(|i| i.parent.is_none())
+    }
+
+    /// The items a subagent run produced, in order: the child conversation
+    /// of the [`ItemKind::Subagent`] item `parent`.
+    pub fn children<'a>(&'a self, parent: &'a str) -> impl Iterator<Item = &'a Item> + 'a {
+        self.items
+            .iter()
+            .filter(move |i| i.parent.as_deref() == Some(parent))
+    }
+
+    /// Every subagent run in the session, in order.
+    pub fn subagents(&self) -> impl Iterator<Item = &Item> {
+        self.items.iter().filter(|i| i.kind == ItemKind::Subagent)
+    }
+
     /// Rebuilds the id index after deserializing.
     pub fn reindex(&mut self) {
         self.index = self
@@ -137,16 +155,31 @@ impl Transcript {
     /// the turn ended, the session went idle (interrupted), finished,
     /// failed, or the process exited. Harnesses don't always complete
     /// every tool call they started, which would otherwise spin forever.
+    ///
+    /// A subagent launched in the background outlives the turn that started
+    /// it, so it stays running until it reports back or the process exits.
     pub fn settle(&mut self, event: &Event) -> Vec<ItemChange> {
-        let ends = match event {
-            Event::TurnCompleted | Event::Exited { .. } => true,
-            Event::StateChanged(s) => matches!(
-                s.state,
-                RunState::Idle | RunState::Done | RunState::Error | RunState::Exited
-            ),
-            _ => false,
-        };
-        if ends { self.close_running() } else { Vec::new() }
+        let exits = matches!(event, Event::Exited { .. })
+            || matches!(event, Event::StateChanged(s) if s.state == RunState::Exited);
+        let ends = exits
+            || match event {
+                Event::TurnCompleted => true,
+                Event::StateChanged(s) => {
+                    matches!(s.state, RunState::Idle | RunState::Done | RunState::Error)
+                }
+                _ => false,
+            };
+        if !ends {
+            return Vec::new();
+        }
+        self.items
+            .iter_mut()
+            .filter(|i| i.status == ItemStatus::Running && (exits || !in_background(i)))
+            .map(|i| {
+                i.status = ItemStatus::Completed;
+                ItemChange::Completed { id: i.id.clone() }
+            })
+            .collect()
     }
 
     fn slot(&mut self, id: &str, kind: ItemKind) -> (&mut Item, bool) {
@@ -172,11 +205,19 @@ impl Transcript {
     /// aren't about items (or refer to an unknown item).
     pub fn apply(&mut self, event: &Event) -> Option<ItemChange> {
         match event {
-            Event::ItemStarted { id, kind, extensions } => {
+            Event::ItemStarted {
+                id,
+                kind,
+                parent: reported,
+                extensions,
+            } => {
                 let (item, new) = self.slot(id, *kind);
                 item.kind = *kind;
                 merge(&mut item.ext, extensions);
-                item.parent = parent(extensions).or(item.parent.take());
+                item.parent = reported
+                    .clone()
+                    .or_else(|| parent(extensions))
+                    .or(item.parent.take());
                 Some(if new {
                     ItemChange::Started { id: id.clone() }
                 } else {
@@ -242,6 +283,14 @@ fn parent(ext: &Value) -> Option<ItemId> {
     owned(ext, "parent_tool_use_id").or_else(|| owned(ext, "parentToolCallId"))
 }
 
+/// A subagent the harness runs in the background (Claude's `isAsync`
+/// launch, a `task` record still running).
+fn in_background(item: &Item) -> bool {
+    item.kind == ItemKind::Subagent
+        && (item.ext.pointer("/result/isAsync").and_then(Value::as_bool) == Some(true)
+            || item.ext.pointer("/task/is_backgrounded").and_then(Value::as_bool) == Some(true))
+}
+
 fn failed(ext: &Value) -> bool {
     ext.get("is_error").and_then(Value::as_bool) == Some(true)
         || matches!(
@@ -264,6 +313,7 @@ mod tests {
             t.apply(&Event::ItemStarted {
                 id: id.clone(),
                 kind: ItemKind::AgentMessage,
+                parent: None,
                 extensions: Value::Null
             }),
             Some(ItemChange::Started { id: id.clone() })
@@ -293,6 +343,7 @@ mod tests {
         t.apply(&Event::ItemStarted {
             id: "t".into(),
             kind: ItemKind::CommandExecution,
+            parent: None,
             extensions: json!({"name": "Bash", "input": {"command": "false"}, "parent_tool_use_id": "p"}),
         });
         t.apply(&Event::ItemCompleted {
@@ -308,11 +359,60 @@ mod tests {
     }
 
     #[test]
+    fn subagent_children_and_top_level() {
+        let mut t = Transcript::new();
+        let start = |id: &str, kind, parent: Option<&str>, ext: Value| Event::ItemStarted {
+            id: id.into(),
+            kind,
+            parent: parent.map(Into::into),
+            extensions: ext,
+        };
+        t.apply(&start("p", ItemKind::UserMessage, None, Value::Null));
+        t.apply(&start("s", ItemKind::Subagent, None, Value::Null));
+        t.apply(&start("c1", ItemKind::ToolCall, Some("s"), Value::Null));
+        // The extension key still works for logs written before `parent`.
+        t.apply(&start(
+            "c2",
+            ItemKind::AgentMessage,
+            None,
+            json!({"parent_tool_use_id": "s"}),
+        ));
+        t.apply(&start("a", ItemKind::AgentMessage, None, Value::Null));
+        let ids = |it: Vec<&Item>| it.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(t.top_level().collect()), ["p", "s", "a"]);
+        assert_eq!(ids(t.children("s").collect()), ["c1", "c2"]);
+        assert_eq!(ids(t.subagents().collect()), ["s"]);
+        // Old serialized events without `parent` still parse.
+        let old: Event =
+            serde_json::from_str(r#"{"type":"item_started","id":"x","kind":"tool_call"}"#).unwrap();
+        assert!(matches!(old, Event::ItemStarted { parent: None, .. }));
+    }
+
+    #[test]
+    fn background_subagents_outlive_the_turn() {
+        let mut t = Transcript::new();
+        t.apply(&Event::ItemStarted {
+            id: "bg".into(),
+            kind: ItemKind::Subagent,
+            parent: None,
+            extensions: json!({"name": "Agent"}),
+        });
+        t.apply(&Event::ItemUpdated {
+            id: "bg".into(),
+            extensions: json!({"result": {"isAsync": true, "agentId": "a1"}}),
+        });
+        assert!(t.settle(&Event::TurnCompleted).is_empty());
+        assert_eq!(t.get("bg").unwrap().status, ItemStatus::Running);
+        assert_eq!(t.settle(&Event::Exited { code: Some(0) }).len(), 1);
+    }
+
+    #[test]
     fn turn_end_closes_tools_left_running() {
         let mut t = Transcript::new();
         t.apply(&Event::ItemStarted {
             id: "t".into(),
             kind: ItemKind::ToolCall,
+            parent: None,
             extensions: Value::Null,
         });
         let working = Event::StateChanged(crate::state::SessionState {

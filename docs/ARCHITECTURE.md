@@ -129,6 +129,35 @@ file, with byte offsets so a restarted follower resumes without loss; closing th
 its processes down. One long-lived channel per host keeps a client inside sshd's per-connection
 session limit however many agents run.
 
+## Subagents
+
+A tool call that runs another agent (Claude's `Agent`, Codex's collab tools `spawn_agent` /
+`send_input` / `wait_agent` / `close_agent` / `resume_agent`, opencode's `task`, pi's `subagent`) is
+`ItemKind::Subagent`. Its typed view, `item::ItemDetail::Subagent`, carries the agent type, the task,
+the harness's id for the child conversation, its status and its report. Every item of that child
+conversation — messages, tool calls, commands — carries the subagent item's id as `Event::ItemStarted`'s
+`parent`, so `Transcript::children(id)` is the run's own conversation and `Transcript::top_level()` is
+the main one with every subagent folded away; `Transcript::subagents()` lists the runs themselves.
+
+A subagent launched in the background outlives the turn that started it: `Transcript::settle` leaves
+it `Running` until it reports back (or the process exits), so a client doesn't show it as finished
+early.
+
+| Harness | How a subagent shows up | Child conversation |
+|---|---|---|
+| Claude | `Agent`/`Task` tool call; `system/task_started`, `task_progress`, `task_updated`, `task_notification` merge onto it; a background launch's tool result only acknowledges (`isAsync`), the notification finishes it | `~/.claude/projects/<proj>/<session>/subagents/agent-<id>.jsonl`, named by `agent-<id>.meta.json`'s `toolUseId`; `Driver::launch` adds `--forward-subagent-text` so a driven session streams it live too |
+| Codex | `collabAgentToolCall` item (`spawnAgent`, ...); `thread/started` with `source.subAgent.thread_spawn.parent_thread_id` names the child thread | the child's own thread: its `item/*` notifications carry its `threadId`, mapped back to the spawning item |
+| Cursor, Copilot, opencode (ACP) | a `task`/`subagent`-shaped tool call (name, or `rawInput.subagent_type`/`agent` with a prompt); the report is opencode's `task_id: …`/`<task_result>` (1.x) or `<subagent sessionID="…">` (2.0) wrapper, unwrapped by `item::detail` | opencode forwards the child session's updates under the parent's session id, tagged `_meta["opencode/child-session"]`; other agents report only the final text |
+| pi | the pi-subagents extension's `subagent` tool | none (no child transcript) |
+
+**Observing** (a TUI ACC didn't start): `Observed::children_exec` finds subagent transcripts not
+followed yet — Claude's `subagents_script` next to the session, Codex's rollout `locate_script` for a
+spawned thread id — and `Observed::on_children` matches what it finds to the spawning item.
+`Observed::child_feed_entries` joins the session's own entry in the client's fan-in; `Observed::feed_child`
+routes each child's bytes through its own reader (`claude::transcript::Observer::for_subagent`,
+`codex::rollout::Observer::for_child`), whose items carry the spawning item as `parent` and whose state
+and usage are the parent's, not reported again.
+
 ## Foreign sessions
 
 `discover` lists harness TUIs ACC didn't start: process, working directory, multiplexer pane (from
