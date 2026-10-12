@@ -20,7 +20,8 @@
 //! - Commands: the palette comes from the `initialize` reply and
 //!   `system/commands_changed`; slash commands run by sending `/name args` as
 //!   a user message. Model, effort, permission mode and rename use dedicated
-//!   control requests.
+//!   control requests. `/plan`, which Claude only runs in its TUI and never
+//!   lists headless, is `set_permission_mode` plus `get_plan`.
 //! - Usage: `result` (tokens, cost), `get_context_usage` (context fill) and
 //!   `rate_limit_event` (subscription windows).
 //!
@@ -78,6 +79,12 @@ const PANELS: [(&str, &str, &str); 5] = [
     ("hooks", "Configured hooks", "get_hooks_listing"),
 ];
 
+/// `/plan` as Claude's TUI describes it (2.1.280: `[open|<description>]`,
+/// `requires: { ink }`). Headless it is neither listed nor accepted as text,
+/// so ACC runs it itself: `set_permission_mode` into plan mode, the
+/// description as the first prompt, and `get_plan` to show the plan.
+const PLAN_DESCRIPTION: &str = "Enable plan mode or view the current session plan";
+
 /// Launch-time settings. Everything else changes at runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeConfig {
@@ -101,6 +108,12 @@ enum Pending {
     SetModel(String),
     SetEffort(String),
     SetPermission(String),
+    /// `/plan`: entering plan mode. Once Claude confirms, `prompt` goes out
+    /// as the first planning turn and `view` fetches the plan panel.
+    Plan {
+        prompt: Option<String>,
+        view: bool,
+    },
     /// A dialog's data, drawn as the panel for this palette entry.
     Panel(&'static str),
     /// An action from a panel; the panel is fetched again afterwards.
@@ -864,6 +877,20 @@ impl ClaudeDriver {
                 self.set_option_current(OptionId::Permission, mode);
                 out.push(Event::OptionsChanged);
             }
+            Pending::Plan { prompt, view } => {
+                self.set_option_current(OptionId::Permission, "plan".into());
+                out.push(Event::OptionsChanged);
+                out.push(Event::Notice {
+                    message: "Entered plan mode".into(),
+                });
+                if let Some(prompt) = prompt {
+                    self.transmit.extend(Self::user_text(&prompt));
+                }
+                if view {
+                    let bytes = self.open_panel("plan");
+                    self.transmit.extend(bytes);
+                }
+            }
             Pending::Panel(id) => out.push(Event::Panel(panel(id, &body))),
             Pending::PanelAction(id) => {
                 let bytes = self.open_panel(id);
@@ -961,6 +988,21 @@ impl ClaudeDriver {
                 None => entries.push(CommandEntry::rpc(name, description, None, subtype)),
             }
         }
+        // `/plan` is TUI-only and unlisted headless; ACC runs it over the
+        // protocol (see `plan`). Listed in a future version, it is taken over.
+        let plan = CommandEntry::rpc(
+            "plan",
+            PLAN_DESCRIPTION,
+            Some("[<description>]"),
+            "set_permission_mode",
+        );
+        match entries.iter_mut().find(|e| e.name == "plan") {
+            Some(e) => {
+                e.exec = plan.exec;
+                e.arg_hint = plan.arg_hint;
+            }
+            None => entries.push(plan),
+        }
         // Terminal-only commands with a control request behind them.
         if self.hidden_commands.iter().any(|c| c == "reload-plugins") {
             entries.push(CommandEntry::rpc(
@@ -1055,6 +1097,7 @@ impl ClaudeDriver {
             ("effort", a) if !a.is_empty() => return self.command(set(OptionId::Effort)),
             ("mode", "") => return Err(DriverError::MissingArgument("a permission mode")),
             ("mode", _) => return self.command(set(OptionId::Permission)),
+            ("plan", a) => return self.plan(a),
             ("rename", a) if !a.is_empty() => {
                 return self.command(Command::Rename { name: a.to_owned() });
             }
@@ -1083,10 +1126,46 @@ impl ClaudeDriver {
         })
     }
 
+    /// `/plan [open|<description>]`, as Claude's TUI runs it: outside plan
+    /// mode it enters plan mode, then sends the description as the first
+    /// prompt; in plan mode it shows the plan. `open` (the plan file in a
+    /// local editor) shows the plan too; `share` (Ultraplan) has no headless
+    /// equivalent.
+    fn plan(&mut self, args: &str) -> Result<Vec<u8>, DriverError> {
+        let planning = self
+            .options
+            .iter()
+            .find(|o| o.id == OptionId::Permission)
+            .and_then(|o| o.current.as_deref())
+            == Some("plan");
+        let view = args.is_empty() || args == "open";
+        Ok(match (planning, view) {
+            _ if args == "share" => {
+                return Err(DriverError::Unsupported {
+                    harness: Harness::Claude,
+                    what: "sharing a plan with Ultraplan",
+                });
+            }
+            (true, true) => self.open_panel("plan"),
+            (true, false) => Self::user_text(args),
+            (false, view) => self.control(
+                json!({"subtype": "set_permission_mode", "mode": "plan"}),
+                Pending::Plan {
+                    prompt: (!view).then(|| args.to_owned()),
+                    view: args == "open",
+                },
+            ),
+        })
+    }
+
     /// Asks for the data behind panel `id`.
     fn open_panel(&mut self, id: &'static str) -> Vec<u8> {
-        match PANELS.iter().find(|(p, ..)| *p == id) {
-            Some((id, _, subtype)) => self.control(json!({"subtype": subtype}), Pending::Panel(id)),
+        let subtype = match id {
+            "plan" => Some("get_plan"),
+            _ => PANELS.iter().find(|(p, ..)| *p == id).map(|(.., s)| *s),
+        };
+        match subtype {
+            Some(subtype) => self.control(json!({"subtype": subtype}), Pending::Panel(id)),
             None => Vec::new(),
         }
     }
@@ -1463,6 +1542,21 @@ fn panel(id: &str, body: &Value) -> Panel {
                 });
             }
         }
+        "plan" => {
+            panel.title = "Plan".into();
+            let rows = match owned(body, "content").filter(|c| !c.trim().is_empty()) {
+                Some(content) => plan_rows(&content),
+                None => vec![PanelRow {
+                    label: "No plan written yet".into(),
+                    ..PanelRow::default()
+                }],
+            };
+            panel.sections.push(PanelSection {
+                title: text(body, "path"),
+                rows,
+                ..PanelSection::default()
+            });
+        }
         "hooks" => {
             panel.title = "Hooks".into();
             let hooks = list(body, "hooks");
@@ -1495,6 +1589,49 @@ fn panel(id: &str, body: &Value) -> Panel {
         _ => {}
     }
     panel
+}
+
+/// A plan's markdown as panel rows: one per heading, with the text under it
+/// as the detail. Text before the first heading is the "Plan" row.
+fn plan_rows(markdown: &str) -> Vec<PanelRow> {
+    let mut rows: Vec<PanelRow> = Vec::new();
+    let mut body = String::new();
+    let mut label = "Plan".to_owned();
+    let flush = |rows: &mut Vec<PanelRow>, label: &str, body: &mut String| {
+        let detail = body.trim();
+        if !detail.is_empty() || label != "Plan" {
+            rows.push(PanelRow {
+                label: label.to_owned(),
+                detail: Some(detail.to_owned()).filter(|d| !d.is_empty()),
+                ..PanelRow::default()
+            });
+        }
+        body.clear();
+    };
+    let mut fenced = false;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        let heading = (!fenced)
+            .then(|| line.strip_prefix('#'))
+            .flatten()
+            .map(|rest| rest.trim_start_matches('#'))
+            .filter(|rest| rest.starts_with(' '))
+            .map(str::trim);
+        match heading {
+            Some(h) => {
+                flush(&mut rows, &label, &mut body);
+                label = h.to_owned();
+            }
+            None => {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+    }
+    flush(&mut rows, &label, &mut body);
+    rows
 }
 
 fn capitalize(s: &str) -> String {

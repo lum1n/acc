@@ -691,3 +691,94 @@ fn terminal_commands_are_known_before_the_first_turn() {
     assert_eq!(choices[1].value, "Concise");
     assert!(!required);
 }
+
+#[test]
+fn plan_enters_plan_mode_then_sends_the_description() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    // Claude never lists /plan headless; ACC offers it anyway.
+    let plan = d.commands().iter().find(|c| c.name == "plan").unwrap();
+    assert_eq!(plan.arg_hint.as_deref(), Some("[<description>]"));
+    assert_ne!(plan.exec, Exec::Terminal);
+
+    let req = invoke(&mut d, "plan", "add caching to the feed").unwrap();
+    assert_eq!(req.len(), 1, "the prompt waits for plan mode: {req:?}");
+    assert_eq!(
+        req[0]["request"],
+        json!({"subtype": "set_permission_mode", "mode": "plan"})
+    );
+    let events = d.on_output(control_reply(&req[0]["request_id"], json!({})).as_bytes());
+    assert!(events.contains(&Event::OptionsChanged));
+    let perm = d.options().iter().find(|o| o.id == OptionId::Permission).unwrap();
+    assert_eq!(perm.current.as_deref(), Some("plan"));
+    let prompt = sent(&d.poll_transmit());
+    assert_eq!(prompt[0]["type"], "user");
+    assert_eq!(prompt[0]["message"]["content"], "add caching to the feed");
+
+    // Already planning: a description is just the next prompt.
+    let again = invoke(&mut d, "plan", "also cover invalidation").unwrap();
+    assert_eq!(again[0]["message"]["content"], "also cover invalidation");
+    assert!(matches!(
+        invoke(&mut d, "plan", "share"),
+        Err(DriverError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn plan_shows_the_plan_once_planning() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    // Bare /plan outside plan mode only enters it.
+    let enter = invoke(&mut d, "plan", "").unwrap();
+    assert_eq!(enter[0]["request"]["subtype"], "set_permission_mode");
+    d.on_output(control_reply(&enter[0]["request_id"], json!({})).as_bytes());
+    assert!(d.poll_transmit().is_empty());
+
+    let req = invoke(&mut d, "plan", "").unwrap();
+    assert_eq!(req[0]["request"], json!({"subtype": "get_plan"}));
+    let events = d.on_output(
+        control_reply(
+            &req[0]["request_id"],
+            json!({"exists": true, "path": "/home/v/.claude/plans/feed-cache.md",
+                   "content": "Cache the feed.\n\n# Context\nThe feed is slow.\n\n## Steps\n1. Add a cache\n```\n# not a heading\n```\n"}),
+        )
+        .as_bytes(),
+    );
+    let Some(Event::Panel(panel)) = events.first() else {
+        panic!("no panel in {events:?}");
+    };
+    assert_eq!(panel.id, "plan");
+    let section = &panel.sections[0];
+    assert_eq!(
+        section.title.as_deref(),
+        Some("/home/v/.claude/plans/feed-cache.md")
+    );
+    let labels: Vec<_> = section.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["Plan", "Context", "Steps"]);
+    assert_eq!(section.rows[0].detail.as_deref(), Some("Cache the feed."));
+    assert_eq!(
+        section.rows[2].detail.as_deref(),
+        Some("1. Add a cache\n```\n# not a heading\n```")
+    );
+
+    // `open` shows the plan too; no plan yet says so.
+    let req = invoke(&mut d, "plan", "open").unwrap();
+    assert_eq!(req[0]["request"]["subtype"], "get_plan");
+    let events = d.on_output(control_reply(&req[0]["request_id"], json!({"exists": false})).as_bytes());
+    let Some(Event::Panel(panel)) = events.first() else {
+        panic!("no panel in {events:?}");
+    };
+    assert_eq!(panel.sections[0].rows[0].label, "No plan written yet");
+}
+
+#[test]
+fn plan_open_outside_plan_mode_enters_it_then_shows_the_plan() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let enter = invoke(&mut d, "plan", "open").unwrap();
+    assert_eq!(enter[0]["request"]["subtype"], "set_permission_mode");
+    d.on_output(control_reply(&enter[0]["request_id"], json!({})).as_bytes());
+    let next = sent(&d.poll_transmit());
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0]["request"]["subtype"], "get_plan");
+}

@@ -73,10 +73,13 @@ describe what a client has to draw:
   driver fetches the panel again. Panels answer only the client that asked.
 - `Exec::Terminal`: nothing on the wire can run it (Claude's `/doctor`); clients open the
   harness's TUI with `tui_command`.
+- Commands a TUI runs itself and never lists headless are re-created from protocol calls: Claude's
+  `/plan [<description>]` is `set_permission_mode` into plan mode, the description sent as the first
+  prompt once Claude confirms, and `get_plan` as a panel when already planning.
 
 | Harness | Pickers | Panels |
 |---|---|---|
-| Claude | model, effort, mode (permission mode), output-style | mcp (reconnect, enable, disable), status, permissions, memory, hooks; reload-plugins |
+| Claude | model, effort, mode (permission mode), output-style | mcp (reconnect, enable, disable), status, permissions, memory, hooks, plan (the session plan); reload-plugins |
 | Codex | model, effort, mode, permissions | mcp (reload, OAuth login), status, experimental (toggle) |
 | Cursor, Copilot, opencode | whatever `configOptions` reports | none: ACP has no such requests |
 | pi | model, thinking | session, settings (auto-compaction, queueing), fork (pick a message); export |
