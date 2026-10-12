@@ -578,9 +578,21 @@ fn resumed_history_is_replayed_as_items() {
 }
 
 #[test]
-fn prompt_before_thread_is_not_started() {
+fn prompt_before_thread_is_queued_not_dropped() {
     let mut d = CodexDriver::default();
-    assert_eq!(d.command(Command::prompt("x")), Err(DriverError::NotStarted));
+    let bytes = d.command(Command::prompt("x")).expect("queued");
+    assert!(bytes.is_empty());
+
+    d.handshake();
+    replay(&mut d, HANDSHAKE);
+
+    let msgs = sent(&d.poll_transmit());
+    let turn = msgs
+        .iter()
+        .find(|m| m["method"] == "turn/start")
+        .expect("the queued prompt went out once the thread opened");
+    assert_eq!(turn["params"]["threadId"], THREAD);
+    assert_eq!(turn["params"]["input"][0]["text"], "x");
 }
 
 #[test]

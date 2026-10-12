@@ -3,6 +3,8 @@
 //! exactly what the mobile client does over an SSH exec channel.
 
 mod acp;
+mod live;
+mod run;
 
 use std::io::{Read as _, Write as _};
 use std::process::{Command, ExitCode};
@@ -23,6 +25,9 @@ usage:
                                         drive an ACP harness (cursor, copilot, opencode);
                                         stdin lines are JSON commands (prompts may carry
                                         image attachments) or prompt text
+  acc run <harness> <cwd> [--resume ID] [--model M] [--program PATH]
+                                        drive claude, codex or pi the same way;
+                                        same stdin/stdout contract as `acc acp`
   acc osc7501                           read terminal bytes on stdin, print OSC 7501 messages as JSON
   acc script launch <harness> <id> <cwd> [resume-id]
   acc script attach <id> [offset]
@@ -50,6 +55,13 @@ fn main() -> ExitCode {
                 Err(format!("{} has no native ACP server", h.display_name()))
             }
         }) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("acc: {e}");
+                ExitCode::from(2)
+            }
+        },
+        ["run", harness, rest @ ..] => match parse_harness(harness).and_then(|h| run::run(h, rest)) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("acc: {e}");

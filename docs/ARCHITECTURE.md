@@ -66,7 +66,13 @@ spawn flag (`agent --model X acp`), reported as `Apply::Restart`. Slash commands
 from `available_commands_update`. Request ids carry a per-client tag, and `Start::Attach` lets a second
 client (or a reconnect) adopt a running agent from its log, reading other clients' responses by shape.
 `acc acp <harness> <cwd>` drives one locally for spikes. Recorded Copilot 1.0.95 and opencode 1.18.35
-sessions under `crates/acc-core/tests/fixtures/acp` are replayed in CI.
+sessions under `crates/acc-core/tests/fixtures/acp` are replayed in CI. `acc run <harness> <cwd>`
+is the same kind of spike tool for Claude, Codex and pi, over their own drivers
+(`acc_core::{claude,codex,pi}`). Both share the drive loop in `acc-cli/src/live.rs`: spawn, write the
+handshake, then pump bytes. A prompt sent before the driver has a session (`AcpDriver` before
+`session/new` answers, `CodexDriver` before `thread/start`/`thread/resume` answers) is queued and
+flushed once it does, rather than dropped with `DriverError::NotStarted`; Claude, pi and the rest of
+ACP's commands have no such readiness gate.
 
 ## Interactive commands
 

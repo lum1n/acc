@@ -141,6 +141,9 @@ pub struct CodexDriver {
     child_threads: HashMap<String, String>,
     /// `spawnAgent` items that haven't named their thread yet, oldest first.
     unclaimed_spawns: Vec<String>,
+    /// Prompts sent before `thread/start` or `thread/resume` answered,
+    /// flushed in order once the thread opens.
+    queued_prompts: Vec<(String, Vec<Attachment>)>,
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
     transmit: Vec<u8>,
@@ -174,6 +177,7 @@ impl CodexDriver {
             skills: Vec::new(),
             child_threads: HashMap::new(),
             unclaimed_spawns: Vec::new(),
+            queued_prompts: Vec::new(),
             commands: Vec::new(),
             options: Vec::new(),
             transmit: Vec::new(),
@@ -400,6 +404,11 @@ impl CodexDriver {
             RunState::Idle
         };
         self.set_state(state, None, out);
+        for (text, attachments) in std::mem::take(&mut self.queued_prompts) {
+            if let Ok(bytes) = self.try_prompt(text, attachments) {
+                self.transmit.extend(bytes);
+            }
+        }
     }
 
     // ---- notifications ---------------------------------------------------
@@ -1128,6 +1137,18 @@ impl CodexDriver {
         }
     }
 
+    /// Builds a turn's input blocks and sends it, for a prompt whose thread
+    /// is ready (either immediately, or flushed from
+    /// [`Self::queued_prompts`]).
+    fn try_prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<Vec<u8>, DriverError> {
+        let mut input = Vec::new();
+        if !text.is_empty() || attachments.is_empty() {
+            input.push(text_input(&text));
+        }
+        input.extend(attachments.iter().map(image_input));
+        self.turn(input)
+    }
+
     /// `turn/start`, or `turn/steer` while a turn is running.
     fn turn(&mut self, input: Vec<Value>) -> Result<Vec<u8>, DriverError> {
         let thread = self.thread()?;
@@ -1242,12 +1263,14 @@ impl Driver for CodexDriver {
         match cmd {
             Command::Prompt { text, attachments } => {
                 validate_attachments(&attachments)?;
-                let mut input = Vec::new();
-                if !text.is_empty() || attachments.is_empty() {
-                    input.push(text_input(&text));
+                // `thread/start` or `thread/resume` hasn't answered yet: hold
+                // the prompt instead of `turn()` dropping it with
+                // `DriverError::NotStarted`, and send it once the thread opens.
+                if self.thread_id.is_none() {
+                    self.queued_prompts.push((text, attachments));
+                    return Ok(Vec::new());
                 }
-                input.extend(attachments.iter().map(image_input));
-                self.turn(input)
+                self.try_prompt(text, attachments)
             }
             Command::Interrupt => match (self.thread_id.clone(), self.turn_id.clone()) {
                 (Some(thread), Some(turn)) => Ok(self.request(
