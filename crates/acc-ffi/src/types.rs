@@ -58,6 +58,7 @@ pub enum AccRunState {
     Working { progress: Option<u8> },
     Blocked { kind: AccBlockKind },
     Done,
+    Waiting,
     Error,
     Exited,
 }
@@ -69,6 +70,7 @@ impl From<RunState> for AccRunState {
             RunState::Working { progress } => Self::Working { progress },
             RunState::Blocked { kind } => Self::Blocked { kind: kind.into() },
             RunState::Done => Self::Done,
+            RunState::Waiting => Self::Waiting,
             RunState::Error => Self::Error,
             RunState::Exited => Self::Exited,
         }

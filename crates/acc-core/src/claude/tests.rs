@@ -939,3 +939,40 @@ fn launch_forwards_subagent_text() {
     let spec = ClaudeDriver::default().launch(None);
     assert!(spec.args.iter().any(|a| a == "--forward-subagent-text"));
 }
+
+/// Claude Code 2.1.280: a turn launches a background `Agent` call and ends
+/// before it reports back; the report then wakes the model for a second turn
+/// (no `running` state of its own), and only after that is the session idle.
+const BACKGROUND_WAKES: &str = include_str!("../../tests/fixtures/claude/background-agent-wakes.ndjson");
+
+#[test]
+fn a_turn_left_waiting_on_a_background_agent_is_not_done() {
+    use crate::transcript::{ItemStatus, Transcript};
+    let mut d = ClaudeDriver::default();
+    let mut t = Transcript::new();
+    let mut states = Vec::new();
+    let mut agent_while_waiting = None;
+    for line in BACKGROUND_WAKES.split_inclusive('\n') {
+        for e in d.on_output(line.as_bytes()) {
+            t.settle(&e);
+            t.apply(&e);
+            if let Event::StateChanged(s) = &e {
+                states.push(s.state.clone());
+                if s.state == RunState::Waiting {
+                    agent_while_waiting = t.subagents().next().map(|i| i.status);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        states,
+        [
+            RunState::Working { progress: None },
+            RunState::Waiting,
+            RunState::Working { progress: None },
+            RunState::Done,
+        ]
+    );
+    assert_eq!(agent_while_waiting, Some(ItemStatus::Running));
+    assert!(t.subagents().all(|i| i.status == ItemStatus::Completed));
+}

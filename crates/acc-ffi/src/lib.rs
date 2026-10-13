@@ -59,6 +59,7 @@ pub enum ProgramState {
     BlockedQuestion,
     BlockedAuth,
     Done,
+    Waiting,
     Error,
     Exited,
     Clear,
@@ -138,6 +139,7 @@ fn to_status(msg: Osc7501) -> ProgramStatus {
                     kind: BlockKind::Auth,
                 }) => (ProgramState::BlockedAuth, None),
                 Some(RunState::Done) => (ProgramState::Done, None),
+                Some(RunState::Waiting) => (ProgramState::Waiting, None),
                 Some(RunState::Error) => (ProgramState::Error, None),
                 Some(RunState::Exited) => (ProgramState::Exited, None),
             };

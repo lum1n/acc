@@ -185,7 +185,10 @@ impl Transcript {
             || match event {
                 Event::TurnCompleted => true,
                 Event::StateChanged(s) => {
-                    matches!(s.state, RunState::Idle | RunState::Done | RunState::Error)
+                    matches!(
+                        s.state,
+                        RunState::Idle | RunState::Done | RunState::Waiting | RunState::Error
+                    )
                 }
                 _ => false,
             };

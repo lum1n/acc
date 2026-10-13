@@ -100,11 +100,15 @@ impl Reader {
         }
     }
 
-    /// Whether the last turn ended, as far as the transcript tells.
-    fn turn_ended(&self) -> bool {
+    /// How the last turn ended (done, or waiting on background agents), as
+    /// far as the transcript tells.
+    fn turn_ended(&self) -> Option<RunState> {
         match self {
-            Reader::Claude(o) => matches!(o.state(), Some(RunState::Done)) && o.pending_tools() == 0,
-            _ => false,
+            Reader::Claude(o) if o.pending_tools() == 0 => match o.state() {
+                Some(s @ (RunState::Done | RunState::Waiting)) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -503,13 +507,7 @@ impl Observed {
         let v: serde_json::Value = serde_json::from_str(report.trim()).ok()?;
         let reader = self.reader.as_ref();
         let waiting_for = v.get("waitingFor").and_then(|w| w.as_str());
-        let idle = || {
-            if reader.is_some_and(Reader::turn_ended) {
-                RunState::Done
-            } else {
-                RunState::Idle
-            }
-        };
+        let idle = || reader.and_then(Reader::turn_ended).unwrap_or(RunState::Idle);
         let state = match v.get("status")?.as_str()? {
             "busy" => RunState::Working { progress: None },
             "idle" => idle(),

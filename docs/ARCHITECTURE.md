@@ -151,7 +151,8 @@ the main one with every subagent folded away; `Transcript::subagents()` lists th
 
 A subagent launched in the background outlives the turn that started it: `Transcript::settle` leaves
 it `Running` until it reports back (or the process exits), so a client doesn't show it as finished
-early.
+early. For Claude, the session meanwhile is `RunState::Waiting` rather than `Done`: the report is
+queued for the model as a new turn, so it goes back to `Working` when the last one finishes.
 
 | Harness | How a subagent shows up | Child conversation |
 |---|---|---|
@@ -199,7 +200,8 @@ until Rex ships a server outside the macOS app. Tests drive real tmux, zellij an
 
 
 `RunState` uses OSC 7501's vocabulary (idle, working, blocked{permission,question,auth}, done,
-error) plus `exited`. Observations are ranked by source (`Native` > `Osc7501` > `Transcript` >
+error) plus `exited` and `waiting` (a turn ended with a background subagent still running, whose
+report will start another turn on its own). Observations are ranked by source (`Native` > `Osc7501` > `Transcript` >
 `ScreenMatch` > `Heuristic`); a lower source only overrides a higher one once it is stale.
 
 ## Research

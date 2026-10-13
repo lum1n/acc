@@ -424,6 +424,7 @@ impl Observer {
                         extensions: json!({"task": {"status": "completed", "summary": last_text}}),
                     }),
                     Some(_) => {}
+                    None if done && !self.background.is_empty() => self.set(RunState::Waiting, out),
                     None if done => self.set(RunState::Done, out),
                     None => self.set(RunState::Working { progress: None }, out),
                 }
@@ -449,6 +450,10 @@ impl Observer {
             id: tool,
             extensions: json!({"task": task, "is_error": failed}),
         });
+        // The report wakes the model for another turn.
+        if self.background.is_empty() && self.state == Some(RunState::Waiting) {
+            self.set(RunState::Working { progress: None }, out);
+        }
     }
 
     /// A tool's result. An `Agent` call's structured result (`toolUseResult`)

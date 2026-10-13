@@ -161,6 +161,9 @@ pub struct ClaudeDriver {
     /// Background tasks (subagents, shells, monitors) by task id: the
     /// `task_*` frames merged, so each update carries the whole record.
     tasks: HashMap<String, Value>,
+    /// Subagents running in the background, from `background_tasks_changed`:
+    /// each one wakes the agent for another turn when it reports back.
+    background_agents: usize,
     /// Usage of the latest top-level assistant message (context fill).
     last_context: Option<u64>,
     context_window: Option<u64>,
@@ -197,6 +200,7 @@ impl ClaudeDriver {
             open: HashMap::new(),
             open_tools: HashMap::new(),
             tasks: HashMap::new(),
+            background_agents: 0,
             last_context: None,
             context_window: None,
             models: Vec::new(),
@@ -366,8 +370,13 @@ impl ClaudeDriver {
                         let kind = self.block_kind();
                         self.set_state(RunState::Blocked { kind }, None, out);
                     }
-                    // `done`/`error` from the result stay visible until the next turn.
-                    Some("idle") if !matches!(self.state, Some(RunState::Done | RunState::Error)) => {
+                    // `done`/`error`/`waiting` from the result stay visible until the next turn.
+                    Some("idle")
+                        if !matches!(
+                            self.state,
+                            Some(RunState::Done | RunState::Waiting | RunState::Error)
+                        ) =>
+                    {
                         self.set_state(RunState::Idle, None, out);
                     }
                     _ => {}
@@ -420,10 +429,23 @@ impl ClaudeDriver {
             Some("task_started" | "task_progress" | "task_updated" | "task_notification") => {
                 self.on_task(v, out)
             }
-            Some("background_tasks_changed") => out.push(Event::Native {
-                kind: "background_tasks".into(),
-                payload: json!({"tasks": v.get("tasks").cloned().unwrap_or_else(|| json!([]))}),
-            }),
+            Some("background_tasks_changed") => {
+                let tasks = v.get("tasks").cloned().unwrap_or_else(|| json!([]));
+                self.background_agents = tasks.as_array().map_or(0, |t| {
+                    t.iter()
+                        .filter(|t| str_at(t, "task_type").is_some_and(|k| k.ends_with("_agent")))
+                        .count()
+                });
+                // The last one's report is queued for the model, which takes
+                // it as a new turn without a `running` state of its own.
+                if self.background_agents == 0 && self.state == Some(RunState::Waiting) {
+                    self.set_state(RunState::Working { progress: None }, None, out);
+                }
+                out.push(Event::Native {
+                    kind: "background_tasks".into(),
+                    payload: json!({"tasks": tasks}),
+                });
+            }
             Some(
                 "post_turn_summary" | "task_summary" | "hook_started" | "hook_progress" | "hook_response"
                 | "files_persisted" | "informational" | "memory_recall" | "thinking_tokens" | "notification",
@@ -776,6 +798,8 @@ impl ClaudeDriver {
                 .or_else(|| str_at(v, "subtype"))
                 .map(|m| wire::one_line(m, 200));
             self.set_state(RunState::Error, message, out);
+        } else if self.background_agents > 0 {
+            self.set_state(RunState::Waiting, None, out);
         } else {
             self.set_state(RunState::Done, None, out);
         }
