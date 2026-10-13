@@ -56,7 +56,7 @@ const OPT_OUT: [&str; 4] = [
 ];
 
 /// Launch and thread settings. Everything else changes at runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexConfig {
     /// Thread to resume instead of starting a new one.
     pub resume: Option<String>,
@@ -74,7 +74,7 @@ pub struct CodexConfig {
 }
 
 /// What a request ACC sent was for, so its response can be applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Req {
     Initialize,
     Thread,
@@ -85,23 +85,23 @@ enum Req {
     RateLimits,
     Skills,
     /// Data for a panel ACC draws.
-    Panel(&'static str),
+    Panel(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
     /// An action from a panel; the panel is fetched again afterwards.
-    PanelAction(&'static str),
+    PanelAction(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
     /// `mcpServer/oauth/login`, which answers with a URL to open.
     McpLogin,
     Other,
 }
 
 /// A request the server is waiting on ACC to answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ServerRequest {
     id: Value,
     method: String,
     params: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Skill {
     name: String,
     path: String,
@@ -109,7 +109,7 @@ struct Skill {
 }
 
 /// Option changes to send with the next `turn/start`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Overrides {
     model: Option<String>,
     effort: Option<String>,
@@ -118,7 +118,7 @@ struct Overrides {
 }
 
 /// Codex app-server driver. See the module docs.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CodexDriver {
     config: CodexConfig,
     framer: LineFramer,
@@ -1192,6 +1192,10 @@ impl CodexDriver {
 impl Driver for CodexDriver {
     fn harness(&self) -> Harness {
         Harness::Codex
+    }
+
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
     }
 
     /// Resume happens in-protocol: set [`CodexConfig::resume`] instead.

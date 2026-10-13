@@ -118,7 +118,11 @@ was interrupted. Inside a multiplexer ACC can also co-drive the TUI via the mult
 `spec.json` (harness, cwd, launch command, native id once known) next to the log, so any client can
 list sessions (`detached::list_script`) and attach. Attaching replays `out.ndjson` through a fresh
 driver while suppressing everything it would transmit, then sends only safe, repeatable queries
-(`Driver::attach_handshake`). Request ids carry a per-client tag, and drivers read other clients'
+(`Driver::attach_handshake`), once per client: their answers land in the log too, so a reconnect
+doesn't repeat them. `Session::snapshot` serializes everything a client has read (drivers included,
+versioned by `SNAPSHOT_VERSION`) and `Session::restore` picks it up after a restart, replaying only
+what the log gained since; a log shorter than the snapshot's offset means it was replaced, and the
+session starts over from 0. Request ids carry a per-client tag, and drivers read other clients'
 responses by shape, so several clients share one harness. Claude answers travel on stdin and never
 reach the log, so the Claude driver resolves a permission from the tool's result instead; every
 client, and every replay, sees it answered.

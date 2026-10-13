@@ -70,7 +70,9 @@ case .relaunch(let request): /* e.g. Claude fork: start `request` as a new sessi
 
 Any client can join later with `AccSession.attach(specJson:clientTag:)` (specs come from
 `listSessionsExec()`): the log is replayed through a fresh driver without re-answering anything,
-then the session is live. `discoverExec()` finds harness TUIs a user started themselves;
+then the session is live. Persist `session.snapshot()` and pass it to
+`AccSession.restore(snapshot:specJson:)` after a relaunch to replay only what the log gained since.
+`discoverExec()` finds harness TUIs a user started themselves;
 `AccObserved` follows them from their transcripts and `AccTakeover` closes one safely and resumes it
 headless.
 

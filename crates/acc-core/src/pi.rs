@@ -38,19 +38,19 @@ const MAX_LINE: usize = 64 * 1024 * 1024;
 pub const CANCEL: &str = "cancel";
 
 /// What an RPC request ACC sent was for, keyed by its `id`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Pending {
     SetThinking(String),
     /// Data for a panel ACC draws; the response is also handled as usual.
-    Panel(&'static str),
+    Panel(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
     /// A change made from a panel; the panel is fetched again afterwards.
-    PanelAction(&'static str),
+    PanelAction(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
     /// Any other request; its response is handled by `command`.
     Plain,
 }
 
 /// An open extension dialog.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Dialog {
     Select(Vec<String>),
     Confirm,
@@ -59,7 +59,7 @@ enum Dialog {
 }
 
 /// Drives `pi --mode rpc`.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct PiDriver {
     framer: LineFramer,
     id_prefix: String,
@@ -814,6 +814,10 @@ impl PiDriver {
 impl Driver for PiDriver {
     fn harness(&self) -> Harness {
         Harness::Pi
+    }
+
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
     }
 
     fn launch(&self, resume: Option<&str>) -> LaunchSpec {

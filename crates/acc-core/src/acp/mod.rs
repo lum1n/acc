@@ -49,7 +49,7 @@ const MAX_EARLY: usize = 1024;
 const AUTH_REQUIRED: i64 = -32000;
 
 /// How the driver gets a session once the agent is up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Start {
     /// `session/new` in the working directory.
     New,
@@ -63,7 +63,7 @@ pub enum Start {
 }
 
 /// Per-session settings for [`AcpDriver`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcpConfig {
     /// Absolute working directory on the host (ACP requires absolute paths).
     pub cwd: String,
@@ -89,7 +89,7 @@ impl AcpConfig {
 }
 
 /// What a request this client sent was for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Pending {
     Initialize,
     Authenticate,
@@ -104,7 +104,7 @@ enum Pending {
 }
 
 /// Where the connection is in its lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Phase {
     Initializing,
     Opening,
@@ -114,7 +114,7 @@ enum Phase {
 }
 
 /// A permission request the agent is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PermissionWait {
     /// The agent's JSON-RPC id, echoed verbatim in the answer.
     rpc_id: Value,
@@ -123,7 +123,7 @@ struct PermissionWait {
 }
 
 /// Sans-IO ACP client for one agent process and one active session.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct AcpDriver {
     harness: Harness,
     cfg: AcpConfig,
@@ -1260,6 +1260,10 @@ const OPTION_COMMANDS: [(OptionId, &str, &str); 4] = [
 impl Driver for AcpDriver {
     fn harness(&self) -> Harness {
         self.harness
+    }
+
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
     }
 
     /// The ACP entry point. Resume happens in-protocol ([`Start::Resume`]),

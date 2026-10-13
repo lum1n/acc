@@ -89,7 +89,7 @@ const PLAN_DESCRIPTION: &str = "Enable plan mode or view the current session pla
 const IMAGE_PLACEHOLDER: &str = "[image]";
 
 /// Launch-time settings. Everything else changes at runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeConfig {
     /// `--model` at spawn.
     pub model: Option<String>,
@@ -105,7 +105,7 @@ pub struct ClaudeConfig {
 }
 
 /// What a control request ACC sent was for, so its reply can be applied.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Pending {
     Initialize,
     SetModel(String),
@@ -118,15 +118,15 @@ enum Pending {
         view: bool,
     },
     /// A dialog's data, drawn as the panel for this palette entry.
-    Panel(&'static str),
+    Panel(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
     /// An action from a panel; the panel is fetched again afterwards.
-    PanelAction(&'static str),
+    PanelAction(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
     /// `reload_plugins`, which answers with the new palette.
     Reload,
     Other,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PendingPermission {
     tool_use_id: Option<String>,
     input: Value,
@@ -137,14 +137,14 @@ struct PendingPermission {
 
 /// Content blocks of one assistant message that started streaming but whose
 /// final `assistant` frame hasn't arrived yet, in stream order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct OpenMessage {
     blocks: VecDeque<String>,
     seen: usize,
 }
 
 /// Claude Code stream-json driver. See the module docs.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeDriver {
     config: ClaudeConfig,
     framer: LineFramer,
@@ -1391,6 +1391,10 @@ impl ClaudeDriver {
 impl Driver for ClaudeDriver {
     fn harness(&self) -> Harness {
         Harness::Claude
+    }
+
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
     }
 
     fn launch(&self, resume: Option<&str>) -> LaunchSpec {

@@ -17,6 +17,11 @@
 //!    and pass every chunk to [`Session::feed`].
 //! 3. After each `feed` and `command`, write [`Session::take_transmit`]
 //!    through [`Session::input_exec`].
+//!
+//! A client that persists [`Session::snapshot`] can [`Session::restore`]
+//! it later (after a relaunch) and read only what the log gained since.
+
+use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +41,10 @@ use crate::transcript::{ItemChange, Transcript};
 
 /// Version of the `spec.json` format.
 pub const SPEC_VERSION: u32 = 1;
+
+/// Version of [`Session::snapshot`]. Bump it whenever a driver's state
+/// changes meaning without changing shape; older snapshots are then refused.
+pub const SNAPSHOT_VERSION: u32 = 1;
 
 /// After this long without news, a lower-fidelity state source may override.
 const STALE_MS: u64 = 30_000;
@@ -163,6 +172,10 @@ pub enum SessionError {
     RelativeCwd(Harness, String),
     #[error("no harness given")]
     NoHarness,
+    /// The snapshot is unreadable, from another version, or of another
+    /// session. Attach afresh instead.
+    #[error("unusable snapshot: {0}")]
+    Snapshot(String),
     #[error(transparent)]
     Driver(#[from] DriverError),
 }
@@ -172,6 +185,7 @@ pub struct Session {
     spec: SessionSpec,
     dir: SessionDir,
     driver: Box<dyn Driver>,
+    client_tag: String,
     offset: u64,
     /// While `offset` is below this, fed bytes are a replay of history.
     replay_until: Option<u64>,
@@ -186,6 +200,29 @@ pub struct Session {
     pending_prompt: Option<Command>,
     spec_dirty: bool,
     exited: bool,
+    /// The harness has been sent its handshake (or the attach queries)
+    /// by this client. They aren't repeated on a reconnect or a restore:
+    /// every query's answer lands in the log, which would grow per attach.
+    handshaken: bool,
+}
+
+/// What [`Session::snapshot`] writes; borrowed on the way out.
+#[derive(Serialize, Deserialize)]
+struct Snapshot<'a> {
+    v: u32,
+    spec: Cow<'a, SessionSpec>,
+    client_tag: Cow<'a, str>,
+    driver: Value,
+    offset: u64,
+    tracker: Cow<'a, StateTracker>,
+    transcript: Cow<'a, Transcript>,
+    usage: Cow<'a, Usage>,
+    quota: Cow<'a, Option<Quota>>,
+    permissions: Cow<'a, [Permission]>,
+    pending_prompt: Cow<'a, Option<Command>>,
+    spec_dirty: bool,
+    exited: bool,
+    handshaken: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -234,6 +271,17 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
             Box::new(AcpDriver::new(h, cfg))
         }
     }
+}
+
+fn restore_driver(harness: Harness, state: Value) -> Result<Box<dyn Driver>, serde_json::Error> {
+    Ok(match harness {
+        Harness::Claude => Box::new(serde_json::from_value::<ClaudeDriver>(state)?),
+        Harness::Codex => Box::new(serde_json::from_value::<CodexDriver>(state)?),
+        Harness::Pi => Box::new(serde_json::from_value::<PiDriver>(state)?),
+        Harness::Cursor | Harness::Copilot | Harness::Opencode => {
+            Box::new(serde_json::from_value::<AcpDriver>(state)?)
+        }
+    })
 }
 
 /// Whether the harness takes a prompt before it reports its session.
@@ -309,6 +357,7 @@ impl Session {
         let session = Self {
             dir,
             driver,
+            client_tag: client_tag.to_owned(),
             offset: 0,
             replay_until: Some(0),
             alive: true,
@@ -321,6 +370,7 @@ impl Session {
             pending_prompt,
             spec_dirty: false,
             exited: false,
+            handshaken: true,
             spec,
         };
         Ok((session, exec))
@@ -335,6 +385,7 @@ impl Session {
         Ok(Self {
             dir,
             driver,
+            client_tag: client_tag.to_owned(),
             offset: 0,
             replay_until: None,
             alive: false,
@@ -347,6 +398,80 @@ impl Session {
             pending_prompt: None,
             spec_dirty: false,
             exited: false,
+            handshaken: false,
+            spec,
+        })
+    }
+
+    /// Everything this client has read of the session, as JSON, for
+    /// [`Session::restore`]. `None` if a driver can't be saved.
+    pub fn snapshot(&self) -> Option<String> {
+        let snap = Snapshot {
+            v: SNAPSHOT_VERSION,
+            spec: Cow::Borrowed(&self.spec),
+            client_tag: Cow::Borrowed(&self.client_tag),
+            driver: self.driver.snapshot()?,
+            offset: self.offset,
+            tracker: Cow::Borrowed(&self.tracker),
+            transcript: Cow::Borrowed(&self.transcript),
+            usage: Cow::Borrowed(&self.usage),
+            quota: Cow::Borrowed(&self.quota),
+            permissions: Cow::Borrowed(&self.permissions),
+            pending_prompt: Cow::Borrowed(&self.pending_prompt),
+            spec_dirty: self.spec_dirty,
+            exited: self.exited,
+            handshaken: self.handshaken,
+        };
+        serde_json::to_string(&snap).ok()
+    }
+
+    /// Picks a session up from a [`Session::snapshot`], for the session
+    /// `spec` describes (as listed on the host now). Continue as after
+    /// [`Session::attach`]: [`Session::on_status`], then follow the log from
+    /// [`Session::offset`]. What the log gained since the snapshot replays
+    /// like history. If the log turns out shorter than the snapshot read
+    /// (it was replaced), `on_status` starts over from offset 0.
+    pub fn restore(snapshot: &str, spec: SessionSpec) -> Result<Self, SessionError> {
+        let bad = |why: &str| SessionError::Snapshot(why.to_owned());
+        let snap: Snapshot<'static> = serde_json::from_str(snapshot).map_err(|e| bad(&e.to_string()))?;
+        if snap.v != SNAPSHOT_VERSION {
+            return Err(bad(&format!("version {}", snap.v)));
+        }
+        let saved = snap.spec.into_owned();
+        if saved.id != spec.id || saved.harness != spec.harness || saved.created_ms != spec.created_ms {
+            return Err(bad("another session"));
+        }
+        let dir = SessionDir::new(&spec.id).ok_or_else(|| SessionError::InvalidId(spec.id.clone()))?;
+        let driver = restore_driver(spec.harness, snap.driver).map_err(|e| bad(&e.to_string()))?;
+        // The host's spec may be newer (another client named the session);
+        // what only this client learned is kept.
+        let mut spec = spec;
+        if spec.native_id.is_none() {
+            spec.native_id = saved.native_id;
+        }
+        if spec.title.is_none() {
+            spec.title = saved.title;
+        }
+        if spec.model.is_none() {
+            spec.model = saved.model;
+        }
+        Ok(Self {
+            dir,
+            driver,
+            client_tag: snap.client_tag.into_owned(),
+            offset: snap.offset,
+            replay_until: None,
+            alive: false,
+            tracker: snap.tracker.into_owned(),
+            transcript: snap.transcript.into_owned(),
+            usage: snap.usage.into_owned(),
+            quota: snap.quota.into_owned(),
+            permissions: snap.permissions.into_owned(),
+            transmit: Vec::new(),
+            pending_prompt: snap.pending_prompt.into_owned(),
+            spec_dirty: snap.spec_dirty,
+            exited: snap.exited,
+            handshaken: snap.handshaken,
             spec,
         })
     }
@@ -404,10 +529,18 @@ impl Session {
             Some((status, history)) => (status, Some(history)),
             None => (stdout, None),
         };
+        let status = parse_status(stdout);
+        if let Some(status) = &status
+            && !matches!(status, Status::Missing)
+            && status.size() < self.offset
+        {
+            // Not the log this client read (restored from an old snapshot).
+            self.start_over();
+        }
         if let Some(history) = history {
             self.driver.on_history(history);
         }
-        let Some(status) = parse_status(stdout) else {
+        let Some(status) = status else {
             return Vec::new();
         };
         if self.replay_until.is_none() {
@@ -586,10 +719,28 @@ impl Session {
     fn finish_replay(&mut self) {
         let Some(until) = self.replay_until else { return };
         self.replay_until = Some(until.min(self.offset));
-        if self.alive && !self.exited && until > 0 {
+        if self.alive && !self.exited && until > 0 && !self.handshaken {
             let t = self.driver.attach_handshake();
             self.transmit.extend(t);
+            self.handshaken = true;
         }
+    }
+
+    /// Forgets everything read and replays the log from the start, as a
+    /// fresh [`Session::attach`] would.
+    fn start_over(&mut self) {
+        self.driver = driver_for(&self.spec, true, &self.client_tag);
+        self.offset = 0;
+        self.replay_until = None;
+        self.tracker = StateTracker::new(STALE_MS);
+        self.transcript = Transcript::new();
+        self.usage = Usage::default();
+        self.quota = None;
+        self.permissions.clear();
+        self.transmit.clear();
+        self.pending_prompt = None;
+        self.exited = false;
+        self.handshaken = false;
     }
 
     fn exit(&mut self, code: Option<i32>, now_ms: u64, out: &mut Vec<Update>) {
@@ -1001,6 +1152,95 @@ mod tests {
         let exec = s.take_spec_write().expect("spec write");
         assert!(exec.script.contains("spec.json"));
         assert!(s.take_spec_write().is_none());
+    }
+
+    /// Reads the first half of `log` (at a line boundary), saves a
+    /// snapshot, restores it and reads the rest: the result must match a
+    /// client that read the whole log in one go.
+    fn restored_matches_full_read(h: Harness, log: &str) {
+        let (full, _) = attached(h, log, true);
+        let (s, _) = Session::launch(req(h), "s1", "first", 1).unwrap();
+        let cut = log[..log.len() / 2].rfind('\n').map_or(0, |i| i + 1);
+        let (head, tail) = log.split_at(cut);
+        let mut a = Session::attach(s.spec().clone(), "second").unwrap();
+        a.on_status(&format!("alive 7 {}", head.len()), 2);
+        a.feed(head.as_bytes(), 3);
+        let sent = a.take_transmit();
+        let snap = a.snapshot().expect("snapshot");
+
+        let mut b = Session::restore(&snap, s.spec().clone()).unwrap();
+        assert_eq!(b.offset(), head.len() as u64);
+        b.on_status(&format!("alive 7 {}", log.len()), 4);
+        assert!(b.is_replaying() || tail.is_empty());
+        let ups = b.feed(tail.as_bytes(), 5);
+        assert!(ups.iter().all(|u| u.replay), "{h:?}: gained history is replay");
+        assert!(!b.is_replaying());
+        assert_eq!(b.transcript().items(), full.transcript().items(), "{h:?}");
+        assert_eq!(b.usage(), full.usage(), "{h:?}");
+        assert_eq!(b.commands(), full.commands(), "{h:?}");
+        assert_eq!(b.options(), full.options(), "{h:?}");
+        if !sent.is_empty() {
+            assert!(b.take_transmit().is_empty(), "{h:?}: handshake sent once");
+        }
+    }
+
+    #[test]
+    fn restored_snapshot_reads_on_like_a_full_replay() {
+        restored_matches_full_read(Harness::Claude, CLAUDE_HI);
+        restored_matches_full_read(Harness::Claude, CLAUDE_PERMISSION);
+        restored_matches_full_read(Harness::Codex, CODEX_HANDSHAKE);
+        restored_matches_full_read(Harness::Pi, PI_TURN);
+        restored_matches_full_read(
+            Harness::Opencode,
+            include_str!("../tests/fixtures/acp/opencode-1.18.35.out.ndjson"),
+        );
+    }
+
+    #[test]
+    fn reattaching_doesnt_repeat_the_attach_queries() {
+        let (mut a, _) = attached(Harness::Claude, CLAUDE_HI, true);
+        assert!(!a.take_transmit().is_empty());
+        a.on_status(&format!("alive 7 {}", CLAUDE_HI.len()), 9);
+        assert!(a.take_transmit().is_empty());
+        let mut b = Session::restore(&a.snapshot().unwrap(), a.spec().clone()).unwrap();
+        b.on_status(&format!("alive 7 {}", CLAUDE_HI.len()), 10);
+        assert!(!b.is_replaying());
+        assert!(b.take_transmit().is_empty());
+    }
+
+    #[test]
+    fn a_shorter_log_than_the_snapshot_read_starts_over() {
+        let (a, _) = attached(Harness::Claude, CLAUDE_HI, true);
+        let mut b = Session::restore(&a.snapshot().unwrap(), a.spec().clone()).unwrap();
+        b.on_status("alive 8 10", 2);
+        assert_eq!(b.offset(), 0);
+        assert!(b.transcript().is_empty());
+        assert!(b.is_replaying());
+        let ups = b.feed(&CLAUDE_HI.as_bytes()[..10], 3);
+        assert!(ups.iter().all(|u| u.replay));
+    }
+
+    #[test]
+    fn snapshots_of_another_session_or_version_are_refused() {
+        let (a, _) = attached(Harness::Claude, CLAUDE_HI, false);
+        let snap = a.snapshot().unwrap();
+        let mut other = a.spec().clone();
+        other.id = "s2".into();
+        assert!(matches!(
+            Session::restore(&snap, other),
+            Err(SessionError::Snapshot(_))
+        ));
+        let old = snap.replacen(&format!("\"v\":{SNAPSHOT_VERSION}"), "\"v\":0", 1);
+        assert!(matches!(
+            Session::restore(&old, a.spec().clone()),
+            Err(SessionError::Snapshot(_))
+        ));
+        assert!(Session::restore("{", a.spec().clone()).is_err());
+        // An exited session stays exited and keeps its title.
+        let b = Session::restore(&snap, a.spec().clone()).unwrap();
+        assert!(!b.is_alive());
+        assert_eq!(b.state().map(|s| &s.state), Some(&RunState::Exited));
+        assert_eq!(b.spec().title, a.spec().title);
     }
 
     #[test]

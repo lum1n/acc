@@ -60,7 +60,7 @@ pub struct SessionState {
 }
 
 /// Merges observations from multiple sources into one current state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StateTracker {
     current: Option<SessionState>,
     /// After this long without an update, a lower-fidelity source may override.

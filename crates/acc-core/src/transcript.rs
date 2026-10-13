@@ -82,11 +82,31 @@ impl ItemChange {
 
 /// The items of one session, in order.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "Stored")]
 pub struct Transcript {
     items: Vec<Item>,
     #[serde(skip)]
     index: HashMap<ItemId, usize>,
     next_seq: u64,
+}
+
+/// A deserialized [`Transcript`] before its id index is rebuilt.
+#[derive(Deserialize)]
+struct Stored {
+    items: Vec<Item>,
+    next_seq: u64,
+}
+
+impl From<Stored> for Transcript {
+    fn from(s: Stored) -> Self {
+        let mut t = Self {
+            items: s.items,
+            index: HashMap::new(),
+            next_seq: s.next_seq,
+        };
+        t.reindex();
+        t
+    }
 }
 
 impl Transcript {
@@ -128,7 +148,7 @@ impl Transcript {
         self.items.iter().filter(|i| i.kind == ItemKind::Subagent)
     }
 
-    /// Rebuilds the id index after deserializing.
+    /// Rebuilds the id index (deserializing does it already).
     pub fn reindex(&mut self) {
         self.index = self
             .items

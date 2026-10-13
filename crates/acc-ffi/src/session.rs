@@ -108,6 +108,26 @@ impl AccSession {
         }))
     }
 
+    /// Picks a session up from `snapshot` (see `snapshot`), for the session
+    /// in `spec_json` as the host lists it now. Continue as after `attach`.
+    /// Fails for a snapshot of another session or ACC version: attach then.
+    #[uniffi::constructor]
+    pub fn restore(snapshot: String, spec_json: String) -> Result<Arc<Self>, AccError> {
+        let spec = SessionSpec::from_json(&spec_json).ok_or_else(|| AccError::InvalidSession {
+            message: "unreadable spec.json".into(),
+        })?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Session::restore(&snapshot, spec)?),
+            launch: Mutex::new(None),
+        }))
+    }
+
+    /// Everything read of the session so far, to persist and `restore`
+    /// later instead of replaying the whole log.
+    pub fn snapshot(&self) -> Option<String> {
+        lock(&self.inner).snapshot()
+    }
+
     /// The script that starts the harness, once, for a launched session.
     pub fn take_launch_exec(&self) -> Option<AccExec> {
         lock(&self.launch).take()
@@ -489,6 +509,42 @@ mod tests {
         assert!(child.is_some());
         assert!(!b.children(subs[0].id.clone()).is_empty());
         assert!(b.top_level_items().iter().all(|i| i.parent.is_none()));
+    }
+
+    #[test]
+    fn snapshots_restore_through_ffi() {
+        let s = AccSession::launch(
+            AccLaunchRequest {
+                harness: AccHarness::Claude,
+                cwd: "/w".into(),
+                model: None,
+                permission: None,
+                resume: None,
+                fork: false,
+                title: None,
+                prompt: None,
+                attachments: vec![],
+                parent: None,
+                replaces_parent: false,
+                origin: AccOrigin::Started,
+                launcher: None,
+            },
+            new_session_id(AccHarness::Claude, vec![10; 15]),
+            "ph".into(),
+            1,
+        )
+        .unwrap();
+        let spec = s.spec().json;
+        let a = AccSession::attach(spec.clone(), "desk".into()).unwrap();
+        a.on_status(format!("alive 3 {}", HI.len()), 2);
+        a.feed(HI.to_vec(), 3);
+        let b = AccSession::restore(a.snapshot().unwrap(), spec.clone()).unwrap();
+        assert_eq!(b.offset(), HI.len() as u64);
+        assert_eq!(b.items(), a.items());
+        assert!(matches!(
+            AccSession::restore("{}".into(), spec),
+            Err(AccError::InvalidSession { .. })
+        ));
     }
 
     #[test]

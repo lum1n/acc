@@ -6,6 +6,8 @@
 //! pane) is not the driver's concern, so the same driver runs on every platform
 //! and is tested by replaying recorded sessions.
 
+use serde_json::Value;
+
 use crate::command::{Command, CommandEntry, OptionDef};
 use crate::event::Event;
 use crate::harness::{Harness, LaunchSpec};
@@ -87,4 +89,10 @@ pub trait Driver: Send {
     }
 
     fn on_history(&mut self, _output: &str) {}
+
+    /// The driver's whole state, for [`crate::session::Session::snapshot`].
+    /// Restored by deserializing the concrete driver for the harness.
+    fn snapshot(&self) -> Option<Value> {
+        None
+    }
 }
