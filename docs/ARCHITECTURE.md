@@ -151,15 +151,20 @@ the main one with every subagent folded away; `Transcript::subagents()` lists th
 
 A subagent launched in the background outlives the turn that started it: `Transcript::settle` leaves
 it `Running` until it reports back (or the process exits), so a client doesn't show it as finished
-early. For Claude, the session meanwhile is `RunState::Waiting` rather than `Done`: the report is
-queued for the model as a new turn, so it goes back to `Working` when the last one finishes.
+early. When its report will start another turn on its own, the session meanwhile is
+`RunState::Waiting` rather than `Done`: Claude (`background_tasks_changed`; the report is queued as a
+new turn, so it goes back to `Working` when the last one finishes) and pi (pi-subagents' `async: true`
+runs, by `details.asyncId`, until their `subagent-notify`). Codex queues a finished child's
+`<subagent_notification>` for the parent without starting a turn, so its turn is simply done.
+opencode and Copilot keep the ACP `session/prompt` open until the background agent has reported
+back and the follow-up is answered, so they stay `Working`.
 
 | Harness | How a subagent shows up | Child conversation |
 |---|---|---|
 | Claude | `Agent`/`Task` tool call; `system/task_started`, `task_progress`, `task_updated`, `task_notification` merge onto it; a background launch's tool result only acknowledges (`isAsync`), the notification finishes it | `~/.claude/projects/<proj>/<session>/subagents/agent-<id>.jsonl`, named by `agent-<id>.meta.json`'s `toolUseId`; `Driver::launch` adds `--forward-subagent-text` so a driven session streams it live too |
 | Codex | `collabAgentToolCall` item (`spawnAgent`, ...); `thread/started` with `source.subAgent.thread_spawn.parent_thread_id` names the child thread | the child's own thread: its `item/*` notifications carry its `threadId`, mapped back to the spawning item |
 | Cursor, Copilot, opencode (ACP) | a `task`/`subagent`-shaped tool call (name, or `rawInput.subagent_type`/`agent` with a prompt); the report is opencode's `task_id: …`/`<task_result>` (1.x) or `<subagent sessionID="…">` (2.0) wrapper, unwrapped by `item::detail` | opencode forwards the child session's updates under the parent's session id, tagged `_meta["opencode/child-session"]`; other agents report only the final text |
-| pi | the pi-subagents extension's `subagent` tool | none (no child transcript) |
+| pi | the pi-subagents extension's `subagent` tool; an `async: true` launch's result only acknowledges (`details.asyncId`), its `subagent-notify` custom message finishes it | none (no child transcript) |
 
 **Observing** (a TUI ACC didn't start): `Observed::children_exec` finds subagent transcripts not
 followed yet — Claude's `subagents_script` next to the session, Codex's rollout `locate_script` for a

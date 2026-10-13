@@ -307,11 +307,13 @@ fn parent(ext: &Value) -> Option<ItemId> {
 }
 
 /// A subagent the harness runs in the background (Claude's `isAsync`
-/// launch, a `task` record still running).
+/// launch, a `task` record still running, a pi-subagents `async: true` run).
 fn in_background(item: &Item) -> bool {
     item.kind == ItemKind::Subagent
         && (item.ext.pointer("/result/isAsync").and_then(Value::as_bool) == Some(true)
-            || item.ext.pointer("/task/is_backgrounded").and_then(Value::as_bool) == Some(true))
+            || item.ext.pointer("/task/is_backgrounded").and_then(Value::as_bool) == Some(true)
+            // pi-subagents' `async: true` launch.
+            || item.ext.pointer("/result/details/asyncId").is_some())
 }
 
 fn failed(ext: &Value) -> bool {

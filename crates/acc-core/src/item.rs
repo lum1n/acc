@@ -719,6 +719,8 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
             .or_else(|| owned(&args, "prompt"))
             .or_else(|| first.and_then(|t| owned(t, "task")));
         let failed = ext.get("is_error").and_then(Value::as_bool) == Some(true);
+        // An async launch's result only acknowledges it; `notify` is its report.
+        let running = ext.pointer("/result/details/asyncId").is_some() && ext.get("notify").is_none();
         return ItemDetail::Subagent {
             agent: owned(&args, "agent").or_else(|| first.and_then(|t| owned(t, "agent"))),
             description: owned(&args, "description")
@@ -726,9 +728,13 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
                 .unwrap_or_default(),
             prompt: task,
             child: None,
-            status: output
-                .as_ref()
-                .map(|_| if failed { "failed" } else { "completed" }.to_owned()),
+            status: if running {
+                Some("running".to_owned())
+            } else {
+                output
+                    .as_ref()
+                    .map(|_| if failed { "failed" } else { "completed" }.to_owned())
+            },
             output: output.or_else(|| (!text.is_empty()).then(|| text.to_owned())),
             model: None,
         };

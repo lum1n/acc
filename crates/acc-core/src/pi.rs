@@ -76,6 +76,10 @@ pub struct PiDriver {
     msg_seq: u64,
     current_msg: Option<String>,
     shell_items: HashMap<String, bool>,
+    /// pi-subagents runs launched with `async: true` and not yet reported
+    /// back, by run id, with the `subagent` call that launched them. Each
+    /// one's `subagent-notify` wakes the agent for another turn.
+    background: HashMap<String, String>,
     usage: Usage,
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
@@ -104,6 +108,7 @@ impl PiDriver {
             msg_seq: 0,
             current_msg: None,
             shell_items: HashMap::new(),
+            background: HashMap::new(),
             usage: Usage::default(),
             commands: canonical_commands(),
             options: vec![
@@ -197,6 +202,7 @@ impl PiDriver {
                 let state = match (aborted, self.last_error.take()) {
                     (true, _) => self.state(RunState::Idle, None),
                     (false, Some(err)) => self.state(RunState::Error, Some(err)),
+                    (false, None) if !self.background.is_empty() => self.state(RunState::Waiting, None),
                     (false, None) => self.state(RunState::Done, None),
                 };
                 out.push(state);
@@ -219,14 +225,20 @@ impl PiDriver {
             "tool_execution_update" => self.resume_working(out),
             "tool_execution_end" => {
                 self.resume_working(out);
-                out.push(Event::ItemCompleted {
-                    id: str_field(&v, "toolCallId"),
-                    extensions: json!({
-                        "result": v.get("result").cloned().unwrap_or(Value::Null),
-                        "is_error": v.get("isError").and_then(Value::as_bool).unwrap_or(false),
-                        "duration_ms": v.get("durationMs").cloned().unwrap_or(Value::Null),
-                    }),
+                let id = str_field(&v, "toolCallId");
+                let is_error = v.get("isError").and_then(Value::as_bool).unwrap_or(false);
+                let extensions = json!({
+                    "result": v.get("result").cloned().unwrap_or(Value::Null),
+                    "is_error": is_error,
+                    "duration_ms": v.get("durationMs").cloned().unwrap_or(Value::Null),
                 });
+                let details = v.pointer("/result/details");
+                if let Some(run) = async_run(&str_field(&v, "toolName"), details, is_error) {
+                    self.background.insert(run.to_owned(), id.clone());
+                    out.push(Event::ItemUpdated { id, extensions });
+                } else {
+                    out.push(Event::ItemCompleted { id, extensions });
+                }
             }
             "bash_execution_update" => {
                 let id = format!("bash-{}", str_field(&v, "id"));
@@ -562,6 +574,7 @@ impl PiDriver {
     fn on_message_end(&mut self, v: &Value, out: &mut Vec<Event>) {
         let Some(msg) = v.get("message") else { return };
         match msg.get("role").and_then(Value::as_str) {
+            Some("custom") => subagent_notify(&mut self.background, msg, out),
             Some("user") => out.push(Event::ItemCompleted {
                 id: format!("u{}", self.msg_seq),
                 extensions: Value::Null,
@@ -1130,6 +1143,46 @@ fn content_text(content: Option<&Value>) -> String {
 }
 
 /// What to show for a user message: its text, or `[image]` when it is only images.
+/// An async `subagent` launch's run id (pi-subagents `async: true`): its
+/// result only acknowledges it, and its `subagent-notify` completes it.
+fn async_run<'a>(tool: &str, details: Option<&'a Value>, is_error: bool) -> Option<&'a str> {
+    details
+        .and_then(|d| d.get("asyncId"))
+        .and_then(Value::as_str)
+        .filter(|_| !is_error && tool == "subagent")
+}
+
+/// pi-subagents' report of finished async runs (a `subagent-notify` custom
+/// message): completes the calls that launched them, with the report as
+/// their output.
+fn subagent_notify(background: &mut HashMap<String, String>, msg: &Value, out: &mut Vec<Event>) {
+    if msg.get("customType").and_then(Value::as_str) != Some("subagent-notify") {
+        return;
+    }
+    let Some(runs) = msg.pointer("/details/runs").and_then(Value::as_array) else {
+        return;
+    };
+    let text = content_text(msg.get("content"));
+    for run in runs {
+        let Some(id) = run
+            .get("runId")
+            .and_then(Value::as_str)
+            .and_then(|r| background.remove(r))
+        else {
+            continue;
+        };
+        let failed = run.get("status").and_then(Value::as_str) != Some("completed");
+        out.push(Event::ItemCompleted {
+            id,
+            extensions: json!({
+                "notify": run,
+                "result": {"content": [{"type": "text", "text": text}]},
+                "is_error": failed,
+            }),
+        });
+    }
+}
+
 fn user_text(content: Option<&Value>) -> String {
     let text = content_text(content);
     let images = content.and_then(Value::as_array).is_some_and(|blocks| {
@@ -1181,11 +1234,14 @@ pub fn session_dir(cwd: &str) -> String {
 /// State comes from the transcript ([`StateSource::Transcript`]): a user
 /// message means working, an assistant message that stops for tool use means
 /// still working, a final one means done, an error stop means error and an
-/// aborted one means idle. pi never shows "blocked" in its transcript.
+/// aborted one means idle, and a final one with async pi-subagents runs still
+/// out means waiting. pi never shows "blocked" in its transcript.
 #[derive(Debug)]
 pub struct Transcript {
     framer: LineFramer,
     open_tools: Vec<String>,
+    /// Async pi-subagents runs not yet reported back, as in [`PiDriver`].
+    background: HashMap<String, String>,
     usage: Usage,
 }
 
@@ -1200,6 +1256,7 @@ impl Transcript {
         Self {
             framer: LineFramer::new(MAX_LINE),
             open_tools: Vec::new(),
+            background: HashMap::new(),
             usage: Usage::default(),
         }
     }
@@ -1264,17 +1321,23 @@ impl Transcript {
                     Some("toolResult") => {
                         let call = str_field(msg, "toolCallId");
                         self.open_tools.retain(|t| *t != call);
-                        out.push(Event::ItemCompleted {
-                            id: call,
-                            extensions: json!({
-                                "result": { "content": msg.get("content") },
-                                "is_error": msg.get("isError").and_then(Value::as_bool).unwrap_or(false),
-                            }),
+                        let is_error = msg.get("isError").and_then(Value::as_bool).unwrap_or(false);
+                        let details = msg.get("details");
+                        let extensions = json!({
+                            "result": { "content": msg.get("content"), "details": details },
+                            "is_error": is_error,
                         });
+                        if let Some(run) = async_run(&str_field(msg, "toolName"), details, is_error) {
+                            self.background.insert(run.to_owned(), call.clone());
+                            out.push(Event::ItemUpdated { id: call, extensions });
+                        } else {
+                            out.push(Event::ItemCompleted { id: call, extensions });
+                        }
                     }
                     _ => {}
                 }
             }
+            Some("custom_message") => subagent_notify(&mut self.background, v, out),
             _ => {}
         }
     }
@@ -1320,6 +1383,7 @@ impl Transcript {
             "toolUse" => RunState::Working { progress: None },
             "error" => RunState::Error,
             "aborted" => RunState::Idle,
+            _ if !self.background.is_empty() => RunState::Waiting,
             _ => RunState::Done,
         };
         let message = (stop == "error")
@@ -1671,6 +1735,93 @@ mod tests {
         let last = last.unwrap();
         assert_eq!(last.state, RunState::Error);
         assert_eq!(last.message.as_deref(), Some("429 rate limited"));
+    }
+
+    /// Synthetic (pi isn't recorded with pi-subagents): an `async: true`
+    /// launch, the turn ending while it runs, then pi-subagents' idle wake —
+    /// the `subagent-notify` custom message and a steered prompt that starts
+    /// a second run. Shapes from pi's `agent-session.ts` and pi-subagents'
+    /// `async-execution.ts`/`notify.ts`.
+    const ASYNC_SUBAGENT: &str = r#"{"type":"agent_start"}
+{"type":"tool_execution_start","toolCallId":"call_1","toolName":"subagent","args":{"agent":"scout","task":"Map the repo","async":true}}
+{"type":"tool_execution_end","toolCallId":"call_1","toolName":"subagent","result":{"content":[{"type":"text","text":"Async: scout [run-7]"}],"details":{"mode":"single","runId":"run-7","results":[],"asyncId":"run-7"}},"isError":false}
+{"type":"agent_settled","aborted":false}
+{"type":"message_start","message":{"role":"custom","customType":"subagent-notify","content":"scout completed: 12 files","display":false,"details":{"runs":[{"agent":"scout","status":"completed","source":"async","runId":"run-7"}]}}}
+{"type":"message_end","message":{"role":"custom","customType":"subagent-notify","content":"scout completed: 12 files","display":false,"details":{"runs":[{"agent":"scout","status":"completed","source":"async","runId":"run-7"}]}}}
+{"type":"agent_start"}
+{"type":"agent_settled","aborted":false}
+"#;
+
+    #[test]
+    fn a_run_left_waiting_on_an_async_subagent_is_not_done() {
+        use crate::item::ItemDetail;
+        use crate::transcript::{ItemStatus, Transcript as Items};
+        let mut d = PiDriver::new();
+        let mut t = Items::new();
+        let mut states = Vec::new();
+        let mut while_waiting = None;
+        for line in ASYNC_SUBAGENT.split_inclusive('\n') {
+            for e in d.on_output(line.as_bytes()) {
+                t.settle(&e);
+                t.apply(&e);
+                if let Event::StateChanged(s) = &e {
+                    states.push(s.state.clone());
+                    if s.state == RunState::Waiting {
+                        while_waiting = t.get("call_1").map(|i| (i.status, i.detail(Harness::Pi)));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            states,
+            [
+                RunState::Working { progress: None },
+                RunState::Waiting,
+                RunState::Working { progress: None },
+                RunState::Done,
+            ]
+        );
+        let (status, detail) = while_waiting.unwrap();
+        assert_eq!(status, ItemStatus::Running);
+        assert!(matches!(detail, ItemDetail::Subagent { status: Some(s), .. } if s == "running"));
+        let item = t.get("call_1").unwrap();
+        assert_eq!(item.status, ItemStatus::Completed);
+        let ItemDetail::Subagent { status, output, .. } = item.detail(Harness::Pi) else {
+            panic!()
+        };
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(output.as_deref(), Some("scout completed: 12 files"));
+    }
+
+    #[test]
+    fn transcript_waits_on_an_async_subagent() {
+        let session = r#"{"type":"message","id":"u1","message":{"role":"user","content":"map it","timestamp":1}}
+{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_1","name":"subagent","arguments":{"agent":"scout","async":true}}],"stopReason":"toolUse","timestamp":2}}
+{"type":"message","id":"r1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"subagent","content":[{"type":"text","text":"Async: scout [run-7]"}],"details":{"asyncId":"run-7","runId":"run-7"},"isError":false,"timestamp":3}}
+{"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"text","text":"Launched."}],"stopReason":"stop","timestamp":4}}
+{"type":"custom_message","id":"c1","customType":"subagent-notify","content":"scout completed","display":false,"details":{"runs":[{"agent":"scout","status":"completed","runId":"run-7"}]}}
+{"type":"message","id":"u2","message":{"role":"user","content":"Inspect subagent updates above.","timestamp":5}}
+{"type":"message","id":"a3","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"stopReason":"stop","timestamp":6}}
+"#;
+        let events = Transcript::new().feed(session.as_bytes());
+        assert_eq!(
+            states(&events),
+            [
+                RunState::Working { progress: None },
+                RunState::Working { progress: None },
+                RunState::Waiting,
+                RunState::Working { progress: None },
+                RunState::Done,
+            ]
+        );
+        let call = |completed: bool| {
+            events.iter().position(|e| match e {
+                Event::ItemCompleted { id, .. } => completed && id == "call_1",
+                Event::ItemUpdated { id, .. } => !completed && id == "call_1",
+                _ => false,
+            })
+        };
+        assert!(call(false) < call(true), "launched, then reported back");
     }
 
     #[test]
