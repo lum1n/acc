@@ -47,6 +47,8 @@ run against (live, or the recordings under `tests/fixtures`), and `parse_probe` 
 installed harness as `Compat::{Tested, Newer, Older, Unknown}` so clients can warn: newer is
 probably fine, older can lack a flag ACC passes. Unknown events are kept as `Event::Unrecognized`,
 never fatal.
+`Event::TurnCompleted` is the last event of a turn on every harness, after the state
+the turn ended in.
 
 **Images.** `Command::Prompt` and `LaunchRequest` carry `Attachment`s: images inline as base64, so
 nothing is copied to the host first and the bytes ride the same stdin path as text. Every

@@ -87,6 +87,8 @@ pub enum Event {
     /// with the actions it offers. Answers a palette entry; a newer panel
     /// with the same `id` replaces the old one.
     Panel(Panel),
+    /// The last event of a turn, on every harness: the state the turn ended
+    /// in (done, error, idle, waiting) has already been reported.
     TurnCompleted,
     Exited {
         code: Option<i32>,

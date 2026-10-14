@@ -280,6 +280,8 @@ fn failed_turn_is_error_with_message() {
     );
     assert!(events.iter().any(|e| matches!(e,
         Event::StateChanged(s) if s.state == RunState::Error && s.message.as_deref() == Some("stream disconnected"))));
+    // The state the turn ended in comes first, on every harness.
+    assert_eq!(events.last(), Some(&Event::TurnCompleted));
 }
 
 #[test]

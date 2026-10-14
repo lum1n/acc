@@ -785,7 +785,6 @@ impl ClaudeDriver {
             left.into_iter()
                 .map(|request_id| Event::PermissionResolved { request_id }),
         );
-        out.push(Event::TurnCompleted);
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false)
             || str_at(v, "subtype").is_some_and(|s| s != "success");
         if is_error {
@@ -803,6 +802,7 @@ impl ClaudeDriver {
         } else {
             self.set_state(RunState::Done, None, out);
         }
+        out.push(Event::TurnCompleted);
     }
 
     fn on_rate_limit(&mut self, v: &Value, out: &mut Vec<Event>) {

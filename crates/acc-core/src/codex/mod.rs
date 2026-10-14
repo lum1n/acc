@@ -449,7 +449,6 @@ impl CodexDriver {
             }
             "turn/completed" if ours => {
                 self.turn_id = None;
-                out.push(Event::TurnCompleted);
                 let turn = p.get("turn").cloned().unwrap_or(Value::Null);
                 match str_at(&turn, "status") {
                     Some("failed") => {
@@ -462,6 +461,7 @@ impl CodexDriver {
                     Some("interrupted") => self.set_state(RunState::Idle, Some("Interrupted".into()), out),
                     _ => self.set_state(RunState::Done, None, out),
                 }
+                out.push(Event::TurnCompleted);
             }
             "item/started" => {
                 if let Some(item) = p.get("item") {

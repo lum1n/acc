@@ -461,6 +461,16 @@ fn unstreamed_assistant_text_is_announced_whole() {
 }
 
 #[test]
+fn failed_turn_reports_error_before_turn_completed() {
+    let mut d = ClaudeDriver::default();
+    let events = d.on_output(
+        b"{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"errors\":[\"boom\"]}\n",
+    );
+    assert_eq!(events.last(), Some(&Event::TurnCompleted));
+    assert_eq!(states(&events), [RunState::Error]);
+}
+
+#[test]
 fn garbage_and_unknown_frames_are_kept_not_fatal() {
     let mut d = ClaudeDriver::default();
     let events = d.on_output(b"not json\n{\"type\":\"future_thing\"}\n");
