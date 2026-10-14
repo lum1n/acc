@@ -141,6 +141,9 @@ pub struct CodexDriver {
     child_threads: HashMap<String, String>,
     /// `spawnAgent` items that haven't named their thread yet, oldest first.
     unclaimed_spawns: Vec<String>,
+    /// Each subagent thread's last agent message, its report to the parent.
+    #[serde(default)]
+    child_reports: HashMap<String, String>,
     /// Prompts sent before `thread/start` or `thread/resume` answered,
     /// flushed in order once the thread opens.
     queued_prompts: Vec<(String, Vec<Attachment>)>,
@@ -177,6 +180,7 @@ impl CodexDriver {
             skills: Vec::new(),
             child_threads: HashMap::new(),
             unclaimed_spawns: Vec::new(),
+            child_reports: HashMap::new(),
             queued_prompts: Vec::new(),
             commands: Vec::new(),
             options: Vec::new(),
@@ -420,7 +424,11 @@ impl CodexDriver {
             "thread/status/changed" if ours => {
                 let status = p.get("status").cloned().unwrap_or(Value::Null);
                 match str_at(&status, "type") {
-                    Some("idle") if !matches!(self.state, Some(RunState::Done | RunState::Error)) => {
+                    // Mid-turn, `turn/completed` reports how the turn ended.
+                    Some("idle")
+                        if self.turn_id.is_none()
+                            && !matches!(self.state, Some(RunState::Done | RunState::Error)) =>
+                    {
                         self.set_state(RunState::Idle, None, out);
                     }
                     Some("systemError") => self.set_state(RunState::Error, None, out),
@@ -464,7 +472,9 @@ impl CodexDriver {
                 out.push(Event::TurnCompleted);
             }
             "item/started" => {
-                if let Some(item) = p.get("item") {
+                if let Some(item) = p.get("item")
+                    && !self.subagent_finished(item, out)
+                {
                     let ext = self.item_ext(item, &p);
                     self.adopt_children(item);
                     let parent = self.parent_for(&p);
@@ -485,14 +495,25 @@ impl CodexDriver {
             "item/completed" => {
                 if let Some(item) = p.get("item") {
                     self.adopt_children(item);
+                    self.keep_report(item, &p);
                 }
                 if let Some(item) = p.get("item")
                     && let (Some(id), Some(_)) = (owned(item, "id"), item_kind(item))
                 {
-                    out.push(Event::ItemCompleted {
-                        id,
-                        extensions: item.clone(),
-                    });
+                    if is_activity(item, "completed") {
+                        // Finished by `subagent_finished` when it started.
+                    } else if is_activity(item, "started") {
+                        // The spawn call returned; the subagent runs on.
+                        out.push(Event::ItemUpdated {
+                            id,
+                            extensions: item.clone(),
+                        });
+                    } else {
+                        out.push(Event::ItemCompleted {
+                            id,
+                            extensions: item.clone(),
+                        });
+                    }
                 }
             }
             "item/agentMessage/delta"
@@ -647,9 +668,16 @@ impl CodexDriver {
         }
     }
 
-    /// Remembers which collab item spawned which thread, so the child
-    /// thread's items can name it as their parent.
+    /// Remembers which item spawned which thread, so the child thread's
+    /// items can name it as their parent.
     fn adopt_children(&mut self, item: &Value) {
+        // 0.162: a `subAgentActivity` names its thread from the start.
+        if is_activity(item, "started")
+            && let (Some(id), Some(child)) = (owned(item, "id"), owned(item, "agentThreadId"))
+        {
+            self.child_threads.entry(child).or_insert(id);
+            return;
+        }
         if str_at(item, "type") != Some("collabAgentToolCall") || str_at(item, "tool") != Some("spawnAgent") {
             return;
         }
@@ -667,6 +695,42 @@ impl CodexDriver {
         } else if !self.unclaimed_spawns.contains(&id) {
             self.unclaimed_spawns.push(id);
         }
+    }
+
+    /// A subagent thread's agent message, kept as its report.
+    fn keep_report(&mut self, item: &Value, params: &Value) {
+        if str_at(item, "type") == Some("agentMessage")
+            && let Some(thread) = str_at(params, "threadId")
+            && self.child_threads.contains_key(thread)
+            && let Some(text) = owned(item, "text").filter(|t| !t.is_empty())
+        {
+            self.child_reports.insert(thread.to_owned(), text);
+        }
+    }
+
+    /// A `subAgentActivity` other than `started` (0.162): the subagent its
+    /// thread belongs to stopped. Completes the spawning item with the
+    /// child's report instead of showing it as an item of its own.
+    fn subagent_finished(&mut self, item: &Value, out: &mut Vec<Event>) -> bool {
+        if str_at(item, "type") != Some("subAgentActivity") || is_activity(item, "started") {
+            return false;
+        }
+        let child = str_at(item, "agentThreadId");
+        if let Some(spawn) = child.and_then(|c| self.child_threads.get(c)).cloned() {
+            let status = match str_at(item, "kind") {
+                Some("completed") => "completed",
+                Some(other) => other,
+                None => "completed",
+            };
+            out.push(Event::ItemCompleted {
+                id: spawn,
+                extensions: json!({
+                    "childStatus": status,
+                    "report": child.and_then(|c| self.child_reports.get(c)),
+                }),
+            });
+        }
+        true
     }
 
     /// The collab item whose thread an item belongs to, for subagent items.
@@ -1464,10 +1528,15 @@ fn item_kind(item: &Value) -> Option<ItemKind> {
         "reasoning" => ItemKind::Reasoning,
         "commandExecution" => ItemKind::CommandExecution,
         "fileChange" => ItemKind::FileChange,
-        "collabAgentToolCall" => ItemKind::Subagent,
+        "collabAgentToolCall" | "subAgentActivity" => ItemKind::Subagent,
         "hookPrompt" | "functionCallOutput" => return None,
         _ => ItemKind::ToolCall,
     })
+}
+
+/// A 0.162 `subAgentActivity` item of this `kind` (`started`, `completed`).
+fn is_activity(item: &Value, kind: &str) -> bool {
+    str_at(item, "type") == Some("subAgentActivity") && str_at(item, "kind") == Some(kind)
 }
 
 /// Text an item carries when it starts (user input has no delta stream).

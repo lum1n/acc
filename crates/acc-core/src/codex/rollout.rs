@@ -55,6 +55,8 @@ pub struct Observer {
     announced: usize,
     /// `spawn_agent` calls waiting for their output (which names the thread).
     spawning: HashMap<String, Value>,
+    /// 0.162 agent paths (`/root/pong`) → `spawn_agent` call id.
+    paths: HashMap<String, String>,
 }
 
 impl Default for Observer {
@@ -74,6 +76,7 @@ impl Observer {
             child_order: Vec::new(),
             announced: 0,
             spawning: HashMap::new(),
+            paths: HashMap::new(),
         }
     }
 
@@ -159,6 +162,7 @@ impl Observer {
                     );
                 }
                 Some("token_count") if self.parent.is_none() => self.token_count(&p, out),
+                Some("item_completed") => self.activity(&p, out),
                 _ => {}
             },
             _ => {}
@@ -194,6 +198,21 @@ impl Observer {
                 let injected = text.trim_start().starts_with('<') || text.starts_with("# AGENTS.md");
                 if !text.is_empty() && !(kind == ItemKind::UserMessage && injected) {
                     whole_item(out, id, kind, self.parent.clone(), text, Value::Null);
+                }
+            }
+            // 0.162 messages between agents; a child's final answer is
+            // the report of the call that spawned it.
+            Some("agent_message") => {
+                let text = text_of("content");
+                let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)).map(str::trim);
+                if field("Message Type:") == Some("FINAL_ANSWER")
+                    && let Some(call) = field("Sender:").and_then(|s| self.paths.get(s))
+                    && let Some((_, report)) = text.split_once("Payload:\n")
+                {
+                    out.push(Event::ItemUpdated {
+                        id: call.clone(),
+                        extensions: json!({"report": report}),
+                    });
                 }
             }
             Some("reasoning") => {
@@ -245,7 +264,8 @@ impl Observer {
                     (
                         ItemKind::Subagent,
                         json!({"type": "collabAgentToolCall", "tool": tool,
-                               "prompt": args.get("message").or_else(|| args.get("prompt")).or_else(|| args.get("task")),
+                               "prompt": args.get("message").or_else(|| args.get("prompt")).or_else(|| args.get("task"))
+                                   .filter(|m| !m.as_str().is_some_and(encrypted)),
                                "agent": args.get("agent_type").or_else(|| args.get("nickname")).or_else(|| args.get("task_name")),
                                "model": args.get("model"),
                                "receiverThreadIds": target}),
@@ -304,12 +324,15 @@ impl Observer {
                         self.children.insert(t.clone(), call.clone());
                         self.child_order.push(t.clone());
                     }
+                    // 0.162 answers with the task name only; its
+                    // `SubAgentActivity` already named the thread.
+                    let mut ext = json!({"status": "completed"});
+                    if let Some(t) = thread {
+                        ext["receiverThreadIds"] = json!([t]);
+                    }
                     out.push(Event::ItemCompleted {
                         id: call,
-                        extensions: json!({
-                            "receiverThreadIds": thread.map(|t| vec![t]).unwrap_or_default(),
-                            "status": "completed",
-                        }),
+                        extensions: ext,
                     });
                     return;
                 }
@@ -324,6 +347,42 @@ impl Observer {
                 });
             }
             _ => {}
+        }
+    }
+
+    /// A 0.162 `SubAgentActivity`: `started` names the spawn's thread,
+    /// anything else says that subagent stopped.
+    fn activity(&mut self, p: &Value, out: &mut Vec<Event>) {
+        let item = p.get("item").cloned().unwrap_or(Value::Null);
+        if str_at(&item, "type") != Some("SubAgentActivity") {
+            return;
+        }
+        let Some(thread) = owned(&item, "agent_thread_id") else {
+            return;
+        };
+        match (str_at(&item, "kind"), owned(&item, "id")) {
+            (Some("started"), Some(call)) => {
+                if let Some(path) = owned(&item, "agent_path") {
+                    self.paths.insert(path, call.clone());
+                }
+                if !self.children.contains_key(&thread) {
+                    self.children.insert(thread.clone(), call.clone());
+                    self.child_order.push(thread.clone());
+                }
+                out.push(Event::ItemUpdated {
+                    id: call,
+                    extensions: json!({"receiverThreadIds": [thread], "model": item.get("model"),
+                                       "childStatus": "running"}),
+                });
+            }
+            (kind, _) => {
+                if let Some(call) = self.children.get(&thread) {
+                    out.push(Event::ItemUpdated {
+                        id: call.clone(),
+                        extensions: json!({"childStatus": kind.unwrap_or("completed")}),
+                    });
+                }
+            }
         }
     }
 
@@ -399,6 +458,11 @@ fn collab_tool(name: &str) -> Option<&'static str> {
         "resume_agent" => "resumeAgent",
         _ => return None,
     })
+}
+
+/// Codex 0.162 stores a spawned agent's task as a Fernet token, not text.
+fn encrypted(text: &str) -> bool {
+    text.starts_with("gAAAAA") && !text.contains(char::is_whitespace)
 }
 
 /// The first UUID-shaped word in a tool output (a thread id).
@@ -592,6 +656,49 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::ItemUpdated { id, .. } if id == "c9"))
         );
+    }
+
+    const PARENT_0162: &str =
+        include_str!("../../tests/fixtures/codex/subagent-0.162.1-parent.rollout.jsonl");
+    const CHILD_0162: &str = include_str!("../../tests/fixtures/codex/subagent-0.162.1-child.rollout.jsonl");
+
+    /// Recorded 0.162.1 rollouts: the spawn's task is encrypted, the thread
+    /// is named by a `SubAgentActivity`, and the child's `FINAL_ANSWER`
+    /// reaches the parent as an inter-agent message.
+    #[test]
+    fn recorded_0162_spawn_names_its_thread_and_report() {
+        let child = "01a13c40-d0f6-7b91-8fb1-48b77d83bdfb";
+        let spawn = "call_732b7e56cb3a4dba89c9ef3b2bb1e7b9";
+        let mut o = Observer::new();
+        let mut t = crate::transcript::Transcript::new();
+        for e in o.feed(PARENT_0162.as_bytes()) {
+            t.apply(&e);
+        }
+        let crate::item::ItemDetail::Subagent {
+            agent,
+            child: c,
+            prompt,
+            status,
+            output,
+            model,
+            ..
+        } = t.get(spawn).unwrap().detail(Harness::Codex)
+        else {
+            panic!()
+        };
+        assert_eq!((agent.as_deref(), prompt), (Some("pong"), None));
+        assert_eq!(c.as_deref(), Some(child));
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(output.as_deref(), Some("pong"));
+        assert_eq!(model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(o.take_new_children(), [(child.to_owned(), spawn.to_owned())]);
+
+        let mut c = Observer::for_child(spawn);
+        for e in c.feed(CHILD_0162.as_bytes()) {
+            t.apply(&e);
+        }
+        let replies: Vec<_> = t.children(spawn).map(|i| i.text.as_str()).collect();
+        assert_eq!(replies, ["pong"]);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use super::*;
 
 const HANDSHAKE: &str = include_str!("../../tests/fixtures/codex/handshake.ndjson");
 const TURN: &str = include_str!("../../tests/fixtures/codex/turn-network-error.ndjson");
+const SUBAGENT: &str = include_str!("../../tests/fixtures/codex/subagent-0.162.1.ndjson");
 const THREAD: &str = "01a125ba-bc10-7a62-8401-c7b0088728d3";
 
 fn replay(d: &mut CodexDriver, recording: &str) -> Vec<Event> {
@@ -805,9 +806,89 @@ fn prompts_with_images_are_data_url_inputs() {
     }));
 }
 
+/// Recorded from 0.162.1 (`acc run codex`): the parent spawns one subagent,
+/// waits for it and reports what it said. The spawn is a `subAgentActivity`
+/// naming the child thread, the child's items stream on that thread, and a
+/// second `subAgentActivity` (`kind: completed`) says it stopped.
+#[test]
+fn recorded_subagent_is_one_item_with_its_childs_conversation() {
+    use crate::item::ItemDetail;
+    use crate::transcript::{ItemStatus, Transcript};
+    let mut d = CodexDriver::default();
+    d.handshake();
+    let mut t = Transcript::new();
+    let mut events = Vec::new();
+    for line in SUBAGENT.split_inclusive('\n') {
+        for e in d.on_output(line.as_bytes()) {
+            t.apply(&e);
+            if matches!(e, Event::SessionStarted { .. }) {
+                d.command(Command::prompt("spawn one")).unwrap();
+            }
+            events.push(e);
+        }
+    }
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Unrecognized { .. })),
+        "{events:#?}"
+    );
+    let subs: Vec<_> = t
+        .subagents()
+        .filter(|i| i.ext["type"] == "subAgentActivity")
+        .collect();
+    assert_eq!(subs.len(), 1, "the completion activity isn't an item of its own");
+    let sub = subs[0];
+    assert_eq!(sub.status, ItemStatus::Completed);
+    let ItemDetail::Subagent {
+        agent,
+        child,
+        status,
+        output,
+        model,
+        ..
+    } = sub.detail(Harness::Codex)
+    else {
+        panic!()
+    };
+    assert_eq!(agent.as_deref(), Some("pong"));
+    assert_eq!(child.as_deref(), Some("01a13c40-d0f6-7b91-8fb1-48b77d83bdfb"));
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert_eq!(output.as_deref(), Some("pong"));
+    assert_eq!(model.as_deref(), Some("gpt-6-luna"));
+    // The child's reply belongs to the subagent, not the main conversation.
+    let children: Vec<_> = t.children(&sub.id).collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        (children[0].kind, children[0].text.as_str()),
+        (ItemKind::AgentMessage, "pong")
+    );
+    let top: Vec<_> = t
+        .top_level()
+        .filter(|i| i.kind == ItemKind::AgentMessage)
+        .collect();
+    assert_eq!(top.len(), 1);
+    assert!(top[0].text.contains("pong"));
+    // No idle flicker before the turn reports how it ended.
+    let states: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::StateChanged(s) => Some(s.state.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            RunState::Idle,
+            RunState::Working { progress: None },
+            RunState::Done
+        ]
+    );
+    assert_eq!(events.last(), Some(&Event::TurnCompleted));
+}
+
 /// Frames shaped by the 0.128 app-server types (`collabAgentToolCall`,
-/// `SessionSource.subAgent.thread_spawn`); not recorded, as no account was
-/// logged in.
+/// `SessionSource.subAgent.thread_spawn`), which 0.162 still sends for
+/// `wait`; the spawn itself is recorded above.
 #[test]
 fn collab_spawn_is_a_subagent_and_child_thread_items_belong_to_it() {
     use crate::item::ItemDetail;

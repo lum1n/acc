@@ -313,7 +313,9 @@ fn in_background(item: &Item) -> bool {
         && (item.ext.pointer("/result/isAsync").and_then(Value::as_bool) == Some(true)
             || item.ext.pointer("/task/is_backgrounded").and_then(Value::as_bool) == Some(true)
             // pi-subagents' `async: true` launch.
-            || item.ext.pointer("/result/details/asyncId").is_some())
+            || item.ext.pointer("/result/details/asyncId").is_some()
+            // A Codex 0.162 spawn until its `subAgentActivity` says it stopped.
+            || (str_at(&item.ext, "type") == Some("subAgentActivity") && item.ext.get("childStatus").is_none()))
 }
 
 fn failed(ext: &Value) -> bool {
@@ -429,6 +431,28 @@ mod tests {
         assert!(t.settle(&Event::TurnCompleted).is_empty());
         assert_eq!(t.get("bg").unwrap().status, ItemStatus::Running);
         assert_eq!(t.settle(&Event::Exited { code: Some(0) }).len(), 1);
+    }
+
+    #[test]
+    fn codex_spawns_outlive_the_turn_until_their_activity_completes() {
+        let mut t = Transcript::new();
+        let spawn = json!({"type": "subAgentActivity", "kind": "started", "agentThreadId": "c1"});
+        t.apply(&Event::ItemStarted {
+            id: "s".into(),
+            kind: ItemKind::Subagent,
+            parent: None,
+            extensions: spawn.clone(),
+        });
+        t.apply(&Event::ItemUpdated {
+            id: "s".into(),
+            extensions: spawn,
+        });
+        assert!(t.settle(&Event::TurnCompleted).is_empty());
+        t.apply(&Event::ItemCompleted {
+            id: "s".into(),
+            extensions: json!({"childStatus": "completed", "report": "pong"}),
+        });
+        assert_eq!(t.get("s").unwrap().status, ItemStatus::Completed);
     }
 
     #[test]

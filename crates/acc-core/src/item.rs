@@ -579,6 +579,27 @@ fn claude(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
 /// `close_agent`, `resume_agent`), as the app-server's `collabAgentToolCall`
 /// item. The driver merges the child thread's nickname or role as `agent`.
 fn codex_subagent(ext: &Value, text: &str) -> ItemDetail {
+    // 0.162: the spawn is a `subAgentActivity` naming the child thread and
+    // its path (`/root/pong`); the driver merges `childStatus` and `report`
+    // when it stops.
+    if str_at(ext, "type") == Some("subAgentActivity") {
+        let agent = str_at(ext, "agentPath")
+            .and_then(|p| p.rsplit('/').next())
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned);
+        return ItemDetail::Subagent {
+            description: match &agent {
+                Some(name) => format!("Spawn agent {name}"),
+                None => "Spawn agent".to_owned(),
+            },
+            agent,
+            prompt: None,
+            child: owned(ext, "agentThreadId"),
+            status: owned(ext, "childStatus").or_else(|| Some("running".to_owned())),
+            output: owned(ext, "report"),
+            model: owned(ext, "model"),
+        };
+    }
     let tool = str_at(ext, "tool").unwrap_or("spawnAgent");
     let child = ext
         .get("receiverThreadIds")
@@ -613,6 +634,7 @@ fn codex_subagent(ext: &Value, text: &str) -> ItemDetail {
         output: state
             .and_then(|s| owned(s, "message"))
             .filter(|m| !m.is_empty())
+            .or_else(|| owned(ext, "report"))
             .or_else(|| (!text.is_empty()).then(|| text.to_owned())),
         model: owned(ext, "model"),
     }

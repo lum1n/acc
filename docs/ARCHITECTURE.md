@@ -46,8 +46,7 @@ ACC drives whatever version is installed. `Harness::tested_versions` is the rang
 run against (live, or the recordings under `tests/fixtures`), and `parse_probe` grades each
 installed harness as `Compat::{Tested, Newer, Older, Unknown}` so clients can warn: newer is
 probably fine, older can lack a flag ACC passes. Unknown events are kept as `Event::Unrecognized`,
-never fatal.
-`Event::TurnCompleted` is the last event of a turn on every harness, after the state
+never fatal. `Event::TurnCompleted` is the last event of a turn on every harness, after the state
 the turn ended in.
 
 **Images.** `Command::Prompt` and `LaunchRequest` carry `Attachment`s: images inline as base64, so
@@ -167,7 +166,7 @@ back and the follow-up is answered, so they stay `Working`.
 | Harness | How a subagent shows up | Child conversation |
 |---|---|---|
 | Claude | `Agent`/`Task` tool call; `system/task_started`, `task_progress`, `task_updated`, `task_notification` merge onto it; a background launch's tool result only acknowledges (`isAsync`), the notification finishes it | `~/.claude/projects/<proj>/<session>/subagents/agent-<id>.jsonl`, named by `agent-<id>.meta.json`'s `toolUseId`; `Driver::launch` adds `--forward-subagent-text` so a driven session streams it live too |
-| Codex | `collabAgentToolCall` item (`spawnAgent`, ...); `thread/started` with `source.subAgent.thread_spawn.parent_thread_id` names the child thread | the child's own thread: its `item/*` notifications carry its `threadId`, mapped back to the spawning item |
+| Codex | 0.162: a `subAgentActivity` item (`kind: started`) names the child thread (`agentThreadId`) and the agent (`agentPath`); its immediate completion only updates it, and a later `subAgentActivity` with another `kind` finishes it with the child's last message as the report. Older: `collabAgentToolCall` (`spawnAgent`, ...) and `thread/started` with `source.subAgent.thread_spawn.parent_thread_id`. `wait` and the other collab tools stay `collabAgentToolCall` | the child's own thread: its `item/*` notifications carry its `threadId`, mapped back to the spawning item. Rollouts: `SubAgentActivity` records name the thread, the spawn's task is encrypted (shown as no prompt), and the child's `FINAL_ANSWER` inter-agent message is the report |
 | Cursor, Copilot, opencode (ACP) | a `task`/`subagent`-shaped tool call (name, or `rawInput.subagent_type`/`agent` with a prompt); the report is opencode's `task_id: …`/`<task_result>` (1.x) or `<subagent sessionID="…">` (2.0) wrapper, unwrapped by `item::detail` | opencode forwards the child session's updates under the parent's session id, tagged `_meta["opencode/child-session"]`; other agents report only the final text |
 | pi | the pi-subagents extension's `subagent` tool; an `async: true` launch's result only acknowledges (`details.asyncId`), its `subagent-notify` custom message finishes it | none (no child transcript) |
 

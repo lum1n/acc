@@ -1,6 +1,6 @@
 # Recorded harness sessions
 
-Real stdout captured from the harnesses on 2026-10-10 (2026-10-12 for the subagent recordings, 2026-10-13 for the background-agent one, 2026-10-14 for Cursor),
+Real stdout captured from the harnesses on 2026-10-10 (2026-10-12 for the subagent recordings, 2026-10-13 for the background-agent one, 2026-10-14 for Cursor and the Codex subagent),
 replayed by the driver tests.
 
 | File | Harness | What it covers |
@@ -15,6 +15,8 @@ replayed by the driver tests.
 | `codex/turn-network-error.ndjson` | codex-cli 0.162.1 | a turn that can't reach the API (retries) |
 | `codex/rollout.jsonl` | codex-cli 0.162.1 | the rollout file of that interrupted turn |
 | `acp/cursor-2026.10.01.{in,out}.ndjson` | Cursor Agent 2026.10.01 | `acc acp cursor` with its default model: `Run echo acc-live-test`, the shell call approved with `allow-once`, no usage reported |
+| `codex/subagent-0.162.1.ndjson` | codex-cli 0.162.1 | `acc run codex`: the parent spawns one subagent (`subAgentActivity` `started`), waits for it (`collabAgentToolCall` `wait`), the child's reply streams on its own thread, `subAgentActivity` `completed`, then the parent's answer |
+| `codex/subagent-0.162.1-{parent,child}.rollout.jsonl` | codex-cli 0.162.1 | the two rollout files of that session: the spawn's encrypted task, `SubAgentActivity` records naming the thread, the child's `FINAL_ANSWER` as an inter-agent message |
 | `acp/opencode-2.0.14-subagent.{in,out}.ndjson` | opencode 2.0.14 | a `subagent` tool call to `explore`, whose child session streams under the parent's session id tagged `_meta["opencode/child-session"]` |
 
 Edits made when recording: home paths and the Claude session id were replaced, very long lists
@@ -22,7 +24,8 @@ Edits made when recording: home paths and the Claude session id were replaced, v
 lines were dropped from the transcript files, and Codex response ids were renumbered to match the
 order `CodexDriver::handshake` sends its requests in.
 
-The Codex collab (subagent) tests aren't recorded: no account was logged in when this was written.
-They're built from the 0.128 app-server TypeScript types (`codex app-server generate-ts`) and the
-`collab_*` strings in the `codex` binary instead, and are called out as synthetic in their doc
-comments.
+Codex 0.162 recordings: `skills/list` was cut to two system skills, MCP startup lines were dropped,
+and the rollouts keep only the session metadata, conversation and events (no instructions,
+developer messages or environment). The older Codex collab test (`spawnAgent` with
+`thread/started`) is still built from the 0.128 app-server TypeScript types and says so in its doc
+comment.
