@@ -30,6 +30,12 @@ pub const EXIT_NOT_RUNNING: u32 = 3;
 /// Exit code of [`SessionDir::write_script`] when fewer bytes arrived than
 /// announced (the connection dropped mid-upload). Nothing was written.
 pub const EXIT_INCOMPLETE: u32 = 4;
+/// Launch exit status when the harness could not start in its working
+/// directory (it does not exist, or is not enterable).
+pub const EXIT_NO_CWD: u32 = 5;
+/// How many 20 ms ticks the launch script waits for the harness PID before
+/// giving up, so a wrapper that dies without a trace cannot hang the launch.
+pub const LAUNCH_WAIT_TICKS: u32 = 500;
 
 /// A detached session's directory on the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,13 +173,19 @@ impl SessionDir {
         })
         .unwrap_or_default();
         // The wrapper starts the harness, records its PID, waits for it and
-        // records the exit code. `$0` is the session directory.
+        // records the exit code. `$0` is the session directory. A `cd` that
+        // fails is recorded as an exit too, so the launcher below sees it
+        // instead of waiting for a PID that never comes.
         let wrapper = format!(
-            "cd {cwd} || exit 1; {env}{cmd} <>\"$0/in\" >>\"$0/out.ndjson\" 2>>\"$0/err\" & \
+            "cd {cwd} 2>>\"$0/err\" || {{ echo {EXIT_NO_CWD} >\"$0/exit\"; exit 1; }}; \
+             {env}{cmd} <>\"$0/in\" >>\"$0/out.ndjson\" 2>>\"$0/err\" & \
              echo $! >\"$0/pid\"; wait $!; echo $? >\"$0/exit\"",
             cwd = quote(cwd),
         );
         let d = self.dir();
+        // Waits for the PID, but gives up on a recorded exit (the wrapper
+        // could not start the harness) or after `LAUNCH_WAIT_TICKS` ticks, so a
+        // bad directory or a dead shell fails the launch rather than hanging it.
         format!(
             "set -e\n\
              {LOGIN_PATH}\
@@ -184,10 +196,20 @@ impl SessionDir {
              : >>\"$d/out.ndjson\"\n\
              printf '%s\\n' {record} >\"$d/spec.json\"\n\
              nohup sh -c {wrapper} \"$d\" </dev/null >/dev/null 2>&1 &\n\
-             while [ ! -s \"$d/pid\" ]; do sleep 0.02; done\n\
+             i=0\n\
+             while [ ! -s \"$d/pid\" ]; do\n\
+             if [ -s \"$d/exit\" ]; then\n\
+             echo \"harness did not start in {cwd_text}: $(cat \"$d/err\" 2>/dev/null | tail -n 1)\" >&2\n\
+             exit {EXIT_NO_CWD}\n\
+             fi\n\
+             i=$((i + 1))\n\
+             if [ \"$i\" -ge {LAUNCH_WAIT_TICKS} ]; then echo \"harness did not report a pid\" >&2; exit 1; fi\n\
+             sleep 0.02\n\
+             done\n\
              cat \"$d/pid\"\n",
             record = quote(&record),
             wrapper = quote(&wrapper),
+            cwd_text = quote(cwd),
         )
     }
 
@@ -403,6 +425,32 @@ mod sh_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         content
+    }
+
+    #[test]
+    fn launch_fails_fast_when_the_directory_is_missing() {
+        let home = std::env::temp_dir().join(format!("acc-test-nocwd-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let dir = SessionDir::new("nocwd").expect("valid id");
+        let spec = LaunchSpec {
+            program: "cat".into(),
+            args: vec![],
+            env: vec![],
+            protocol: Protocol::Acp,
+        };
+        let missing = home.join("no-such-directory");
+        let started = Instant::now();
+        let (out, code) = sh_code(&home, &dir.launch_script(&spec, &missing.to_string_lossy()), b"");
+        assert_eq!(code, Some(EXIT_NO_CWD as i32), "stdout: {out}");
+        assert!(started.elapsed() < Duration::from_secs(5), "launch hung");
+        assert!(out.trim().is_empty(), "no pid may be printed: {out}");
+        let listed = parse_list(&sh(&home, &list_script(), b""));
+        assert_eq!(listed.len(), 1);
+        assert!(
+            matches!(listed[0].status, Status::Exited { .. }),
+            "{:?}",
+            listed[0].status
+        );
     }
 
     #[test]
