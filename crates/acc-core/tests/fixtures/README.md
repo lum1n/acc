@@ -1,6 +1,6 @@
 # Recorded harness sessions
 
-Real stdout captured from the harnesses on 2026-10-10 (2026-10-12 for the subagent recordings, 2026-10-13 for the background-agent one),
+Real stdout captured from the harnesses on 2026-10-10 (2026-10-12 for the subagent recordings, 2026-10-13 for the background-agent one, 2026-10-14 for Cursor),
 replayed by the driver tests.
 
 | File | Harness | What it covers |
@@ -14,10 +14,11 @@ replayed by the driver tests.
 | `codex/handshake.ndjson` | codex-cli 0.162.1 | `initialize`, `thread/start`, `model/list`, profiles, modes, rate limits without auth |
 | `codex/turn-network-error.ndjson` | codex-cli 0.162.1 | a turn that can't reach the API (retries) |
 | `codex/rollout.jsonl` | codex-cli 0.162.1 | the rollout file of that interrupted turn |
+| `acp/cursor-2026.10.01.{in,out}.ndjson` | Cursor Agent 2026.10.01 | `acc acp cursor` with its default model: `Run echo acc-live-test`, the shell call approved with `allow-once`, no usage reported |
 | `acp/opencode-2.0.14-subagent.{in,out}.ndjson` | opencode 2.0.14 | a `subagent` tool call to `explore`, whose child session streams under the parent's session id tagged `_meta["opencode/child-session"]` |
 
 Edits made when recording: home paths and the Claude session id were replaced, very long lists
-(tools, commands, skills, models, context grid) were cut down, environment-specific bookkeeping
+(tools, commands, skills, models, context grid) were cut down (Cursor's commands to its own, without the recording machine's skills), environment-specific bookkeeping
 lines were dropped from the transcript files, and Codex response ids were renumbered to match the
 order `CodexDriver::handshake` sends its requests in.
 

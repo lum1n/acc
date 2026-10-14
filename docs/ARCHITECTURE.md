@@ -70,8 +70,8 @@ legacy `modes`/`models` fields and `session/set_mode`/`session/set_model` as fal
 spawn flag (`agent --model X acp`), reported as `Apply::Restart`. Slash commands are prompt text, taken
 from `available_commands_update`. Request ids carry a per-client tag, and `Start::Attach` lets a second
 client (or a reconnect) adopt a running agent from its log, reading other clients' responses by shape.
-`acc acp <harness> <cwd>` drives one locally for spikes. Recorded Copilot 1.0.95 and opencode 1.18.35
-sessions under `crates/acc-core/tests/fixtures/acp` are replayed in CI. `acc run <harness> <cwd>`
+`acc acp <harness> <cwd>` drives one locally for spikes. Recorded Copilot 1.0.95, opencode 1.18.35 and
+Cursor 2026.10.01 sessions under `crates/acc-core/tests/fixtures/acp` are replayed in CI. `acc run <harness> <cwd>`
 is the same kind of spike tool for Claude, Codex and pi, over their own drivers
 (`acc_core::{claude,codex,pi}`). Both share the drive loop in `acc-cli/src/live.rs`: spawn, write the
 handshake, then pump bytes. A prompt sent before the driver has a session (`AcpDriver` before

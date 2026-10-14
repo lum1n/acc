@@ -1,6 +1,6 @@
 //! Replays real ACP sessions recorded from Copilot CLI 1.0.95 and opencode
-//! 1.18.35 (`acc acp` against a local mock model, one shell tool call that
-//! needs approval). `*.out.ndjson` is what the agent wrote, `*.in.ndjson` what
+//! 1.18.35 (`acc acp` against a local mock model) and Cursor Agent 2026.10.01
+//! (its own default model), each one shell tool call that needs approval. `*.out.ndjson` is what the agent wrote, `*.in.ndjson` what
 //! ACC wrote back. Paths and request-id tags were normalized after recording.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -16,6 +16,8 @@ const COPILOT_OUT: &str = include_str!("fixtures/acp/copilot-1.0.95.out.ndjson")
 const COPILOT_IN: &str = include_str!("fixtures/acp/copilot-1.0.95.in.ndjson");
 const OPENCODE_OUT: &str = include_str!("fixtures/acp/opencode-1.18.35.out.ndjson");
 const OPENCODE_IN: &str = include_str!("fixtures/acp/opencode-1.18.35.in.ndjson");
+const CURSOR_OUT: &str = include_str!("fixtures/acp/cursor-2026.10.01.out.ndjson");
+const CURSOR_IN: &str = include_str!("fixtures/acp/cursor-2026.10.01.in.ndjson");
 
 const PROMPT: &str = "Run echo acc-live-test";
 
@@ -79,7 +81,7 @@ fn replay_as_launcher(harness: Harness, out_log: &str) -> (Vec<Event>, Vec<u8>) 
     (events, written)
 }
 
-fn check_turn(harness: Harness, out_log: &str, in_log: &str, approve: &str) {
+fn check_turn(harness: Harness, out_log: &str, in_log: &str, approve: &str) -> Vec<Event> {
     let (events, written) = replay_as_launcher(harness, out_log);
     assert_eq!(
         json_lines(std::str::from_utf8(&written).unwrap()),
@@ -116,6 +118,12 @@ fn check_turn(harness: Harness, out_log: &str, in_log: &str, approve: &str) {
     )));
     assert!(events.iter().any(|e| matches!(e,
         Event::ItemCompleted { extensions, .. } if extensions["status"] == "completed")));
+    assert_eq!(events.last(), Some(&Event::TurnCompleted));
+    events
+}
+
+/// The mock model's reply and usage report.
+fn check_mock_reply(events: &[Event]) {
     assert!(
         events
             .iter()
@@ -126,17 +134,36 @@ fn check_turn(harness: Harness, out_log: &str, in_log: &str, approve: &str) {
             .iter()
             .any(|e| matches!(e, Event::Usage(u) if u.output_tokens.is_some()))
     );
-    assert_eq!(events.last(), Some(&Event::TurnCompleted));
 }
 
 #[test]
 fn copilot_turn_with_approval() {
-    check_turn(Harness::Copilot, COPILOT_OUT, COPILOT_IN, "allow_once");
+    check_mock_reply(&check_turn(
+        Harness::Copilot,
+        COPILOT_OUT,
+        COPILOT_IN,
+        "allow_once",
+    ));
 }
 
 #[test]
 fn opencode_turn_with_approval() {
-    check_turn(Harness::Opencode, OPENCODE_OUT, OPENCODE_IN, "once");
+    check_mock_reply(&check_turn(Harness::Opencode, OPENCODE_OUT, OPENCODE_IN, "once"));
+}
+
+#[test]
+fn cursor_turn_with_approval() {
+    let events = check_turn(Harness::Cursor, CURSOR_OUT, CURSOR_IN, "allow-once");
+    let reply: String = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ItemDelta { id, text } if id == "item-4" => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reply, "`acc-live-test`");
+    // Cursor reports no usage in ACP.
+    assert!(!events.iter().any(|e| matches!(e, Event::Usage(_))));
 }
 
 #[test]
@@ -166,7 +193,11 @@ fn recorded_options_and_commands() {
 /// while another client drove it, and ends up in the same place.
 #[test]
 fn attach_replays_another_clients_log() {
-    for (harness, log) in [(Harness::Copilot, COPILOT_OUT), (Harness::Opencode, OPENCODE_OUT)] {
+    for (harness, log) in [
+        (Harness::Copilot, COPILOT_OUT),
+        (Harness::Opencode, OPENCODE_OUT),
+        (Harness::Cursor, CURSOR_OUT),
+    ] {
         let mut cfg = AcpConfig::new("/home/v/proj", Start::Attach);
         cfg.client_tag = "phone-1".into();
         let mut d = AcpDriver::new(harness, cfg);
