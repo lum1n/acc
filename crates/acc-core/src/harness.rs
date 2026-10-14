@@ -202,6 +202,62 @@ impl Harness {
     pub fn version_args(self) -> &'static [&'static str] {
         &["--version"]
     }
+
+    /// The oldest and newest versions the driver has been run against (live
+    /// or from the recordings under `tests/fixtures`). Older ones can lack a
+    /// flag ACC passes (Claude before 2.1.280 rejects `--forward-subagent-text`).
+    pub fn tested_versions(self) -> (&'static str, &'static str) {
+        match self {
+            Harness::Claude => ("2.1.280", "2.1.296"),
+            Harness::Codex => ("0.128.0", "0.162.1"),
+            Harness::Cursor => ("2026.10.01", "2026.10.01"),
+            Harness::Copilot => ("1.0.94", "1.0.95"),
+            Harness::Pi => ("0.82.1", "1.1.0"),
+            Harness::Opencode => ("1.18.30", "2.0.14"),
+        }
+    }
+
+    /// How a version line (`--version`'s first line, as [`parse_probe`]
+    /// reads it) compares with [`Harness::tested_versions`]. ACC drives any
+    /// version; this tells a client whether to warn.
+    pub fn compat(self, version: &str) -> Compat {
+        let Some(v) = parse_version(version) else {
+            return Compat::Unknown;
+        };
+        let (min, max) = self.tested_versions();
+        let (min, max) = (parse_version(min), parse_version(max));
+        if min.is_some_and(|min| v < min) {
+            Compat::Older
+        } else if max.is_some_and(|max| v > max) {
+            Compat::Newer
+        } else {
+            Compat::Tested
+        }
+    }
+}
+
+/// A harness version against the range ACC was tested with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compat {
+    /// Within the tested range.
+    Tested,
+    /// Newer than any tested version: probably fine, new frames are kept as
+    /// `Event::Unrecognized`.
+    Newer,
+    /// Older than the oldest tested version: launching may fail.
+    Older,
+    /// No version could be read.
+    Unknown,
+}
+
+/// The first dotted number in a version line: `2.1.296 (Claude Code)`,
+/// `codex-cli 0.128.0`, `opencode v2.0.14`, `2026.10.01-e373342`.
+fn parse_version(line: &str) -> Option<Vec<u64>> {
+    line.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|w| w.trim_matches('.'))
+        .find(|w| w.contains('.'))
+        .and_then(|w| w.split('.').map(|n| n.parse().ok()).collect())
 }
 
 /// A harness found on a host by [`probe_script`].
@@ -212,6 +268,8 @@ pub struct Availability {
     pub path: String,
     /// First line of `--version`, when it printed one in time.
     pub version: Option<String>,
+    /// That version against the range ACC was tested with.
+    pub compat: Compat,
 }
 
 /// Script listing which harnesses are installed on the host, using the
@@ -244,10 +302,12 @@ pub fn parse_probe(out: &str) -> Vec<Availability> {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_owned);
+            let compat = version.as_deref().map_or(Compat::Unknown, |v| harness.compat(v));
             Some(Availability {
                 harness,
                 path,
                 version,
+                compat,
             })
         })
         .collect()
@@ -315,6 +375,8 @@ mod tests {
         let found = parse_probe(out);
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].version.as_deref(), Some("2.1.296 (Claude Code)"));
+        assert_eq!(found[0].compat, Compat::Tested);
+        assert_eq!(found[1].compat, Compat::Unknown);
         assert_eq!(
             (found[1].harness, found[1].version.clone()),
             (Harness::Cursor, None)
@@ -333,6 +395,31 @@ mod tests {
             .unwrap_or_default();
         // Whatever is installed here, every line must parse.
         assert_eq!(parse_probe(&out).len(), out.lines().count());
+    }
+
+    #[test]
+    fn versions_compare_with_the_tested_range() {
+        assert_eq!(Harness::Claude.compat("2.1.296 (Claude Code)"), Compat::Tested);
+        assert_eq!(Harness::Claude.compat("2.1.300 (Claude Code)"), Compat::Newer);
+        assert_eq!(Harness::Claude.compat("2.1.99 (Claude Code)"), Compat::Older);
+        assert_eq!(Harness::Codex.compat("codex-cli 0.128.0"), Compat::Tested);
+        assert_eq!(Harness::Cursor.compat("2026.10.01-e373342"), Compat::Tested);
+        assert_eq!(Harness::Opencode.compat("opencode v2.0.14"), Compat::Tested);
+        assert_eq!(Harness::Opencode.compat("opencode v2.1.0"), Compat::Newer);
+        assert_eq!(Harness::Pi.compat("1.1.0"), Compat::Tested);
+        assert_eq!(
+            Harness::Copilot.compat("GitHub Copilot CLI 1.0.95."),
+            Compat::Tested
+        );
+        assert_eq!(Harness::Pi.compat("garbage"), Compat::Unknown);
+        for h in Harness::ALL {
+            let (min, max) = h.tested_versions();
+            assert_eq!(
+                (h.compat(min), h.compat(max)),
+                (Compat::Tested, Compat::Tested),
+                "{h:?}"
+            );
+        }
     }
 
     #[test]

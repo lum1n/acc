@@ -42,7 +42,11 @@ every protocol is tested by replaying recorded sessions.
 | pi | `--mode rpc` |
 | opencode | ACP (`opencode acp`) |
 
-Unknown events are kept as `Event::Unrecognized`, never fatal.
+ACC drives whatever version is installed. `Harness::tested_versions` is the range each driver was
+run against (live, or the recordings under `tests/fixtures`), and `parse_probe` grades each
+installed harness as `Compat::{Tested, Newer, Older, Unknown}` so clients can warn: newer is
+probably fine, older can lack a flag ACC passes. Unknown events are kept as `Event::Unrecognized`,
+never fatal.
 
 **Images.** `Command::Prompt` and `LaunchRequest` carry `Attachment`s: images inline as base64, so
 nothing is copied to the host first and the bytes ride the same stdin path as text. Every

@@ -12,7 +12,7 @@ use acc_core::detached::{FeedEntry, FeedPath, Listing, Status};
 use acc_core::event::{
     Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
 };
-use acc_core::harness::{Availability, Launcher};
+use acc_core::harness::{Availability, Compat, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag};
 use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
@@ -51,6 +51,10 @@ mirror_enum!(AccApply <=> Apply { Live, NextTurn, Restart });
 mirror_enum!(AccCommandSource <=> CommandSource { Builtin, Custom, Skill, Mcp, Plugin, Acc });
 mirror_enum!(AccFileChangeKind <=> FileChangeKind { Add, Delete, Update, Rename });
 mirror_enum!(AccLineTag <=> LineTag { Context, Add, Remove });
+mirror_enum!(
+    /// A harness version against the range ACC was tested with.
+    AccCompat <=> Compat { Tested, Newer, Older, Unknown }
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum AccRunState {
@@ -1096,6 +1100,7 @@ pub struct AccAvailability {
     pub harness: AccHarness,
     pub path: String,
     pub version: Option<String>,
+    pub compat: AccCompat,
 }
 
 impl From<Availability> for AccAvailability {
@@ -1104,6 +1109,7 @@ impl From<Availability> for AccAvailability {
             harness: a.harness.into(),
             path: a.path,
             version: a.version,
+            compat: a.compat.into(),
         }
     }
 }

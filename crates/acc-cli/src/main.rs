@@ -12,6 +12,7 @@ use std::process::{Command, ExitCode};
 use acc_core::Harness;
 use acc_core::detached::SessionDir;
 use acc_core::driver::Driver as _;
+use acc_core::harness::Compat;
 use acc_core::multiplexer::{self, Multiplexer, PaneRef, Target, tui};
 use acc_core::osc7501::Scanner;
 use acc_core::pi::{PiDriver, Transcript};
@@ -112,7 +113,17 @@ fn harnesses() -> ExitCode {
                     .to_owned()
             });
         match version {
-            Some(v) => println!("{:<10} {:<9} {v}", h.id(), h.program()),
+            Some(v) => match h.compat(&v) {
+                Compat::Tested => println!("{:<10} {:<9} {v}", h.id(), h.program()),
+                compat => {
+                    let (min, max) = h.tested_versions();
+                    println!(
+                        "{:<10} {:<9} {v} ({compat:?}, tested {min} to {max})",
+                        h.id(),
+                        h.program()
+                    );
+                }
+            },
             None => println!("{:<10} {:<9} (not found)", h.id(), h.program()),
         }
     }
