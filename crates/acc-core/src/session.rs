@@ -49,8 +49,9 @@ pub const SNAPSHOT_VERSION: u32 = 1;
 /// After this long without news, a lower-fidelity state source may override.
 const STALE_MS: u64 = 30_000;
 
-/// What to start.
+/// What to start. Omitted fields take their defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LaunchRequest {
     pub harness: Option<Harness>,
     /// Working directory on the host. Absolute for ACP harnesses (Cursor,

@@ -19,7 +19,7 @@ POSIX tools.
 |---|---|
 | `crates/acc-core` | Sans-IO core: harness catalogue, drivers, event stream, commands/options, sessions (launch, attach with replay, transcript, permissions), typed items and diffs, discovery, observation and takeover of foreign TUIs, detached-session and fan-in scripts, multiplexers |
 | `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`): `AccSession`, `AccObserved`, `AccTakeover`, `AccFanIn` and the host scripts, as a byte pump with no callbacks |
-| `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node |
+| `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node: the same objects and functions as `acc-ffi` (a test keeps them in step), records as JSON in the core's serde shapes, bytes as `Uint8Array` |
 | `crates/acc-cli` | `acc` command-line tool for hosts and spikes |
 
 ## Quick start
