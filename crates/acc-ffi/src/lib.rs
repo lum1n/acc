@@ -9,6 +9,12 @@
 //!   in tmux, zellij, screen or Rex panes ([`PaneSession`]). These calls are
 //!   `async`/`suspend` and survive dropped connections.
 //!
+//! - Detached sessions as a byte pump ([`AccSession`], [`AccFanIn`],
+//!   [`AccObserved`], [`AccTakeover`]): the app runs the scripts ACC hands it
+//!   over its own SSH channels and feeds back their output. Sessions are
+//!   launched, listed and attached by any client, replayed from their log,
+//!   and foreign TUIs are observed and taken over.
+//!
 //! Objects can be shared across threads. Panics are caught by UniFFI and
 //! surfaced as errors instead of crashing the app.
 
@@ -16,13 +22,19 @@ use std::sync::{Mutex, MutexGuard};
 
 use acc_core::detached::SessionDir;
 use acc_core::driver::DriverError;
+use acc_core::live as core_session;
 use acc_core::osc7501::{self, Osc7501};
-use acc_core::session as core_session;
 
+pub mod acc_types;
+pub mod observe;
 mod remote;
+pub mod session;
 mod types;
 
+pub use acc_types::*;
+pub use observe::*;
 pub use remote::*;
+pub use session::*;
 pub use types::*;
 
 uniffi::setup_scaffolding!();
@@ -101,6 +113,16 @@ pub enum AccError {
     Remote { exit_code: Option<u32>, stderr: String },
     #[error("multiplexer: {reason}")]
     Multiplexer { reason: String },
+    /// A detached session's spec, snapshot or agent record didn't read.
+    #[error("invalid session: {reason}")]
+    InvalidSession { reason: String },
+    /// The palette entry needs input (see `AccCommandEntry::input`).
+    #[error("{reason}")]
+    MissingArgument { reason: String },
+    /// An image the harnesses or the session log can't carry (over 5 MiB,
+    /// over 10 MiB per prompt, or not an image). Resize and retry.
+    #[error("{reason}")]
+    AttachmentRejected { reason: String },
 }
 
 impl From<DriverError> for AccError {
@@ -112,6 +134,12 @@ impl From<DriverError> for AccError {
             DriverError::NotStarted => Self::NotStarted,
             DriverError::UnknownRequest(request_id) => Self::UnknownRequest { request_id },
             DriverError::InvalidOption(value) => Self::InvalidOption { value },
+            DriverError::MissingArgument(_) => Self::MissingArgument {
+                reason: e.to_string(),
+            },
+            DriverError::AttachmentRejected(_) => Self::AttachmentRejected {
+                reason: e.to_string(),
+            },
         }
     }
 }
@@ -473,7 +501,12 @@ mod tests {
         let s = Session::new(config(Harness::Pi)).unwrap();
         let hello = String::from_utf8(s.start()).unwrap();
         assert!(hello.contains("get_state"));
-        let bytes = s.send(Command::Prompt { text: "hi".into() }).unwrap();
+        let bytes = s
+            .send(Command::Prompt {
+                text: "hi".into(),
+                attachments: vec![],
+            })
+            .unwrap();
         assert!(String::from_utf8(bytes).unwrap().contains("\"hi\""));
         let events = s.exited(Some(0), 9);
         assert!(matches!(events.last(), Some(Event::Exited { code: Some(0) })));

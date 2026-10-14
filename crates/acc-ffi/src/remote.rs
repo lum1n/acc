@@ -130,13 +130,15 @@ pub struct DetachedInfo {
     /// What it runs, and where; `None` for sessions an older ACC started.
     pub spec: Option<LaunchSpec>,
     pub cwd: Option<String>,
+    /// The whole `spec.json`, for `AccSession.attach`.
+    pub spec_json: Option<String>,
 }
 
 impl From<ssh::Status> for DetachedStatus {
     fn from(s: ssh::Status) -> Self {
         match s {
-            ssh::Status::Alive { pid } => Self::Alive { pid },
-            ssh::Status::Exited { code } => Self::Exited { code },
+            ssh::Status::Alive { pid, .. } => Self::Alive { pid },
+            ssh::Status::Exited { code, .. } => Self::Exited { code },
             ssh::Status::Missing => Self::Missing,
         }
     }
@@ -226,12 +228,16 @@ impl SshHost {
         Ok(ssh::list(&self.host)
             .await?
             .into_iter()
-            .map(|l| DetachedInfo {
-                id: l.id,
-                status: l.status.into(),
-                log_bytes: l.log_bytes,
-                cwd: l.spec.as_ref().map(|s| s.cwd.clone()),
-                spec: l.spec.map(|s| LaunchSpec::from(&s.spec)),
+            .map(|l| {
+                let spec = l.spec_json.as_deref().and_then(ssh::SessionSpec::from_json);
+                DetachedInfo {
+                    id: l.id,
+                    status: l.status.into(),
+                    log_bytes: l.status.size(),
+                    cwd: spec.as_ref().map(|s| s.cwd.clone()),
+                    spec: spec.map(|s| LaunchSpec::from(&s.launch)),
+                    spec_json: l.spec_json,
+                }
             })
             .collect())
     }

@@ -145,7 +145,8 @@ async fn attaches_to_a_detached_session() {
         c.port = sshd.port;
         c
     }));
-    acc_ssh::Detached::launch(ssh_host, &id, &spec, "/tmp")
+    let record = acc_ssh::SessionSpec::new(&id, acc_core::Harness::Claude, "/tmp", spec.clone(), 0).to_json();
+    acc_ssh::Detached::launch(ssh_host, &id, &spec, "/tmp", Some(&record))
         .await
         .unwrap();
 
@@ -178,6 +179,7 @@ async fn attaches_to_a_detached_session() {
 
     s.send(Command::Prompt {
         text: "from the phone".into(),
+        attachments: vec![],
     })
     .await
     .unwrap();
@@ -193,7 +195,11 @@ async fn attaches_to_a_detached_session() {
     );
     assert!(matches!(s.status().await.unwrap(), DetachedStatus::Exited { .. }));
     assert!(matches!(
-        s.send(Command::Prompt { text: "late".into() }).await,
+        s.send(Command::Prompt {
+            text: "late".into(),
+            attachments: vec![],
+        })
+        .await,
         Err(AccError::NotRunning { .. })
     ));
     assert!(

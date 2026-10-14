@@ -8,14 +8,13 @@
 //! `research/daemonless-ssh-control.md` §2 and §4.
 //!
 //! Layout under `$HOME/.acc/s/<session>/`:
-//! `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json`, `sent`
-//! (ids of writes already delivered) and `lock` (held while writing).
+//! `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json` (one line, a
+//! [`crate::session::SessionSpec`]), `sent` (ids of writes already
+//! delivered) and `lock` (held while writing).
 //!
 //! These functions only build scripts and parse their output; running them
 //! (locally, or over an SSH exec channel with [`crate::shell::ssh_command`])
 //! is up to the transport.
-
-use serde::{Deserialize, Serialize};
 
 use crate::harness::LaunchSpec;
 use crate::shell::{LOGIN_PATH, join, quote};
@@ -23,8 +22,9 @@ use crate::shell::{LOGIN_PATH, join, quote};
 /// Root directory for detached sessions, relative to `$HOME`.
 pub const ROOT: &str = ".acc/s";
 
-/// Exit code of [`SessionDir::attach_script`], [`SessionDir::write_script`]
-/// and [`SessionDir::stop_script`] when the session has no running harness.
+/// Exit code of [`SessionDir::attach_script`], [`SessionDir::input_script`],
+/// [`SessionDir::write_script`] and [`SessionDir::stop_script`] when the
+/// session has no running harness.
 pub const EXIT_NOT_RUNNING: u32 = 3;
 
 /// Exit code of [`SessionDir::write_script`] when fewer bytes arrived than
@@ -41,91 +41,6 @@ pub const LAUNCH_WAIT_TICKS: u32 = 500;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDir {
     id: String,
-}
-
-/// What `spec.json` records about a detached session, so any client can
-/// rebuild the right driver when it reattaches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSpec {
-    pub spec: LaunchSpec,
-    pub cwd: String,
-}
-
-/// Liveness of a detached session, from [`SessionDir::status_script`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum Status {
-    Alive {
-        pid: u32,
-    },
-    /// `code` is `None` when the wrapper was killed before recording it.
-    Exited {
-        code: Option<i32>,
-    },
-    Missing,
-}
-
-impl Status {
-    /// Parses one line of [`SessionDir::status_script`] output.
-    pub fn parse(line: &str) -> Status {
-        let mut words = line.split_whitespace();
-        match (words.next(), words.next()) {
-            (Some("alive"), Some(pid)) => pid.parse().map_or(Status::Missing, |pid| Status::Alive { pid }),
-            (Some("exited"), code) => Status::Exited {
-                code: code.and_then(|c| c.parse().ok()),
-            },
-            _ => Status::Missing,
-        }
-    }
-}
-
-/// One detached session found on a host by [`list_script`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Listed {
-    pub id: String,
-    pub status: Status,
-    /// Size of the output log, the offset a fresh follower ends up at.
-    pub log_bytes: u64,
-    /// `None` for sessions started by an older ACC that didn't record it.
-    pub spec: Option<SessionSpec>,
-}
-
-/// Shell snippet that sets `$st` to the session's status line.
-const STATUS: &str = r#"if [ -f "$d/exit" ]; then st="exited $(cat "$d/exit")"
-elif [ -f "$d/pid" ] && kill -0 "$(cat "$d/pid")" 2>/dev/null; then st="alive $(cat "$d/pid")"
-elif [ -f "$d/pid" ]; then st="exited"
-else st=missing; fi
-"#;
-
-/// Script listing every detached session as `id \t status \t log-bytes \t spec-json`.
-pub fn list_script() -> String {
-    format!(
-        "r=\"$HOME\"/{ROOT}\n\
-         [ -d \"$r\" ] || exit 0\n\
-         for d in \"$r\"/*; do\n\
-         [ -d \"$d\" ] || continue\n\
-         {STATUS}\
-         n=$(wc -c <\"$d/out.ndjson\" 2>/dev/null | tr -d ' ')\n\
-         printf '%s\\t%s\\t%s\\t%s\\n' \"${{d##*/}}\" \"$st\" \"${{n:-0}}\" \"$(head -n 1 \"$d/spec.json\" 2>/dev/null)\"\n\
-         done\n"
-    )
-}
-
-/// Parses [`list_script`] output. Malformed lines are skipped.
-pub fn parse_list(out: &str) -> Vec<Listed> {
-    out.lines()
-        .filter_map(|line| {
-            let mut f = line.splitn(4, '\t');
-            let id = f.next()?;
-            SessionDir::new(id)?;
-            Some(Listed {
-                id: id.to_owned(),
-                status: Status::parse(f.next()?),
-                log_bytes: f.next()?.trim().parse().unwrap_or(0),
-                spec: f.next().and_then(|j| serde_json::from_str(j).ok()),
-            })
-        })
-        .collect()
 }
 
 impl SessionDir {
@@ -155,6 +70,13 @@ impl SessionDir {
     /// harness PID on success. Relaunching an existing id (to resume) keeps
     /// appending to the same log, so client offsets stay valid.
     pub fn launch_script(&self, spec: &LaunchSpec, cwd: &str) -> String {
+        self.launch_script_with_spec(spec, cwd, None)
+    }
+
+    /// [`SessionDir::launch_script`] that also records `spec_json` (one
+    /// line, a [`crate::session::SessionSpec`]) as `spec.json`, so other
+    /// clients can list and attach.
+    pub fn launch_script_with_spec(&self, spec: &LaunchSpec, cwd: &str, spec_json: Option<&str>) -> String {
         let env = spec
             .env
             .iter()
@@ -167,11 +89,6 @@ impl SessionDir {
         } else {
             format!("env {env} ")
         };
-        let record = serde_json::to_string(&SessionSpec {
-            spec: spec.clone(),
-            cwd: cwd.to_owned(),
-        })
-        .unwrap_or_default();
         // The wrapper starts the harness, records its PID, waits for it and
         // records the exit code. `$0` is the session directory. A `cd` that
         // fails is recorded as an exit too, so the launcher below sees it
@@ -180,9 +97,12 @@ impl SessionDir {
             "cd {cwd} 2>>\"$0/err\" || {{ echo {EXIT_NO_CWD} >\"$0/exit\"; exit 1; }}; \
              {env}{cmd} <>\"$0/in\" >>\"$0/out.ndjson\" 2>>\"$0/err\" & \
              echo $! >\"$0/pid\"; wait $!; echo $? >\"$0/exit\"",
-            cwd = quote(cwd),
+            cwd = quote_path(cwd),
         );
         let d = self.dir();
+        let write_spec = spec_json
+            .map(|j| format!("printf '%s\\n' {} >\"$d/spec.json\"\n", quote(j.trim())))
+            .unwrap_or_default();
         // Waits for the PID, but gives up on a recorded exit (the wrapper
         // could not start the harness) or after `LAUNCH_WAIT_TICKS` ticks, so a
         // bad directory or a dead shell fails the launch rather than hanging it.
@@ -194,7 +114,7 @@ impl SessionDir {
              [ -p \"$d/in\" ] || mkfifo \"$d/in\"\n\
              rm -f \"$d/pid\" \"$d/exit\"\n\
              : >>\"$d/out.ndjson\"\n\
-             printf '%s\\n' {record} >\"$d/spec.json\"\n\
+             {write_spec}\
              nohup sh -c {wrapper} \"$d\" </dev/null >/dev/null 2>&1 &\n\
              i=0\n\
              while [ ! -s \"$d/pid\" ]; do\n\
@@ -207,9 +127,17 @@ impl SessionDir {
              sleep 0.02\n\
              done\n\
              cat \"$d/pid\"\n",
-            record = quote(&record),
             wrapper = quote(&wrapper),
             cwd_text = quote(cwd),
+        )
+    }
+
+    /// Script that replaces `spec.json` (after the native id or title is known).
+    pub fn write_spec_script(&self, spec_json: &str) -> String {
+        format!(
+            "d={}\n[ -d \"$d\" ] && printf '%s\\n' {} >\"$d/spec.json\"\n",
+            self.dir(),
+            quote(spec_json.trim())
         )
     }
 
@@ -247,15 +175,31 @@ impl SessionDir {
         format!("exec tail -c +{} {}/out.ndjson\n", offset + 1, self.dir())
     }
 
+    /// Path of the session's log, as a shell expression.
+    pub fn log_path(&self) -> String {
+        format!("{}/out.ndjson", self.dir())
+    }
+
+    /// Path of the file the exit code is written to, as a shell expression.
+    pub fn exit_path(&self) -> String {
+        format!("{}/exit", self.dir())
+    }
+
     /// Script whose stdin is forwarded to the harness as it arrives, for
-    /// interactive use (`acc script input`). Clients should prefer
-    /// [`SessionDir::write_script`], which never forwards a partial write.
+    /// interactive use (`acc script input`) and clients that write whole
+    /// lines. [`SessionDir::write_script`] also never forwards a partial
+    /// write. Writers are serialized with the session lock; the FIFO is
+    /// opened read-write, since a write-only open waits for a reader and
+    /// input to a harness that already exited would hang. Exits
+    /// [`EXIT_NOT_RUNNING`] when there is no session or it has exited.
     pub fn input_script(&self) -> String {
         let d = self.dir();
         format!(
             "d={d}\n\
+             [ -p \"$d/in\" ] || {{ echo 'acc: no such session' >&2; exit {EXIT_NOT_RUNNING}; }}\n\
+             [ -f \"$d/exit\" ] && {{ echo 'acc: the session has exited' >&2; exit {EXIT_NOT_RUNNING}; }}\n\
              {LOCK}\
-             cat >\"$d/in\"\n"
+             cat 1<>\"$d/in\"\n"
         )
     }
 
@@ -289,9 +233,19 @@ impl SessionDir {
         )
     }
 
-    /// Script printing `alive <pid>`, `exited <code>` or `missing`; see [`Status::parse`].
+    /// Script printing `alive <pid> <size>`, `exited <code> <size>` or
+    /// `missing`, where `size` is the log's length in bytes. Parse it with
+    /// [`parse_status`].
     pub fn status_script(&self) -> String {
-        format!("d={}\n{STATUS}echo \"$st\"\n", self.dir())
+        let d = self.dir();
+        format!(
+            "d={d}\n\
+             s=$(wc -c <\"$d/out.ndjson\" 2>/dev/null | tr -d ' ' || echo 0)\n\
+             if [ -f \"$d/exit\" ]; then echo \"exited $(cat \"$d/exit\") $s\";\n\
+             elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then echo \"alive $(cat \"$d/pid\") $s\";\n\
+             elif [ -f \"$d/pid\" ]; then echo \"exited - $s\";\n\
+             else echo missing; fi\n"
+        )
     }
 
     /// Script that asks the harness to exit (SIGTERM). Exits
@@ -301,6 +255,20 @@ impl SessionDir {
         format!(
             "d={d}\n\
              pid=$(cat \"$d/pid\" 2>/dev/null) && kill \"$pid\" 2>/dev/null || exit {EXIT_NOT_RUNNING}\n"
+        )
+    }
+
+    /// Script that stops the harness: TERM, then KILL after `grace_ms`.
+    pub fn kill_script(&self, grace_ms: u64) -> String {
+        let d = self.dir();
+        let tries = grace_ms.div_ceil(100).max(1);
+        format!(
+            "d={d}\n\
+             p=$(cat \"$d/pid\" 2>/dev/null || true)\n\
+             if [ -n \"$p\" ] && kill -TERM \"$p\" 2>/dev/null; then\n\
+             i=0; while kill -0 \"$p\" 2>/dev/null && [ $i -lt {tries} ]; do sleep 0.1; i=$((i+1)); done\n\
+             kill -KILL \"$p\" 2>/dev/null || true\n\
+             fi\n"
         )
     }
 
@@ -327,6 +295,238 @@ trap 'rm -rf "$d/lock"' EXIT
 trap 'exit 1' HUP INT TERM
 "#;
 
+/// `PATH` from the user's login shell, for commands run over SSH exec
+/// ([`LOGIN_PATH`]). Falls back to the current `PATH` when the login shell fails.
+pub fn login_path_prelude() -> &'static str {
+    LOGIN_PATH
+}
+
+/// Quotes a path, leaving a leading `~/` for the shell to expand.
+fn quote_path(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
+        None if path == "~" => "\"$HOME\"".to_owned(),
+        None => quote(path),
+    }
+}
+
+/// A detached session's status from [`SessionDir::status_script`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Status {
+    Alive {
+        pid: u32,
+        size: u64,
+    },
+    /// `code` is `None` when the process died without the wrapper recording it.
+    Exited {
+        code: Option<i32>,
+        size: u64,
+    },
+    Missing,
+}
+
+impl Status {
+    /// Bytes in the session's log.
+    pub fn size(&self) -> u64 {
+        match self {
+            Status::Alive { size, .. } | Status::Exited { size, .. } => *size,
+            Status::Missing => 0,
+        }
+    }
+}
+
+/// Parses the output of [`SessionDir::status_script`].
+pub fn parse_status(out: &str) -> Option<Status> {
+    let mut parts = out.split_whitespace();
+    let num = |s: Option<&str>| s.and_then(|n| n.parse::<u64>().ok());
+    match parts.next()? {
+        "alive" => Some(Status::Alive {
+            pid: parts.next()?.parse().ok()?,
+            size: num(parts.next()).unwrap_or(0),
+        }),
+        "exited" => Some(Status::Exited {
+            code: parts.next().and_then(|c| c.parse().ok()),
+            size: num(parts.next()).unwrap_or(0),
+        }),
+        "missing" => Some(Status::Missing),
+        _ => None,
+    }
+}
+
+/// One session found by [`list_script`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Listing {
+    pub id: String,
+    pub status: Status,
+    /// The log's last modification, in seconds since the Unix epoch.
+    pub modified: Option<u64>,
+    /// The `spec.json` line, when the session has one.
+    pub spec_json: Option<String>,
+}
+
+/// Script listing every detached session on the host. Parse it with [`parse_list`].
+pub fn list_script() -> String {
+    format!(
+        "for d in \"$HOME\"/{ROOT}/*/; do\n\
+         [ -d \"$d\" ] || continue\n\
+         d=${{d%/}}; id=${{d##*/}}\n\
+         s=$(wc -c <\"$d/out.ndjson\" 2>/dev/null | tr -d ' ')\n\
+         m=$(stat -c %Y \"$d/out.ndjson\" 2>/dev/null || stat -f %m \"$d/out.ndjson\" 2>/dev/null || echo -)\n\
+         if [ -f \"$d/exit\" ]; then st=\"exited $(cat \"$d/exit\")\";\n\
+         elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then st=\"alive $(cat \"$d/pid\")\";\n\
+         elif [ -f \"$d/pid\" ]; then st=\"exited -\";\n\
+         else st=missing; fi\n\
+         printf 'S\\t%s\\t%s %s\\t%s\\n' \"$id\" \"$st\" \"${{s:-0}}\" \"$m\"\n\
+         [ -f \"$d/spec.json\" ] && printf 'J\\t%s\\n' \"$(head -n 1 \"$d/spec.json\")\"\n\
+         done; true\n"
+    )
+}
+
+/// Parses the output of [`list_script`].
+pub fn parse_list(out: &str) -> Vec<Listing> {
+    let mut list: Vec<Listing> = Vec::new();
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("S\t") {
+            let mut f = rest.splitn(3, '\t');
+            let (Some(id), Some(status), modified) = (f.next(), f.next(), f.next()) else {
+                continue;
+            };
+            if SessionDir::new(id).is_none() {
+                continue;
+            }
+            list.push(Listing {
+                id: id.to_owned(),
+                status: parse_status(status).unwrap_or(Status::Missing),
+                modified: modified.and_then(|m| m.trim().parse().ok()),
+                spec_json: None,
+            });
+        } else if let Some(json) = line.strip_prefix("J\t")
+            && let Some(last) = list.last_mut()
+        {
+            last.spec_json = Some(json.to_owned());
+        }
+    }
+    list
+}
+
+/// A file followed by [`fan_in_script`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeedEntry {
+    /// Tag for this file's lines, `[A-Za-z0-9_.:-]{1,128}`.
+    pub key: String,
+    /// The file, as a shell expression from [`SessionDir::log_path`] or
+    /// [`SessionDir::exit_path`], or an absolute path (quoted here).
+    pub path: FeedPath,
+    /// Byte offset to resume from.
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum FeedPath {
+    /// The log of a detached session.
+    SessionLog(String),
+    /// The exit-code file of a detached session.
+    SessionExit(String),
+    /// Any file, such as a harness transcript (`~/` is expanded).
+    File(String),
+}
+
+fn valid_key(key: &str) -> bool {
+    (1..=128).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+}
+
+/// One long-running script that follows many line-oriented files at once
+/// and prints each line as `<key>\t<line>`. A phone uses one SSH channel
+/// for every session on a host instead of one per session, which keeps it
+/// under sshd's per-connection session limit.
+///
+/// Closing the channel signals the script, which takes every process it
+/// started (its descendants, found with `ps`) down with it. Entries with
+/// invalid keys or session ids are skipped.
+pub fn fan_in_script(entries: &[FeedEntry]) -> String {
+    let mut script = String::from(
+        "k() { for c in $(ps -eo pid=,ppid= | awk -v p=\"$1\" '$2 == p { print $1 }'); do echo \"$c\"; k \"$c\"; done; }\n\
+         trap 'trap - TERM INT HUP; kill $(k $$) 2>/dev/null' TERM INT HUP\n\
+         f() { tail -c +\"$3\" -F \"$2\" 2>/dev/null | awk -v k=\"$1\" '{ print k \"\\t\" $0; fflush() }'; }\n",
+    );
+    for e in entries.iter().filter(|e| valid_key(&e.key)) {
+        let path = match &e.path {
+            FeedPath::SessionLog(id) => SessionDir::new(id).map(|d| d.log_path()),
+            FeedPath::SessionExit(id) => SessionDir::new(id).map(|d| d.exit_path()),
+            FeedPath::File(p) => Some(quote_path(p)),
+        };
+        if let Some(path) = path {
+            script.push_str(&format!("f {} {path} {} &\n", e.key, e.offset + 1));
+        }
+    }
+    script.push_str("wait\n");
+    script
+}
+
+/// Splits [`fan_in_script`] output back into per-file lines and tracks
+/// each file's offset, so a restarted script resumes without loss.
+#[derive(Debug, Default)]
+pub struct FanInParser {
+    buf: Vec<u8>,
+    offsets: std::collections::HashMap<String, u64>,
+}
+
+/// One line of one followed file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanInLine {
+    pub key: String,
+    /// The line's bytes, newline included, exactly as in the file.
+    pub bytes: Vec<u8>,
+    /// The file offset just past this line.
+    pub offset: u64,
+}
+
+impl FanInParser {
+    /// Starts tracking from the entries' offsets.
+    pub fn new(entries: &[FeedEntry]) -> Self {
+        Self {
+            buf: Vec::new(),
+            offsets: entries.iter().map(|e| (e.key.clone(), e.offset)).collect(),
+        }
+    }
+
+    pub fn offset(&self, key: &str) -> Option<u64> {
+        self.offsets.get(key).copied()
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<FanInLine> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut start = 0;
+        while let Some(pos) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let line = &self.buf[start..start + pos];
+            start += pos + 1;
+            let Some(tab) = line.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let Ok(key) = std::str::from_utf8(&line[..tab]) else {
+                continue;
+            };
+            let mut body = line[tab + 1..].to_vec();
+            body.push(b'\n');
+            let offset = self.offsets.entry(key.to_owned()).or_insert(0);
+            *offset += body.len() as u64;
+            out.push(FanInLine {
+                key: key.to_owned(),
+                bytes: body,
+                offset: *offset,
+            });
+        }
+        self.buf.drain(..start);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +540,32 @@ mod tests {
         assert!(SessionDir::new("s_01-abc").is_some());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn input_to_an_exited_session_does_not_hang() {
+        let home = std::env::temp_dir().join(format!("acc-input-{}", std::process::id()));
+        let d = home.join(ROOT).join("s1");
+        std::fs::create_dir_all(&d).unwrap();
+        let run = |script: String| {
+            std::process::Command::new("timeout")
+                .args(["5", "sh", "-c", &script])
+                .env("HOME", &home)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+                .status
+                .code()
+        };
+        let dir = SessionDir::new("s1").unwrap();
+        assert_eq!(run(format!("mkfifo {}", d.join("in").display())), Some(0));
+        // No reader and no exit file yet: still returns (read-write open).
+        assert_eq!(run(dir.input_script()), Some(0));
+        std::fs::write(d.join("exit"), "1\n").unwrap();
+        assert_eq!(run(dir.input_script()), Some(EXIT_NOT_RUNNING as i32));
+        assert!(!d.join("lock").exists(), "the lock is released");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn launch_script_quotes_cwd_and_opens_fifo_read_write() {
         let dir = SessionDir::new("s1").expect("valid id");
@@ -351,30 +577,57 @@ mod tests {
     }
 
     #[test]
+    fn status_and_list_parse() {
+        assert_eq!(
+            parse_status("alive 42 1000\n"),
+            Some(Status::Alive { pid: 42, size: 1000 })
+        );
+        assert_eq!(
+            parse_status("exited 0 7"),
+            Some(Status::Exited {
+                code: Some(0),
+                size: 7
+            })
+        );
+        assert_eq!(
+            parse_status("exited - 7"),
+            Some(Status::Exited { code: None, size: 7 })
+        );
+        assert_eq!(parse_status("missing"), Some(Status::Missing));
+        let list = parse_list(
+            "S\ta1\talive 9 12\t1700000000\nJ\t{\"id\":\"a1\"}\nS\t../x\tmissing 0\t-\nS\tb2\texited 1 3\t-\n",
+        );
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].spec_json.as_deref(), Some("{\"id\":\"a1\"}"));
+        assert_eq!(list[0].modified, Some(1_700_000_000));
+        assert_eq!(
+            list[1].status,
+            Status::Exited {
+                code: Some(1),
+                size: 3
+            }
+        );
+    }
+
+    #[test]
+    fn fan_in_parser_tracks_offsets_across_chunks() {
+        let mut p = FanInParser::new(&[FeedEntry {
+            key: "a".into(),
+            path: FeedPath::SessionLog("a".into()),
+            offset: 10,
+        }]);
+        assert!(p.feed(b"a\t{\"x\"").is_empty());
+        let lines = p.feed(b":1}\nb\thi\n");
+        assert_eq!(lines[0].bytes, b"{\"x\":1}\n");
+        assert_eq!(lines[0].offset, 18);
+        assert_eq!((lines[1].key.as_str(), lines[1].offset), ("b", 3));
+    }
+
+    #[test]
     fn attach_offset_is_one_based_for_tail() {
         let dir = SessionDir::new("s1").expect("valid id");
         assert!(dir.attach_script(0).contains("tail -c +1 -f"));
         assert!(dir.attach_script(100).contains("tail -c +101 -f"));
-    }
-
-    #[test]
-    fn parses_status_and_list() {
-        assert_eq!(Status::parse("alive 42\n"), Status::Alive { pid: 42 });
-        assert_eq!(Status::parse("exited 0"), Status::Exited { code: Some(0) });
-        assert_eq!(Status::parse("exited"), Status::Exited { code: None });
-        assert_eq!(Status::parse("missing"), Status::Missing);
-        let spec = SessionSpec {
-            spec: Harness::Codex.launch(None),
-            cwd: "/w".into(),
-        };
-        let json = serde_json::to_string(&spec).expect("json");
-        let out = format!("a1\talive 7\t120\t{json}\nbad id\tmissing\t0\t\nold\texited 1\t5\t\n");
-        let listed = parse_list(&out);
-        assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].status, Status::Alive { pid: 7 });
-        assert_eq!(listed[0].log_bytes, 120);
-        assert_eq!(listed[0].spec.as_ref(), Some(&spec));
-        assert_eq!(listed[1].spec, None);
     }
 }
 
@@ -464,7 +717,11 @@ mod sh_tests {
             env: vec![],
             protocol: Protocol::Acp,
         };
-        sh(&home, &dir.launch_script(&spec, "/"), b"");
+        sh(
+            &home,
+            &dir.launch_script_with_spec(&spec, "/", Some("{\"cwd\":\"/\"}")),
+            b"",
+        );
         let log = home.join(ROOT).join("w/out.ndjson");
 
         // A truncated upload is refused and nothing reaches the harness.
@@ -481,16 +738,16 @@ mod sh_tests {
         // The follower replays from an offset and ends when the harness exits.
         let listed = parse_list(&sh(&home, &list_script(), b""));
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].log_bytes, 16);
-        assert_eq!(listed[0].spec.as_ref().map(|s| s.cwd.as_str()), Some("/"));
+        assert_eq!(listed[0].status.size(), 16);
+        assert_eq!(listed[0].spec_json.as_deref(), Some("{\"cwd\":\"/\"}"));
         assert_eq!(sh_code(&home, &dir.stop_script(), b"").1, Some(0));
         let (out, code) = sh_code(&home, &dir.attach_script(8), b"");
         assert_eq!(code, Some(0));
         assert!("{\"n\":2}\n".starts_with(&out), "{out:?}");
         assert_eq!(sh(&home, &dir.read_script(8), b""), "{\"n\":2}\n");
         assert!(matches!(
-            Status::parse(&sh(&home, &dir.status_script(), b"")),
-            Status::Exited { .. }
+            parse_status(&sh(&home, &dir.status_script(), b"")),
+            Some(Status::Exited { size: 16, .. })
         ));
         let (_, code) = sh_code(&home, &dir.write_script(1, "d"), b"x");
         assert_eq!(code, Some(EXIT_NOT_RUNNING as i32));
@@ -532,6 +789,148 @@ mod sh_tests {
         assert!(sh(&home, &dir.status_script(), b"").starts_with("alive"));
 
         let _ = Command::new("kill").arg(pid.trim()).status();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn spec_list_status_kill_and_remove() {
+        let home = std::env::temp_dir().join(format!("acc-test-list-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let dir = SessionDir::new("lst").expect("valid id");
+        let spec = LaunchSpec {
+            program: "cat".into(),
+            args: vec![],
+            env: vec![],
+            protocol: Protocol::Acp,
+        };
+        let pid = sh(
+            &home,
+            &dir.launch_script_with_spec(&spec, "~", Some("{\"id\":\"lst\",\"q\":\"it's\"}")),
+            b"",
+        );
+        sh(&home, &dir.input_script(), b"0123456789\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && !matches!(
+                parse_status(&sh(&home, &dir.status_script(), b"")),
+                Some(Status::Alive { size: 11, .. })
+            )
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            parse_status(&sh(&home, &dir.status_script(), b"")),
+            Some(Status::Alive {
+                pid: pid.trim().parse().expect("pid"),
+                size: 11
+            })
+        );
+        let list = parse_list(&sh(&home, &list_script(), b""));
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].spec_json.as_deref(),
+            Some("{\"id\":\"lst\",\"q\":\"it's\"}")
+        );
+
+        sh(&home, &dir.kill_script(1_000), b"");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && matches!(
+                parse_status(&sh(&home, &dir.status_script(), b"")),
+                Some(Status::Alive { .. })
+            )
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(
+            parse_status(&sh(&home, &dir.status_script(), b"")),
+            Some(Status::Exited { size: 11, .. })
+        ));
+        sh(&home, &dir.remove_script(), b"");
+        assert!(parse_list(&sh(&home, &list_script(), b"")).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fan_in_follows_files_from_offsets_and_dies_with_its_channel() {
+        let home = std::env::temp_dir().join(format!("acc-test-fan-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let a = home.join("a.jsonl");
+        let b = home.join("b b.jsonl");
+        std::fs::write(&a, "{\"a\":0}\n{\"a\":1}\n").expect("write");
+        std::fs::write(&b, "{\"b\":0}\n").expect("write");
+        let entries = [
+            FeedEntry {
+                key: "ka".into(),
+                path: FeedPath::File(a.display().to_string()),
+                offset: 8,
+            },
+            FeedEntry {
+                key: "kb".into(),
+                path: FeedPath::File(b.display().to_string()),
+                offset: 0,
+            },
+        ];
+        let mut child = Command::new("sh");
+        // Its own process group, as sshd gives every session.
+        std::os::unix::process::CommandExt::process_group(&mut child, 0);
+        let mut child = child
+            .arg("-c")
+            .arg(fan_in_script(&entries))
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let reader = std::thread::spawn(move || {
+            let mut parser = FanInParser::new(&entries);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while got.len() < 3 {
+                let n = std::io::Read::read(&mut stdout, &mut buf).expect("read");
+                if n == 0 {
+                    break;
+                }
+                got.extend(parser.feed(&buf[..n]));
+            }
+            (got, parser.offset("ka"))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&b).expect("open");
+        f.write_all(b"{\"b\":1}\n").expect("append");
+        let (got, ka) = reader.join().expect("join");
+        let mut lines: Vec<(String, String)> = got
+            .iter()
+            .map(|l| (l.key.clone(), String::from_utf8_lossy(&l.bytes).trim().to_owned()))
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                ("ka".to_owned(), "{\"a\":1}".to_owned()),
+                ("kb".to_owned(), "{\"b\":0}".to_owned()),
+                ("kb".to_owned(), "{\"b\":1}".to_owned()),
+            ]
+        );
+        assert_eq!(ka, Some(16));
+        // Closing the channel: TERM the script; its tails must go too.
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status();
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        let ps = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ps -eo args | grep -F {} | grep -v grep || true",
+                quote(&b.display().to_string())
+            ))
+            .output()
+            .expect("ps");
+        assert!(
+            String::from_utf8_lossy(&ps.stdout).trim().is_empty(),
+            "tail left running"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }

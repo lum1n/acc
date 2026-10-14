@@ -42,7 +42,9 @@ pub fn inputs(harness: Harness, cmd: &Command) -> Result<Vec<Input>, DriverError
         }
     };
     match (harness, cmd) {
-        (_, Command::Prompt { text }) => Ok(submit(text)),
+        (_, Command::Prompt { text, attachments }) if attachments.is_empty() => Ok(submit(text)),
+        // Images only travel over the headless protocols.
+        (h, Command::Prompt { .. }) => Err(unsupported(h, "images from a pane")),
         (_, Command::Invoke { name, args }) => slash(with_arg(name.trim_start_matches('/'), args)),
         (Harness::Pi | Harness::Claude | Harness::Codex, Command::Interrupt) => {
             Ok(vec![Input::Keys(vec![Key::Escape])])
@@ -124,8 +126,50 @@ pub fn launch(harness: Harness, resume: Option<&str>) -> Result<Program, DriverE
 /// after ACC closed the TUI there: types the resume command into the shell
 /// left in the pane.
 pub fn resume_inputs(harness: Harness, resume: &str) -> Result<Vec<Input>, DriverError> {
-    let argv = launch(harness, Some(resume))?.argv();
+    let argv = resume_argv(harness, resume, None)?;
     Ok(submit(&crate::shell::join(argv.iter().map(String::as_str))))
+}
+
+/// The TUI command resuming `resume`, run the way `launcher` describes
+/// (inside the user's sandbox, with their executable and flags).
+pub fn resume_argv(
+    harness: Harness,
+    resume: &str,
+    launcher: Option<&crate::harness::Launcher>,
+) -> Result<Vec<String>, DriverError> {
+    let mut program = launch(harness, Some(resume))?;
+    let Some(l) = launcher else {
+        return Ok(program.argv());
+    };
+    if let Some(p) = &l.program {
+        program.program = p.clone();
+    }
+    program.args.extend(l.args.iter().cloned());
+    let mut argv = l.prefix.clone();
+    argv.extend(program.argv());
+    Ok(argv)
+}
+
+/// Whether a captured pane shows `harness`'s approval dialog, which its
+/// transcript doesn't record. Only the bottom of the screen counts: the
+/// dialog replaces the prompt there, while the same words higher up are
+/// conversation.
+pub fn shows_approval(harness: Harness, screen: &str) -> bool {
+    match harness {
+        // "Do you want to proceed?" (or "make this edit to", "allow Claude
+        // to fetch", ...) over numbered choices starting with "1. Yes".
+        Harness::Claude => {
+            let tail: Vec<&str> = screen
+                .lines()
+                .map(|l| l.trim_matches(|c: char| c.is_whitespace() || "│|❯>›".contains(c)))
+                .filter(|l| !l.is_empty())
+                .collect();
+            let tail = &tail[tail.len().saturating_sub(25)..];
+            let question = tail.iter().position(|l| l.starts_with("Do you want to"));
+            question.is_some_and(|q| tail[q..].iter().any(|l| l.starts_with("1. Yes")))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -136,12 +180,21 @@ mod tests {
     #[test]
     fn prompts_type_or_paste() {
         assert_eq!(
-            inputs(Harness::Cursor, &Command::Prompt { text: "hi".into() }).unwrap(),
+            inputs(Harness::Cursor, &Command::prompt("hi")).unwrap(),
             [Input::Text("hi".into()), Input::Keys(vec![Key::Enter])]
         );
         assert!(matches!(
-            inputs(Harness::Pi, &Command::Prompt { text: "a\nb".into() }).unwrap()[0],
+            inputs(Harness::Pi, &Command::prompt("a\nb")).unwrap()[0],
             Input::Paste(_)
+        ));
+        // A pane takes keystrokes, never an image.
+        let with_image = Command::Prompt {
+            text: "look".into(),
+            attachments: vec![crate::command::Attachment::from_bytes("image/png", b"PNG")],
+        };
+        assert!(matches!(
+            inputs(Harness::Pi, &with_image),
+            Err(DriverError::Unsupported { .. })
         ));
     }
 
@@ -178,5 +231,20 @@ mod tests {
         );
         assert!(launch(Harness::Cursor, Some("x")).is_err());
         assert_eq!(exit_inputs(Harness::Pi).unwrap()[0], Input::Text("/quit".into()));
+    }
+
+    #[test]
+    fn claude_approval_dialog_on_screen() {
+        let dialog = "● Running the build\n\n Bash command\n\n   cargo build\n   Build it\n\n \
+            Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for cargo build commands\n   \
+            3. No, and tell Claude what to do differently (esc)\n\n";
+        assert!(shows_approval(Harness::Claude, dialog));
+        let boxed = "│ Do you want to make this edit to main.rs?\n│ > 1. Yes\n│   2. No\n";
+        assert!(shows_approval(Harness::Claude, boxed));
+        let working = "● Bash(cargo build)\n  ⎿  Running…\n\n✻ Compiling… (12s · esc to interrupt)\n\n> \n  ? for shortcuts\n";
+        assert!(!shows_approval(Harness::Claude, working));
+        let quoted = "> Do you want to proceed? is what it asks\n● Sure.\n> \n";
+        assert!(!shows_approval(Harness::Claude, quoted));
+        assert!(!shows_approval(Harness::Pi, dialog));
     }
 }

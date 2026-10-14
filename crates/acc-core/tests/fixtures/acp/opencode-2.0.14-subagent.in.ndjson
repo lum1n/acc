@@ -1,0 +1,4 @@
+{"jsonrpc": "2.0", "id": "acc-1", "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}, "clientInfo": {"name": "acc", "title": "Agent Control Core", "version": "0"}}}
+{"jsonrpc": "2.0", "id": "acc-2", "method": "session/new", "params": {"cwd": "/tmp/acc-sub-spike", "mcpServers": []}}
+{"jsonrpc": "2.0", "id": "acc-3", "method": "session/set_config_option", "params": {"sessionId": "ses_ed041d750ffeJ5psvJ7ccuSW28", "configId": "model", "value": "opencode/big-pickle"}}
+{"jsonrpc": "2.0", "id": "acc-4", "method": "session/prompt", "params": {"sessionId": "ses_ed041d750ffeJ5psvJ7ccuSW28", "prompt": [{"type": "text", "text": "Use the task tool to launch an explore subagent that lists the files in this directory and reports their names. When it returns, reply with one line summarizing what it found."}]}}

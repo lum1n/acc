@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use acc_core::Harness;
 use acc_core::codex::rollout;
+use acc_core::harness::Compat;
 use acc_core::multiplexer;
 
 const MULTIPLEXERS: [(&str, &str); 4] = [
@@ -29,15 +30,28 @@ pub fn name(h: Harness) -> String {
     format!("{h:?}").to_lowercase()
 }
 
+/// How `version` compares with the versions ACC was tested with, as a
+/// note for the end of a line (empty when it is in the tested range).
+pub fn compat_note(h: Harness, version: &str) -> String {
+    let (min, max) = h.tested_versions();
+    match h.compat(version) {
+        Compat::Tested => String::new(),
+        Compat::Newer => format!(" (newer than tested: {min} to {max})"),
+        Compat::Older => format!(" (older than tested: {min} to {max}; may not start)"),
+        Compat::Unknown => format!(" (unknown version; tested {min} to {max})"),
+    }
+}
+
 pub fn doctor() -> ExitCode {
     println!("harnesses");
     for h in Harness::ALL {
         match version(h.program(), "--version") {
             Some(v) => println!(
-                "  ✓ {:<9} {:<9} {v:<32} try: acc run {}",
+                "  ✓ {:<9} {:<9} {v:<32} try: acc run {}{}",
                 name(h),
                 h.program(),
-                name(h)
+                name(h),
+                compat_note(h, &v)
             ),
             None => println!("  · {:<9} {:<9} not found", name(h), h.program()),
         }

@@ -11,6 +11,12 @@ fn driver(harness: Harness, start: Start) -> AcpDriver {
     AcpDriver::new(harness, AcpConfig::new("/home/v/proj", start))
 }
 
+fn driver_with_model(harness: Harness, start: Start, model: &str) -> AcpDriver {
+    let mut cfg = AcpConfig::new("/home/v/proj", start);
+    cfg.model = Some(model.to_owned());
+    AcpDriver::new(harness, cfg)
+}
+
 /// Parses NDJSON the driver wrote.
 fn sent(bytes: &[u8]) -> Vec<Value> {
     std::str::from_utf8(bytes)
@@ -158,22 +164,108 @@ fn handshake_opens_a_new_session() {
     assert_eq!(d.auth_methods()[0].0, "copilot-login");
 
     let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["compact", "interrupt", "new"]);
+    assert_eq!(
+        names,
+        ["compact", "interrupt", "new", "model", "mode", "permissions"]
+    );
     assert_eq!(d.commands()[0].exec, Exec::Text);
     assert_eq!(d.commands()[1].source, CommandSource::Acc);
+    // Copilot reports model, mode and allow-all as options: each gets a picker.
+    assert_eq!(
+        d.commands()[3].input,
+        CommandInput::Option { id: OptionId::Model }
+    );
 
     let ids: Vec<_> = d.options().iter().map(|o| o.id).collect();
     assert_eq!(ids, [OptionId::Mode, OptionId::Model, OptionId::Permission]);
 }
 
+fn opencode_session(session: &str, current_model: &str) -> Value {
+    json!({
+        "sessionId": session,
+        "configOptions": [
+            { "id": "model", "name": "Model", "category": "model", "type": "select",
+              "currentValue": current_model,
+              "options": [
+                { "value": "mock/mock-1", "name": "Mock" },
+                { "value": "github-copilot/claude-sonnet-5", "name": "Sonnet" } ] },
+            { "id": "mode", "name": "Session Mode", "category": "mode", "type": "select",
+              "currentValue": "build",
+              "options": [ { "value": "build", "name": "build" }, { "value": "plan", "name": "plan" } ] }
+        ]
+    })
+}
+
+#[test]
+fn startup_model_is_applied_as_a_config_option_for_opencode() {
+    // opencode takes no `--model` flag (see `launch_spec`); the agent opens
+    // with its own default and the driver has to switch it itself.
+    let mut d = driver_with_model(Harness::Opencode, Start::New, "github-copilot/claude-sonnet-5");
+    let init = one(&d.handshake());
+    feed(&mut d, &[result(init["id"].clone(), init_result(json!({})))]);
+    let new = one(&d.poll_transmit());
+
+    let events = feed(
+        &mut d,
+        &[result(new["id"].clone(), opencode_session("s1", "mock/mock-1"))],
+    );
+    assert!(
+        events.contains(&Event::SessionStarted {
+            harness: Harness::Opencode,
+            native_id: "s1".into(),
+            model: Some("mock/mock-1".into()),
+        }),
+        "reports the model the agent actually opened with"
+    );
+
+    let set = one(&d.poll_transmit());
+    assert_eq!(set["method"], "session/set_config_option");
+    assert_eq!(
+        set["params"],
+        json!({ "sessionId": "s1", "configId": "model", "value": "github-copilot/claude-sonnet-5" })
+    );
+
+    let mut after = opencode_session("s1", "mock/mock-1");
+    after["configOptions"][0]["currentValue"] = json!("github-copilot/claude-sonnet-5");
+    let events = feed(
+        &mut d,
+        &[result(
+            set["id"].clone(),
+            json!({ "configOptions": after["configOptions"] }),
+        )],
+    );
+    assert_eq!(events, [Event::OptionsChanged]);
+    assert_eq!(
+        d.options()
+            .iter()
+            .find(|o| o.id == OptionId::Model)
+            .expect("model")
+            .current
+            .as_deref(),
+        Some("github-copilot/claude-sonnet-5")
+    );
+
+    // A second session (e.g. `Command::New`) opening with the agent's
+    // default again gets switched back to the configured model too.
+    let new2 = one(&d.command(Command::New).expect("new"));
+    let events = feed(
+        &mut d,
+        &[result(new2["id"].clone(), opencode_session("s2", "mock/mock-1"))],
+    );
+    assert!(events.contains(&Event::SessionStarted {
+        harness: Harness::Opencode,
+        native_id: "s2".into(),
+        model: Some("mock/mock-1".into()),
+    }));
+    let set2 = one(&d.poll_transmit());
+    assert_eq!(set2["params"]["sessionId"], "s2");
+    assert_eq!(set2["params"]["value"], "github-copilot/claude-sonnet-5");
+}
+
 #[test]
 fn a_full_turn_with_a_permission_prompt() {
     let mut d = ready_copilot();
-    let prompt = one(&d
-        .command(Command::Prompt {
-            text: "fix the build".into(),
-        })
-        .expect("prompt"));
+    let prompt = one(&d.command(Command::prompt("fix the build")).expect("prompt"));
     assert_eq!(prompt["method"], "session/prompt");
     assert_eq!(prompt["params"]["sessionId"], "s1");
     assert_eq!(
@@ -238,10 +330,9 @@ fn a_full_turn_with_a_permission_prompt() {
         id: "item-2".into(),
         extensions: Value::Null
     }));
-    assert!(events.contains(&Event::PermissionRequested {
-        request_id: "7".into(),
-        title: "cargo build".into(),
-        options: vec![
+    assert!(events.iter().any(|e| matches!(e, Event::PermissionRequested {
+        request_id, title, options, kind: BlockKind::Permission, item_id, ..
+    } if request_id == "7" && title == "cargo build" && item_id.is_some() && options == &vec![
             PermissionOption {
                 id: "allow-once".into(),
                 label: "Allow".into()
@@ -250,8 +341,7 @@ fn a_full_turn_with_a_permission_prompt() {
                 id: "reject-once".into(),
                 label: "Reject".into()
             },
-        ],
-    }));
+        ])));
 
     // The answer echoes the agent's numeric id.
     let answer = one(&d
@@ -321,6 +411,194 @@ fn a_full_turn_with_a_permission_prompt() {
 }
 
 #[test]
+fn prompts_are_echoed_once() {
+    let mut d = ready_copilot();
+    assert!(d.take_events().is_empty());
+    let prompt = one(&d.command(Command::prompt("fix the build")).expect("prompt"));
+    assert_eq!(
+        d.take_events(),
+        [
+            Event::ItemStarted {
+                id: "prompt-1".into(),
+                kind: ItemKind::UserMessage,
+                parent: None,
+                extensions: Value::Null,
+            },
+            Event::ItemDelta {
+                id: "prompt-1".into(),
+                text: "fix the build".into(),
+            },
+            Event::ItemCompleted {
+                id: "prompt-1".into(),
+                extensions: Value::Null,
+            },
+        ]
+    );
+    assert!(d.take_events().is_empty());
+
+    // An agent that repeats the prompt during the turn isn't shown twice.
+    let events = feed(
+        &mut d,
+        &[
+            update("s1", text_chunk("user_message_chunk", "fix the build")),
+            update("s1", text_chunk("agent_message_chunk", "Done.")),
+            result(prompt["id"].clone(), json!({ "stopReason": "end_turn" })),
+        ],
+    );
+    let users = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::ItemStarted {
+                        kind: ItemKind::UserMessage,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    assert_eq!(users(&events), 0);
+
+    // Another client's prompt, once this client's turn is over, is.
+    let events = feed(
+        &mut d,
+        &[update("s1", text_chunk("user_message_chunk", "and the docs"))],
+    );
+    assert_eq!(users(&events), 1);
+
+    // Slash commands ride on prompts but aren't the user's words.
+    d.command(Command::Compact { hint: None }).expect("compact");
+    assert!(d.take_events().is_empty());
+}
+
+/// The user messages in `events`, as `(id, text)`.
+fn prompts(events: &[Event]) -> Vec<(String, String)> {
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ItemStarted {
+                id,
+                kind: ItemKind::UserMessage,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    ids.into_iter()
+        .map(|id| {
+            let text = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ItemDelta { id: i, text } if *i == id => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (id, text)
+        })
+        .collect()
+}
+
+/// Copilot's `events.jsonl` lines for these prompts, with other events between.
+fn copilot_history(texts: &[&str]) -> String {
+    texts
+        .iter()
+        .flat_map(|t| {
+            [
+                json!({ "type": "user.message", "data": { "content": t, "transformedContent": format!("<x/>{t}") } }),
+                json!({ "type": "assistant.turn_start", "data": {} }),
+            ]
+        })
+        .map(|v| format!("{v}\n"))
+        .collect()
+}
+
+#[test]
+fn a_late_client_takes_prompts_from_copilots_history() {
+    let mut d = driver(Harness::Copilot, Start::Attach);
+    assert!(
+        d.history_script("s1")
+            .expect("copilot")
+            .contains("session-state/s1/events.jsonl")
+    );
+    assert!(d.history_script("s1; rm -rf ~").is_none());
+    assert!(
+        driver(Harness::Cursor, Start::Attach)
+            .history_script("s1")
+            .is_none()
+    );
+
+    // The session was resumed: `session/load` replayed two prompts, then
+    // two live turns ran, the second one this client didn't see the end of.
+    d.on_history(&copilot_history(&["one", "two", "three", "four"]));
+    let events = feed(
+        &mut d,
+        &[
+            result("desk-0", init_result(json!({ "loadSession": true }))),
+            update("s1", text_chunk("user_message_chunk", "one")),
+            update("s1", text_chunk("agent_message_chunk", "1")),
+            update("s1", text_chunk("user_message_chunk", "two")),
+            update("s1", text_chunk("agent_message_chunk", "2")),
+            result("desk-1", copilot_session("s1")),
+            update("s1", text_chunk("agent_thought_chunk", "hm")),
+            update("s1", text_chunk("agent_message_chunk", "3")),
+            result("desk-2", json!({ "stopReason": "end_turn" })),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "ls", "kind": "execute" }),
+            ),
+        ],
+    );
+    assert_eq!(
+        prompts(&events),
+        [
+            ("item-1".into(), "one".into()),
+            ("item-3".into(), "two".into()),
+            ("history-2".into(), "three".into()),
+            ("history-3".into(), "four".into()),
+        ]
+    );
+    // Each prompt comes before its turn's first item.
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ItemStarted { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        [
+            "item-1",
+            "item-2",
+            "item-3",
+            "item-4",
+            "history-2",
+            "item-5",
+            "item-6",
+            "history-3",
+            "t1"
+        ]
+    );
+
+    // This client's own prompt is echoed and takes the next slot.
+    feed(&mut d, &[result("desk-3", json!({ "stopReason": "end_turn" }))]);
+    d.command(Command::prompt("five")).expect("prompt");
+    assert_eq!(prompts(&d.take_events()), [("prompt-1".into(), "five".into())]);
+    d.on_history(&copilot_history(&["one", "two", "three", "four", "five", "six"]));
+    let events = feed(
+        &mut d,
+        &[
+            update("s1", text_chunk("agent_message_chunk", "5")),
+            result("phone-0", json!({ "stopReason": "end_turn" })),
+            update("s1", text_chunk("agent_message_chunk", "6")),
+        ],
+    );
+    assert_eq!(prompts(&events), [("history-5".into(), "six".into())]);
+}
+
+#[test]
 fn split_reads_give_the_same_events() {
     let msgs = [
         update("s1", text_chunk("agent_message_chunk", "héllo ✓")),
@@ -328,9 +606,7 @@ fn split_reads_give_the_same_events() {
         result("acc-1", json!({ "stopReason": "end_turn" })),
     ];
     let mut whole = ready_copilot();
-    whole
-        .command(Command::Prompt { text: "x".into() })
-        .expect("prompt");
+    whole.command(Command::prompt("x")).expect("prompt");
     let expected = feed(&mut whole, &msgs);
 
     let mut bytes = Vec::new();
@@ -340,7 +616,7 @@ fn split_reads_give_the_same_events() {
     }
     for size in [1, 2, 7, 64] {
         let mut d = ready_copilot();
-        d.command(Command::Prompt { text: "x".into() }).expect("prompt");
+        d.command(Command::prompt("x")).expect("prompt");
         let got: Vec<_> = bytes.chunks(size).flat_map(|c| d.on_output(c)).collect();
         assert_eq!(got, expected, "chunk size {size}");
     }
@@ -501,7 +777,7 @@ fn auth_required_blocks_until_authenticated() {
 #[test]
 fn interrupt_cancels_open_permission_requests() {
     let mut d = ready_copilot();
-    d.command(Command::Prompt { text: "go".into() }).expect("prompt");
+    d.command(Command::prompt("go")).expect("prompt");
     feed(
         &mut d,
         &[
@@ -652,6 +928,60 @@ fn canonical_commands_use_advertised_slash_commands() {
 }
 
 #[test]
+fn prompts_sent_before_the_session_opens_are_queued_not_dropped() {
+    let mut d = driver(Harness::Copilot, Start::New);
+    let init = one(&d.handshake());
+
+    // A prompt sent while still handshaking is held, not an error.
+    let bytes = d.command(Command::prompt("hello")).expect("queued");
+    assert!(bytes.is_empty());
+    assert!(d.take_events().is_empty());
+
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(json!({ "loadSession": true })),
+        )],
+    );
+    let new = one(&d.poll_transmit());
+
+    // A second prompt sent while `session/new` is still outstanding queues too.
+    let bytes = d.command(Command::prompt("world")).expect("queued");
+    assert!(bytes.is_empty());
+    assert!(d.take_events().is_empty());
+
+    let events = feed(&mut d, &[result(new["id"].clone(), copilot_session("s1"))]);
+    assert!(events.contains(&Event::SessionStarted {
+        harness: Harness::Copilot,
+        native_id: "s1".into(),
+        model: Some("gpt-5.4".into()),
+    }));
+
+    // Both queued prompts went out, in order, once the session opened.
+    let sent = sent(&d.poll_transmit());
+    let prompts: Vec<_> = sent
+        .into_iter()
+        .filter(|m| m["method"] == "session/prompt")
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0]["params"]["sessionId"], "s1");
+    assert_eq!(prompts[0]["params"]["prompt"][0]["text"], "hello");
+    assert_eq!(prompts[1]["params"]["prompt"][0]["text"], "world");
+
+    // Each was echoed as its own user-message item.
+    let texts: Vec<_> = d
+        .take_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ItemDelta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, ["hello", "world"]);
+}
+
+#[test]
 fn new_session_switches_and_drops_stale_updates() {
     let mut d = ready_copilot();
     let new = one(&d.command(Command::New).expect("new"));
@@ -730,9 +1060,7 @@ fn attach_follows_another_clients_session() {
     );
     assert_eq!(events.last(), Some(&Event::TurnCompleted));
 
-    let p = one(&d
-        .command(Command::Prompt { text: "next".into() })
-        .expect("prompt"));
+    let p = one(&d.command(Command::prompt("next")).expect("prompt"));
     assert_eq!(p["id"], "phone-3f2a-0");
 }
 
@@ -827,4 +1155,97 @@ fn invoke_notice_and_resolved_permissions() {
         }),
         Err(DriverError::UnknownRequest(_))
     ));
+}
+
+#[test]
+fn option_pickers_set_config_options() {
+    let mut d = ready_copilot();
+    let mode = d
+        .commands()
+        .iter()
+        .find(|c| c.name == "mode")
+        .expect("mode picker");
+    assert_eq!(mode.input, CommandInput::Option { id: OptionId::Mode });
+    let set = one(&d
+        .command(Command::Invoke {
+            name: "mode".into(),
+            args: "plan".into(),
+        })
+        .expect("mode"));
+    assert_eq!(set["method"], "session/set_config_option");
+    assert_eq!(set["params"]["value"], "plan");
+    assert!(matches!(
+        d.command(Command::Invoke {
+            name: "model".into(),
+            args: String::new(),
+        }),
+        Err(DriverError::MissingArgument(_))
+    ));
+    // No effort option, no effort picker.
+    assert!(!d.commands().iter().any(|c| c.name == "effort"));
+}
+
+#[test]
+fn opencode_lists_its_unadvertised_compact() {
+    let mut d = driver(Harness::Opencode, Start::Attach);
+    feed(&mut d, &[update("s1", text_chunk("agent_message_chunk", "x"))]);
+    assert!(d.commands().iter().any(|c| c.name == "compact"));
+    let c = one(&d
+        .command(Command::Invoke {
+            name: "compact".into(),
+            args: "keep notes".into(),
+        })
+        .expect("compact"));
+    assert_eq!(c["params"]["prompt"][0]["text"], "/compact keep notes");
+}
+
+#[test]
+fn images_need_the_agents_prompt_capability() {
+    let png = Attachment::from_bytes("image/png", b"PNG");
+    let with_image = || Command::Prompt {
+        text: String::new(),
+        attachments: vec![png.clone()],
+    };
+    // `ready_copilot` advertises no promptCapabilities.
+    let mut d = ready_copilot();
+    assert!(matches!(
+        d.command(with_image()),
+        Err(DriverError::Unsupported { .. })
+    ));
+
+    let mut d = driver(Harness::Copilot, Start::New);
+    let init = one(&d.handshake());
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(
+                json!({ "loadSession": true, "promptCapabilities": { "image": true, "audio": false } }),
+            ),
+        )],
+    );
+    let new = one(&d.poll_transmit());
+    feed(&mut d, &[result(new["id"].clone(), copilot_session("s1"))]);
+    d.take_events();
+    let prompt = one(&d.command(with_image()).expect("prompt"));
+    assert_eq!(
+        prompt["params"]["prompt"],
+        json!([{ "type": "image", "mimeType": "image/png", "data": "UE5H" }])
+    );
+    assert_eq!(
+        prompts(&d.take_events()),
+        [("prompt-1".to_owned(), "[image]".to_owned())]
+    );
+
+    let both = one(&d
+        .command(Command::Prompt {
+            text: "and this".into(),
+            attachments: vec![png.clone()],
+        })
+        .expect("prompt"));
+    assert_eq!(
+        both["params"]["prompt"][0],
+        json!({ "type": "text", "text": "and this" })
+    );
+    assert_eq!(both["params"]["prompt"][1]["type"], "image");
 }

@@ -37,7 +37,7 @@ while offset < fixture.count {
     offset = end
     for event in got.events {
         switch event {
-        case let .permissionRequested(requestId, _, options) where !answered:
+        case let .permissionRequested(requestId, _, options, _, _, _) where !answered:
             let deny = options.first { $0.id.lowercased().contains("deny") || $0.id.lowercased().contains("reject") }!
             let bytes = try! session.send(command: .answerPermission(requestId: requestId, optionId: deny.id))
             check(String(decoding: bytes, as: UTF8.self).contains(requestId), "answer carries request id")

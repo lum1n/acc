@@ -254,7 +254,9 @@ async fn detached_session_survives_dropped_connections() {
     let phone = host(&sshd, proxy.port, check.clone());
     let id = unique("drop");
 
-    let d = Detached::launch(phone.clone(), &id, &cat_spec(), "/")
+    // No spec.json: the session lives in the real `~/.acc/s`, and an ACC
+    // client following that directory would attach to anything it can read.
+    let d = Detached::launch(phone.clone(), &id, &cat_spec(), "/", None)
         .await
         .expect("launch")
         .with_retry(retry());
@@ -298,12 +300,12 @@ async fn detached_session_survives_dropped_connections() {
     assert_eq!(read_exactly(&d, 5).await, b"five\n");
     assert!(phone.connections() > dials);
 
-    // The listing shows it, with the spec a client needs to rebuild a driver.
+    // The listing shows it, with its log size.
     let listed = acc_ssh::list(&phone).await.expect("list");
     let me = listed.iter().find(|l| l.id == id).expect("listed");
     assert!(matches!(me.status, Status::Alive { .. }));
-    assert_eq!(me.log_bytes, 24);
-    assert_eq!(me.spec.as_ref().map(|s| s.spec.program.as_str()), Some("cat"));
+    assert_eq!(me.status.size(), 24);
+    assert_eq!(me.spec_json, None);
 
     // Stopping drains the log, then reports the exit.
     d.stop().await.expect("stop");
@@ -368,8 +370,8 @@ async fn session_drives_a_harness_across_reconnects() {
     let id = unique("session");
     let inlog = sshd.dir.join("claude-stdin");
     let config = SessionConfig::new(Harness::Claude, "/tmp");
-    let mut core = acc_core::session::Session::new(config.clone());
-    let pipe = Detached::launch(h.clone(), &id, &fake_claude(&inlog), "/tmp")
+    let mut core = acc_core::live::Session::new(config.clone());
+    let pipe = Detached::launch(h.clone(), &id, &fake_claude(&inlog), "/tmp", None)
         .await
         .expect("launch")
         .with_retry(retry());

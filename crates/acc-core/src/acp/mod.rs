@@ -24,7 +24,10 @@ use serde_json::{Value, json};
 pub use options::{ConfigOption, ConfigValue};
 use options::{OptionState, Route, set_config_params};
 
-use crate::command::{Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Attachment, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId, offer,
+    offer_option, validate_attachments,
+};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Usage};
 use crate::harness::{Harness, LaunchSpec, Protocol};
@@ -46,7 +49,7 @@ const MAX_EARLY: usize = 1024;
 const AUTH_REQUIRED: i64 = -32000;
 
 /// How the driver gets a session once the agent is up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Start {
     /// `session/new` in the working directory.
     New,
@@ -60,7 +63,7 @@ pub enum Start {
 }
 
 /// Per-session settings for [`AcpDriver`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcpConfig {
     /// Absolute working directory on the host (ACP requires absolute paths).
     pub cwd: String,
@@ -86,7 +89,7 @@ impl AcpConfig {
 }
 
 /// What a request this client sent was for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Pending {
     Initialize,
     Authenticate,
@@ -101,7 +104,7 @@ enum Pending {
 }
 
 /// Where the connection is in its lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Phase {
     Initializing,
     Opening,
@@ -111,7 +114,7 @@ enum Phase {
 }
 
 /// A permission request the agent is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PermissionWait {
     /// The agent's JSON-RPC id, echoed verbatim in the answer.
     rpc_id: Value,
@@ -120,7 +123,7 @@ struct PermissionWait {
 }
 
 /// Sans-IO ACP client for one agent process and one active session.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct AcpDriver {
     harness: Harness,
     cfg: AcpConfig,
@@ -132,6 +135,8 @@ pub struct AcpDriver {
 
     // From `initialize`.
     load_session: bool,
+    /// `promptCapabilities.image`: whether `session/prompt` may carry images.
+    prompt_images: bool,
     resume_session: bool,
     fork_session: bool,
     auth_methods: Vec<(String, String)>,
@@ -146,11 +151,37 @@ pub struct AcpDriver {
     /// Updates for a session whose `session/new` or `session/fork` response
     /// hasn't arrived yet, replayed once it does.
     early: Vec<(String, Value)>,
+    /// Prompts sent before any session has opened, flushed in order once it
+    /// does. Unlike `early`, this holds client commands, not agent traffic.
+    queued_prompts: Vec<(String, Vec<Attachment>)>,
 
     /// The message or thought currently streaming in chunks.
     open_item: Option<(ItemId, ItemKind)>,
     open_tools: BTreeSet<String>,
+    /// Subagent tool calls that haven't been matched to a child session
+    /// yet, oldest first, with the child session they run in themselves
+    /// (`None` for the main conversation's).
+    unclaimed_subagents: Vec<(String, Option<String>)>,
+    /// Subagent tool calls whose kind has been reported.
+    subagent_tools: BTreeSet<String>,
+    /// Child session id → the subagent tool call it runs for.
+    child_sessions: BTreeMap<String, String>,
+    /// The message or thought streaming in each child session.
+    child_open: BTreeMap<String, (ItemId, ItemKind)>,
     item_seq: u64,
+    /// Prompts this client sent, as items, until the session takes them:
+    /// ACP agents only repeat a prompt when `session/load` replays history.
+    echoes: Vec<Event>,
+    echo_seq: u64,
+    /// Echoed prompts whose turn hasn't ended. An agent that repeats the
+    /// prompt anyway is ignored meanwhile, so it doesn't show twice.
+    echoed_turns: usize,
+    /// Every prompt of the session in order, from the harness's own store
+    /// (see [`Driver::history_script`]), and the next one's index: each turn
+    /// takes one, whether its prompt is replayed, echoed or taken from here.
+    history: Vec<String>,
+    history_next: usize,
+    turn_open: bool,
 
     state: Option<(RunState, Option<String>)>,
 }
@@ -173,6 +204,7 @@ impl AcpDriver {
             outgoing: Vec::new(),
             phase: if attach { Phase::Ready } else { Phase::Initializing },
             load_session: false,
+            prompt_images: false,
             resume_session: false,
             fork_session: false,
             auth_methods: Vec::new(),
@@ -183,9 +215,20 @@ impl AcpDriver {
             commands: Vec::new(),
             permissions: BTreeMap::new(),
             early: Vec::new(),
+            queued_prompts: Vec::new(),
             open_item: None,
             open_tools: BTreeSet::new(),
+            unclaimed_subagents: Vec::new(),
+            subagent_tools: BTreeSet::new(),
+            child_sessions: BTreeMap::new(),
+            child_open: BTreeMap::new(),
             item_seq: 0,
+            echoes: Vec::new(),
+            echo_seq: 0,
+            echoed_turns: 0,
+            history: Vec::new(),
+            history_next: 0,
+            turn_open: false,
             state: None,
         };
         d.rebuild_commands();
@@ -277,14 +320,58 @@ impl AcpDriver {
         }
     }
 
-    fn prompt_text(&mut self, text: String) -> Result<Vec<u8>, DriverError> {
+    /// `session/prompt` with text and image blocks. An image-only prompt
+    /// carries no text block.
+    fn prompt(&mut self, text: &str, attachments: &[Attachment]) -> Result<Vec<u8>, DriverError> {
         let sid = self.require_session()?;
+        let mut prompt = Vec::new();
+        if !text.is_empty() || attachments.is_empty() {
+            prompt.push(json!({ "type": "text", "text": text }));
+        }
+        for a in attachments {
+            prompt.push(json!({ "type": "image", "mimeType": a.media_type, "data": a.data }));
+        }
         let bytes = self.request(
             "session/prompt",
-            json!({ "sessionId": sid, "prompt": [{ "type": "text", "text": text }] }),
+            json!({ "sessionId": sid, "prompt": prompt }),
             Pending::Prompt,
         );
         Ok(bytes)
+    }
+
+    /// Checks image support and sends, for a prompt whose session is ready
+    /// (either immediately, or flushed from [`Self::queued_prompts`]).
+    fn try_prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<Vec<u8>, DriverError> {
+        if !attachments.is_empty() && !self.prompt_images {
+            return Err(DriverError::Unsupported {
+                harness: self.harness,
+                what: "images (the agent did not advertise promptCapabilities.image)",
+            });
+        }
+        let bytes = self.prompt(&text, &attachments)?;
+        self.echo_prompt(if text.is_empty() { "[image]" } else { &text });
+        Ok(bytes)
+    }
+
+    fn echo_prompt(&mut self, text: &str) {
+        self.echo_seq += 1;
+        self.echoed_turns += 1;
+        self.history_next += 1;
+        self.turn_open = true;
+        push_prompt(format!("prompt-{}", self.echo_seq), text, &mut self.echoes);
+    }
+
+    /// A turn whose prompt nobody showed began: show it from the history.
+    fn open_turn(&mut self, out: &mut Vec<Event>) {
+        if self.turn_open {
+            return;
+        }
+        self.turn_open = true;
+        let n = self.history_next;
+        self.history_next += 1;
+        if let Some(text) = self.history.get(n).cloned() {
+            push_prompt(format!("history-{n}"), &text, out);
+        }
     }
 
     /// Sends `/name args` if the agent advertises one of `names`, or if the
@@ -303,7 +390,7 @@ impl AcpDriver {
         } else {
             format!("/{name} {args}")
         };
-        self.prompt_text(text)
+        self.prompt(&text, &[])
     }
 
     fn answer_permission(&mut self, rpc_id: Value, outcome: Value) {
@@ -366,7 +453,10 @@ impl AcpDriver {
             Pending::Load { session_id } | Pending::Resume { session_id } => {
                 self.on_session_open(session_id, &r, out);
             }
-            Pending::Prompt => self.on_turn_end(&r, out),
+            Pending::Prompt => {
+                self.echoed_turns = self.echoed_turns.saturating_sub(1);
+                self.on_turn_end(&r, out);
+            }
             Pending::SetConfig => {
                 if r.get("configOptions").is_some() {
                     self.opts.absorb_response(&r);
@@ -425,6 +515,8 @@ impl AcpDriver {
                 self.fail(&message, out);
             }
             Pending::Prompt => {
+                self.echoed_turns = self.echoed_turns.saturating_sub(1);
+                self.turn_open = false;
                 self.close_turn_items(out);
                 self.set_state(RunState::Error, Some(message), out);
                 out.push(Event::TurnCompleted);
@@ -441,6 +533,7 @@ impl AcpDriver {
 
     fn fail(&mut self, message: &str, out: &mut Vec<Event>) {
         self.phase = Phase::Failed;
+        self.queued_prompts.clear();
         self.set_state(RunState::Error, Some(message.to_owned()), out);
     }
 
@@ -469,6 +562,10 @@ impl AcpDriver {
         let session_caps = caps.get("sessionCapabilities").unwrap_or(&Value::Null);
         let has = |k: &str| session_caps.get(k).is_some_and(|v| !v.is_null());
         self.load_session = caps.get("loadSession").and_then(Value::as_bool).unwrap_or(false);
+        self.prompt_images = caps
+            .pointer("/promptCapabilities/image")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.resume_session = has("resume");
         self.fork_session = has("fork");
         self.auth_methods = r
@@ -490,21 +587,30 @@ impl AcpDriver {
             self.reset_session();
         }
         self.replaying = false;
+        self.turn_open = false;
         self.phase = Phase::Ready;
         self.close_open_item(out);
         self.opts.absorb_response(r);
         self.opts.rebuild(self.harness);
         self.session_id = Some(session_id.clone());
+        let bytes = self.apply_startup_model();
+        self.outgoing.extend(bytes);
         out.push(Event::SessionStarted {
             harness: self.harness,
             native_id: session_id,
             model: self.opts.current_model(),
         });
         out.push(Event::OptionsChanged);
+        self.refresh_palette(out);
         self.set_state(RunState::Idle, None, out);
         for (sid, msg) in std::mem::take(&mut self.early) {
             if self.session_id.as_deref() == Some(sid.as_str()) {
                 self.on_notification("session/update", &msg, out);
+            }
+        }
+        for (text, attachments) in std::mem::take(&mut self.queued_prompts) {
+            if let Ok(bytes) = self.try_prompt(text, attachments) {
+                self.outgoing.extend(bytes);
             }
         }
     }
@@ -513,14 +619,26 @@ impl AcpDriver {
         self.permissions.clear();
         self.open_item = None;
         self.open_tools.clear();
+        self.unclaimed_subagents.clear();
+        self.subagent_tools.clear();
+        self.child_sessions.clear();
+        self.child_open.clear();
         self.harness_commands.clear();
         self.rebuild_commands();
+        self.history.clear();
+        self.history_next = 0;
     }
 
     /// Completes whatever the turn left open. A cancelled or failed turn can
     /// leave tool calls without a final status.
     fn close_turn_items(&mut self, out: &mut Vec<Event>) {
         self.close_open_item(out);
+        for (_, (id, _)) in std::mem::take(&mut self.child_open) {
+            out.push(Event::ItemCompleted {
+                id,
+                extensions: Value::Null,
+            });
+        }
         for id in std::mem::take(&mut self.open_tools) {
             out.push(Event::ItemCompleted {
                 id,
@@ -533,6 +651,7 @@ impl AcpDriver {
     }
 
     fn on_turn_end(&mut self, r: &Value, out: &mut Vec<Event>) {
+        self.turn_open = false;
         self.close_turn_items(out);
         if let Some(u) = r.get("usage").filter(|u| u.is_object()) {
             let n = |k: &str| u.get(k).and_then(Value::as_u64);
@@ -564,6 +683,9 @@ impl AcpDriver {
             // Another client opened or forked a session; follow it.
             self.on_session_open(sid.to_owned(), r, out);
         } else if r.get("configOptions").is_some() || r.get("modes").is_some() {
+            // Also how another client's `session/load` ends, after the
+            // history it replayed.
+            self.turn_open = false;
             self.opts.absorb_response(r);
             self.options_changed(out);
         }
@@ -595,7 +717,7 @@ impl AcpDriver {
         if let Some(tid) = &tool_call_id
             && !self.open_tools.contains(tid)
         {
-            self.start_tool(tid.clone(), tool, out);
+            self.start_tool(tid.clone(), tool, None, out);
         }
         let options: Vec<PermissionOption> = params
             .get("options")
@@ -622,10 +744,18 @@ impl AcpDriver {
                 option_ids: options.iter().map(|o| o.id.clone()).collect(),
             },
         );
+        let input = tool.get("rawInput").cloned().unwrap_or(Value::Null);
+        let item_id = self
+            .permissions
+            .get(&request_id)
+            .and_then(|w| w.tool_call_id.clone());
         out.push(Event::PermissionRequested {
             request_id,
             title: title.clone(),
             options,
+            kind: BlockKind::Permission,
+            item_id,
+            input,
         });
         self.set_state(
             RunState::Blocked {
@@ -672,9 +802,14 @@ impl AcpDriver {
             return;
         };
         let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+        if let Some(child) = update.pointer("/_meta/opencode~1child-session") {
+            self.on_child_update(kind, child, update, out);
+            return;
+        }
         match kind {
             "agent_message_chunk" => self.chunk(ItemKind::AgentMessage, update, out),
             "agent_thought_chunk" => self.chunk(ItemKind::Reasoning, update, out),
+            "user_message_chunk" if self.echoed_turns > 0 && !self.replaying => {}
             "user_message_chunk" => self.chunk(ItemKind::UserMessage, update, out),
             "tool_call" => self.on_tool_call(update, out),
             "tool_call_update" => self.on_tool_update(update, out),
@@ -732,6 +867,7 @@ impl AcpDriver {
         if self.replaying {
             return;
         }
+        self.open_turn(out);
         let blocked = matches!(self.state, Some((RunState::Blocked { .. }, _)));
         if !blocked || self.permissions.is_empty() {
             self.set_state(RunState::Working { progress: None }, None, out);
@@ -750,6 +886,10 @@ impl AcpDriver {
             .is_some_and(|(id, k)| *k == kind && message_id.is_none_or(|m| m == id));
         if !same {
             self.close_open_item(out);
+            if kind == ItemKind::UserMessage {
+                self.history_next += 1;
+                self.turn_open = true;
+            }
             let id = message_id.map_or_else(
                 || {
                     self.item_seq += 1;
@@ -760,6 +900,7 @@ impl AcpDriver {
             out.push(Event::ItemStarted {
                 id: id.clone(),
                 kind,
+                parent: None,
                 extensions: Value::Null,
             });
             self.open_item = Some((id, kind));
@@ -789,19 +930,175 @@ impl AcpDriver {
         }
     }
 
-    fn start_tool(&mut self, id: String, update: &Value, out: &mut Vec<Event>) {
-        self.close_open_item(out);
-        let kind = match update.get("kind").and_then(Value::as_str) {
-            Some("execute") => ItemKind::CommandExecution,
-            Some("edit" | "delete" | "move") => ItemKind::FileChange,
-            _ => ItemKind::ToolCall,
+    fn start_tool(
+        &mut self,
+        id: String,
+        update: &Value,
+        parent: Option<(String, String)>,
+        out: &mut Vec<Event>,
+    ) {
+        match &parent {
+            Some((child, _)) => self.close_child_item(child, out),
+            None => self.close_open_item(out),
+        }
+        let kind = if crate::item::acp_is_subagent(update) {
+            self.note_subagent(&id, parent.as_ref().map(|(c, _)| c.clone()));
+            ItemKind::Subagent
+        } else {
+            match update.get("kind").and_then(Value::as_str) {
+                Some("execute") => ItemKind::CommandExecution,
+                Some("edit" | "delete" | "move") => ItemKind::FileChange,
+                _ => ItemKind::ToolCall,
+            }
         };
         self.open_tools.insert(id.clone());
         out.push(Event::ItemStarted {
             id,
             kind,
+            parent: parent.map(|(_, item)| item),
             extensions: strip_tag(update),
         });
+    }
+
+    /// Records a subagent tool call, so the child session that shows up
+    /// next under its session can be matched to it.
+    fn note_subagent(&mut self, id: &str, session: Option<String>) {
+        if self.subagent_tools.insert(id.to_owned()) {
+            self.unclaimed_subagents.push((id.to_owned(), session));
+        }
+    }
+
+    /// A tool call first reported without what identifies it as a subagent
+    /// (opencode sends the input in a later update): report its kind now.
+    fn upgrade_to_subagent(
+        &mut self,
+        id: &str,
+        update: &Value,
+        session: Option<String>,
+        out: &mut Vec<Event>,
+    ) {
+        if self.subagent_tools.contains(id) || !crate::item::acp_is_subagent(update) {
+            return;
+        }
+        self.note_subagent(id, session);
+        out.push(Event::ItemStarted {
+            id: id.to_owned(),
+            kind: ItemKind::Subagent,
+            parent: None,
+            extensions: strip_tag(update),
+        });
+    }
+
+    /// The subagent tool call a child session runs for. opencode streams a
+    /// child session's updates under the parent's session id, marked with
+    /// `_meta["opencode/child-session"] = {id, parentID, depth, title}`,
+    /// before the tool's result names the session: the first update claims
+    /// the oldest unmatched subagent call of its parent session.
+    fn subagent_for(&mut self, child: &str, parent_session: Option<&str>) -> Option<String> {
+        if let Some(item) = self.child_sessions.get(child) {
+            return Some(item.clone());
+        }
+        let ours = |s: &Option<String>| match (s, parent_session) {
+            (None, None) => true,
+            (None, Some(p)) => self.session_id.as_deref() == Some(p),
+            (Some(s), Some(p)) => s == p,
+            (Some(_), None) => false,
+        };
+        let i = self.unclaimed_subagents.iter().position(|(_, s)| ours(s))?;
+        let (item, _) = self.unclaimed_subagents.remove(i);
+        self.child_sessions.insert(child.to_owned(), item.clone());
+        Some(item)
+    }
+
+    fn on_child_update(&mut self, kind: &str, meta: &Value, update: &Value, out: &mut Vec<Event>) {
+        let Some(child) = meta.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            return;
+        };
+        let parent_session = meta.get("parentID").and_then(Value::as_str);
+        let Some(parent) = self.subagent_for(&child, parent_session) else {
+            // No subagent call to hang it on; keep it visible as native.
+            out.push(native(kind, update));
+            return;
+        };
+        if !self.replaying {
+            self.working(out);
+        }
+        match kind {
+            "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" => {
+                let item_kind = match kind {
+                    "agent_message_chunk" => ItemKind::AgentMessage,
+                    "agent_thought_chunk" => ItemKind::Reasoning,
+                    _ => ItemKind::UserMessage,
+                };
+                let message_id = update.get("messageId").and_then(Value::as_str);
+                let same = self
+                    .child_open
+                    .get(&child)
+                    .is_some_and(|(id, k)| *k == item_kind && message_id.is_none_or(|m| m == id));
+                if !same {
+                    self.close_child_item(&child, out);
+                    let id = message_id.map_or_else(
+                        || {
+                            self.item_seq += 1;
+                            format!("item-{}", self.item_seq)
+                        },
+                        str::to_owned,
+                    );
+                    out.push(Event::ItemStarted {
+                        id: id.clone(),
+                        kind: item_kind,
+                        parent: Some(parent.clone()),
+                        extensions: Value::Null,
+                    });
+                    self.child_open.insert(child.clone(), (id, item_kind));
+                }
+                let Some((id, _)) = self.child_open.get(&child) else {
+                    return;
+                };
+                let content = update.get("content").unwrap_or(&Value::Null);
+                match content.get("text").and_then(Value::as_str) {
+                    Some(text) if content.get("type").and_then(Value::as_str) == Some("text") => {
+                        out.push(Event::ItemDelta {
+                            id: id.clone(),
+                            text: text.to_owned(),
+                        });
+                    }
+                    _ => out.push(Event::ItemUpdated {
+                        id: id.clone(),
+                        extensions: content.clone(),
+                    }),
+                }
+            }
+            "tool_call" | "tool_call_update" => {
+                let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+                    out.push(native(kind, update));
+                    return;
+                };
+                if self.open_tools.contains(id) {
+                    self.upgrade_to_subagent(id, update, Some(child.clone()), out);
+                    if !is_final(update) {
+                        out.push(Event::ItemUpdated {
+                            id: id.to_owned(),
+                            extensions: strip_tag(update),
+                        });
+                    }
+                } else {
+                    self.start_tool(id.to_owned(), update, Some((child, parent)), out);
+                }
+                self.finish_tool_if_done(id, update, out);
+            }
+            // Usage, plans and the rest of a child session are its own.
+            _ => out.push(native(kind, update)),
+        }
+    }
+
+    fn close_child_item(&mut self, child: &str, out: &mut Vec<Event>) {
+        if let Some((id, _)) = self.child_open.remove(child) {
+            out.push(Event::ItemCompleted {
+                id,
+                extensions: Value::Null,
+            });
+        }
     }
 
     fn on_tool_call(&mut self, update: &Value, out: &mut Vec<Event>) {
@@ -811,12 +1108,13 @@ impl AcpDriver {
         };
         self.working(out);
         if self.open_tools.contains(id) {
+            self.upgrade_to_subagent(id, update, None, out);
             out.push(Event::ItemUpdated {
                 id: id.to_owned(),
                 extensions: strip_tag(update),
             });
         } else {
-            self.start_tool(id.to_owned(), update, out);
+            self.start_tool(id.to_owned(), update, None, out);
         }
         self.finish_tool_if_done(id, update, out);
     }
@@ -840,8 +1138,9 @@ impl AcpDriver {
         }
         self.working(out);
         if !self.open_tools.contains(id) {
-            self.start_tool(id.to_owned(), update, out);
+            self.start_tool(id.to_owned(), update, None, out);
         } else if !is_final(update) {
+            self.upgrade_to_subagent(id, update, None, out);
             out.push(Event::ItemUpdated {
                 id: id.to_owned(),
                 extensions: strip_tag(update),
@@ -852,6 +1151,17 @@ impl AcpDriver {
 
     fn finish_tool_if_done(&mut self, id: &str, update: &Value, out: &mut Vec<Event>) {
         if is_final(update) && self.open_tools.remove(id) {
+            // A finished subagent: its child session's last message is done.
+            let children: Vec<String> = self
+                .child_sessions
+                .iter()
+                .filter(|(_, item)| *item == id)
+                .map(|(c, _)| c.clone())
+                .collect();
+            for child in children {
+                self.close_child_item(&child, out);
+            }
+            self.unclaimed_subagents.retain(|(t, _)| t != id);
             out.push(Event::ItemCompleted {
                 id: id.to_owned(),
                 extensions: strip_tag(update),
@@ -878,39 +1188,82 @@ impl AcpDriver {
     fn options_changed(&mut self, out: &mut Vec<Event>) {
         self.opts.rebuild(self.harness);
         out.push(Event::OptionsChanged);
+        self.refresh_palette(out);
     }
 
-    /// Harness commands first, then ACC's canonical ones the harness lacks.
+    /// Rebuilds the palette after the options changed, reporting it when
+    /// pickers came or went.
+    fn refresh_palette(&mut self, out: &mut Vec<Event>) {
+        let before: Vec<String> = self.commands.iter().map(|c| c.name.clone()).collect();
+        self.rebuild_commands();
+        if self.commands.iter().map(|c| &c.name).ne(before.iter()) {
+            out.push(Event::CommandsChanged);
+        }
+    }
+
+    /// Harness commands first, then ACC's canonical ones the harness lacks,
+    /// then pickers for the options the agent reports.
     fn rebuild_commands(&mut self) {
         let mut all = self.harness_commands.clone();
-        let rpc = |name: &str, description: &str, method: &str| CommandEntry {
-            name: name.into(),
-            description: description.into(),
-            arg_hint: None,
-            source: CommandSource::Acc,
-            exec: Exec::Rpc {
-                method: method.into(),
-            },
-        };
-        let mut canonical = vec![
+        let rpc =
+            |name: &str, description: &str, method: &str| CommandEntry::rpc(name, description, None, method);
+        offer(
+            &mut all,
             rpc("interrupt", "Stop the current turn", "session/cancel"),
-            rpc("new", "Start a new session", "session/new"),
-        ];
+        );
+        offer(&mut all, rpc("new", "Start a new session", "session/new"));
         if self.fork_session {
-            canonical.push(rpc("fork", "Fork this session", "session/fork"));
+            offer(&mut all, rpc("fork", "Fork this session", "session/fork"));
         }
-        for c in canonical {
-            if !all.iter().any(|h| h.name == c.name) {
-                all.push(c);
-            }
+        // opencode 1.18.35 and 2.0.14 run `/compact` without listing it.
+        if self.harness == Harness::Opencode {
+            offer(
+                &mut all,
+                CommandEntry {
+                    source: CommandSource::Builtin,
+                    exec: Exec::Text,
+                    ..rpc("compact", "Summarize the conversation to free context", "")
+                },
+            );
+        }
+        for (id, name, description) in OPTION_COMMANDS {
+            let method = match self.opts.route(id) {
+                Some(Route::SpawnFlag) => "restart",
+                Some(Route::Config { .. }) => "session/set_config_option",
+                Some(Route::LegacyMode) => "session/set_mode",
+                Some(Route::LegacyModel) => "session/set_model",
+                None => continue,
+            };
+            offer_option(
+                &mut all,
+                &self.opts.defs,
+                id,
+                CommandEntry::rpc(name, description, Some("<value>"), method),
+            );
         }
         self.commands = all;
     }
 }
 
+/// Palette names for option pickers.
+const OPTION_COMMANDS: [(OptionId, &str, &str); 4] = [
+    (OptionId::Model, "model", "Choose the model"),
+    (OptionId::Effort, "effort", "Choose reasoning effort"),
+    (OptionId::Mode, "mode", "Choose the agent mode"),
+    (
+        OptionId::Permission,
+        "permissions",
+        "Choose what the agent may do without asking",
+    ),
+];
+
 impl Driver for AcpDriver {
     fn harness(&self) -> Harness {
         self.harness
+    }
+
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
     }
 
     /// The ACP entry point. Resume happens in-protocol ([`Start::Resume`]),
@@ -959,9 +1312,48 @@ impl Driver for AcpDriver {
         std::mem::take(&mut self.outgoing)
     }
 
+    fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.echoes)
+    }
+
+    /// Copilot keeps every prompt in its own event log; ACP only replays
+    /// them on `session/load`, which would repeat the history to every
+    /// client following the session's output.
+    fn history_script(&self, native_id: &str) -> Option<String> {
+        let safe = !native_id.is_empty() && native_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        (self.harness == Harness::Copilot && safe).then(|| {
+            format!(
+                "grep -F '\"user.message\"' \"$HOME/.copilot/session-state/{native_id}/events.jsonl\" 2>/dev/null || :\n"
+            )
+        })
+    }
+
+    fn on_history(&mut self, output: &str) {
+        self.history = output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("type").and_then(Value::as_str) == Some("user.message"))
+            .filter_map(|v| {
+                v.pointer("/data/content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+    }
+
     fn command(&mut self, cmd: Command) -> Result<Vec<u8>, DriverError> {
         match cmd {
-            Command::Prompt { text } => self.prompt_text(text),
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                // No session yet (still handshaking, opening, or waiting on
+                // auth): hold the prompt instead of dropping it, and send it
+                // the moment a session opens.
+                if self.session_id.is_none() && self.phase != Phase::Failed {
+                    self.queued_prompts.push((text, attachments));
+                    return Ok(Vec::new());
+                }
+                self.try_prompt(text, attachments)
+            }
             Command::Interrupt => {
                 let sid = self.require_session()?;
                 // The spec requires answering open permission requests with
@@ -1049,16 +1441,47 @@ impl AcpDriver {
             "interrupt" => self.command(Command::Interrupt),
             "new" => self.command(Command::New),
             "fork" => self.command(Command::Fork),
+            // An option picker the agent doesn't list as its own command.
+            _ if !self.harness_commands.iter().any(|c| c.name == name)
+                && let Some((id, ..)) = OPTION_COMMANDS.iter().find(|(_, n, _)| *n == name) =>
+            {
+                let value = args.trim();
+                if value.is_empty() {
+                    return Err(DriverError::MissingArgument("a value"));
+                }
+                self.command(Command::SetOption {
+                    id: *id,
+                    value: value.to_owned(),
+                })
+            }
+            "compact" if self.harness == Harness::Opencode => self.command(Command::Compact {
+                hint: Some(args.to_owned()).filter(|a| !a.trim().is_empty()),
+            }),
             _ if self.harness_commands.iter().any(|c| c.name == name) => {
                 let text = if args.is_empty() {
                     format!("/{name}")
                 } else {
                     format!("/{name} {args}")
                 };
-                self.prompt_text(text)
+                self.prompt(&text, &[])
             }
             _ => Err(DriverError::InvalidOption(name.to_owned())),
         }
+    }
+
+    /// `cfg.model` for a session just opened. Cursor and Copilot already got
+    /// it as a launch flag (see [`launch_spec`]); for agents that only take
+    /// the model as a config option or legacy field (opencode), nothing
+    /// applies it otherwise, so every new session falls back to the agent's
+    /// own default instead of what the caller asked for.
+    fn apply_startup_model(&mut self) -> Vec<u8> {
+        let Some(model) = self.cfg.model.clone() else {
+            return Vec::new();
+        };
+        if self.opts.current_model().as_deref() == Some(model.as_str()) {
+            return Vec::new();
+        }
+        self.set_option(OptionId::Model, model).unwrap_or_default()
     }
 
     fn set_option(&mut self, id: OptionId, value: String) -> Result<Vec<u8>, DriverError> {
@@ -1129,6 +1552,23 @@ pub fn launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
     }
 }
 
+fn push_prompt(id: ItemId, text: &str, out: &mut Vec<Event>) {
+    out.push(Event::ItemStarted {
+        id: id.clone(),
+        kind: ItemKind::UserMessage,
+        parent: None,
+        extensions: Value::Null,
+    });
+    out.push(Event::ItemDelta {
+        id: id.clone(),
+        text: text.to_owned(),
+    });
+    out.push(Event::ItemCompleted {
+        id,
+        extensions: Value::Null,
+    });
+}
+
 fn line(v: &Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(v).unwrap_or_default();
     bytes.push(b'\n');
@@ -1186,6 +1626,7 @@ fn parse_commands(list: Option<&Value>) -> Vec<CommandEntry> {
                     .map(str::to_owned),
                 source: CommandSource::Builtin,
                 exec: Exec::Text,
+                input: CommandInput::None,
                 name,
             })
         })

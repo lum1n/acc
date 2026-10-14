@@ -12,7 +12,7 @@
 //! - [`Detached`]: the bytes of one detached session (harness stdin on a FIFO,
 //!   stdout in a log). Reads resume from the exact byte offset after a
 //!   dropped connection; writes are delivered whole and at most once.
-//! - [`Session`]: an [`acc_core::session::Session`] (driver picked by
+//! - [`Session`]: an [`acc_core::live::Session`] (driver picked by
 //!   harness, merged state) on top of a [`Detached`], turning commands into
 //!   writes and log bytes into events.
 //!
@@ -40,9 +40,10 @@ pub use host::{AgentSocket, Auth, Host, HostKeyCheck, Output, SshConfig, Stream,
 pub use pane::Pane;
 pub use session::Session;
 
-/// Re-exported so callers can name session listings and statuses.
-pub use acc_core::detached::{Listed, SessionSpec, Status};
+/// Re-exported so callers can name session listings, statuses and specs.
+pub use acc_core::detached::{Listing, Status};
 /// Re-exported so callers can configure a [`Session`] without naming acc-core.
-pub use acc_core::session::{Opening, SessionConfig};
+pub use acc_core::live::{Opening, SessionConfig};
+pub use acc_core::session::SessionSpec;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

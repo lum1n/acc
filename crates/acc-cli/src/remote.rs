@@ -71,7 +71,7 @@ impl Remote {
     }
 
     /// A detached session on the host, for rejoining it.
-    pub fn find(&self, id: &str) -> Result<acc_ssh::Listed, String> {
+    pub fn find(&self, id: &str) -> Result<acc_ssh::Listing, String> {
         let listed = self
             .rt
             .block_on(acc_ssh::list(&self.host))
@@ -99,6 +99,7 @@ impl Remote {
     /// `replay` bytes the log held when the client attached.
     pub fn start(
         self,
+        harness: acc_core::Harness,
         spec: &LaunchSpec,
         cwd: &str,
         attach: Option<&str>,
@@ -109,8 +110,12 @@ impl Remote {
             Some(id) => Detached::attach(self.host.clone(), id, 0).map_err(|e| e.to_string())?,
             None => {
                 let id = new_id();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                let record = acc_ssh::SessionSpec::new(&id, harness, cwd, spec.clone(), now).to_json();
                 self.rt
-                    .block_on(Detached::launch(self.host.clone(), &id, spec, cwd))
+                    .block_on(Detached::launch(self.host.clone(), &id, spec, cwd, Some(&record)))
                     .map_err(|e| format!("launch on the host: {e}"))?
             }
         };
@@ -284,16 +289,18 @@ pub fn sessions(dest: &str, args: &[&str]) -> Result<std::process::ExitCode, Str
     }
     for l in listed {
         let status = match l.status {
-            acc_ssh::Status::Alive { pid } => format!("running (pid {pid})"),
-            acc_ssh::Status::Exited { code: Some(c) } => format!("exited {c}"),
-            acc_ssh::Status::Exited { code: None } => "exited".to_owned(),
+            acc_ssh::Status::Alive { pid, .. } => format!("running (pid {pid})"),
+            acc_ssh::Status::Exited { code: Some(c), .. } => format!("exited {c}"),
+            acc_ssh::Status::Exited { code: None, .. } => "exited".to_owned(),
             acc_ssh::Status::Missing => "never started".to_owned(),
         };
         let what = l
-            .spec
-            .map(|s| format!("{} in {}", s.spec.program, s.cwd))
+            .spec_json
+            .as_deref()
+            .and_then(acc_ssh::SessionSpec::from_json)
+            .map(|s| format!("{} in {}", s.launch.program, s.cwd))
             .unwrap_or_default();
-        println!("{:<16} {status:<20} {:>9} B  {what}", l.id, l.log_bytes);
+        println!("{:<16} {status:<20} {:>9} B  {what}", l.id, l.status.size());
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

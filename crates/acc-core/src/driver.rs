@@ -6,6 +6,8 @@
 //! pane) is not the driver's concern, so the same driver runs on every platform
 //! and is tested by replaying recorded sessions.
 
+use serde_json::Value;
+
 use crate::command::{Command, CommandEntry, OptionDef};
 use crate::event::Event;
 use crate::harness::{Harness, LaunchSpec};
@@ -21,6 +23,12 @@ pub enum DriverError {
     UnknownRequest(String),
     #[error("unknown option value {0}")]
     InvalidOption(String),
+    #[error("this command needs {0}")]
+    MissingArgument(&'static str),
+    /// An image too large, not an image, or not decodable; see
+    /// [`crate::command::validate_attachments`].
+    #[error("attachment rejected: {0}")]
+    AttachmentRejected(String),
 }
 
 /// Translates between one harness protocol and ACC's model.
@@ -33,6 +41,15 @@ pub trait Driver: Send {
     /// Bytes to write right after the process starts (handshakes such as
     /// ACP/app-server `initialize`). Empty for harnesses that need none.
     fn handshake(&mut self) -> Vec<u8>;
+
+    /// Bytes to write when joining a harness that another client (or an
+    /// earlier connection of this one) already started and initialized, after
+    /// its log has been replayed through [`Driver::on_output`]. Only safe,
+    /// repeatable queries (models, usage, palette) are sent; never a second
+    /// `initialize` or a new session.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
 
     /// Feed bytes read from the harness; returns events in order.
     ///
@@ -54,5 +71,28 @@ pub trait Driver: Send {
     /// answered) or follow-up queries. Call after [`Driver::on_output`].
     fn poll_transmit(&mut self) -> Vec<u8> {
         Vec::new()
+    }
+
+    /// Events a command produced without the harness saying so, such as the
+    /// prompt of a harness that doesn't repeat it. Call after
+    /// [`Driver::command`].
+    fn take_events(&mut self) -> Vec<Event> {
+        Vec::new()
+    }
+
+    /// A script printing what the harness keeps of a session that its
+    /// protocol won't replay to a client joining late (prompts, for ACP),
+    /// given the session's native id. Run it before replaying the log and
+    /// pass its output to [`Driver::on_history`].
+    fn history_script(&self, _native_id: &str) -> Option<String> {
+        None
+    }
+
+    fn on_history(&mut self, _output: &str) {}
+
+    /// The driver's whole state, for [`crate::session::Session::snapshot`].
+    /// Restored by deserializing the concrete driver for the harness.
+    fn snapshot(&self) -> Option<Value> {
+        None
     }
 }

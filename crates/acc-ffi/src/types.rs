@@ -52,7 +52,6 @@ pub enum Protocol {
     CodexAppServer,
     Acp,
     PiRpc,
-    OpencodeHttp,
 }
 
 impl From<core_h::Protocol> for Protocol {
@@ -62,7 +61,6 @@ impl From<core_h::Protocol> for Protocol {
             core_h::Protocol::CodexAppServer => Self::CodexAppServer,
             core_h::Protocol::Acp => Self::Acp,
             core_h::Protocol::PiRpc => Self::PiRpc,
-            core_h::Protocol::OpencodeHttp => Self::OpencodeHttp,
         }
     }
 }
@@ -74,7 +72,6 @@ impl From<Protocol> for core_h::Protocol {
             Protocol::CodexAppServer => Self::CodexAppServer,
             Protocol::Acp => Self::Acp,
             Protocol::PiRpc => Self::PiRpc,
-            Protocol::OpencodeHttp => Self::OpencodeHttp,
         }
     }
 }
@@ -133,6 +130,9 @@ pub enum ProgramState {
     BlockedQuestion,
     BlockedAuth,
     Done,
+    /// The turn ended with a background subagent still running, whose report
+    /// will start another turn on its own.
+    Waiting,
     Error,
     Exited,
     Clear,
@@ -154,6 +154,7 @@ pub fn from_run_state(s: Option<&RunState>) -> (ProgramState, Option<u8>) {
             kind: BlockKind::Auth,
         }) => (ProgramState::BlockedAuth, None),
         Some(RunState::Done) => (ProgramState::Done, None),
+        Some(RunState::Waiting) => (ProgramState::Waiting, None),
         Some(RunState::Error) => (ProgramState::Error, None),
         Some(RunState::Exited) => (ProgramState::Exited, None),
     }
@@ -174,6 +175,7 @@ pub fn to_run_state(state: ProgramState, progress: Option<u8>) -> Option<RunStat
             kind: BlockKind::Auth,
         },
         ProgramState::Done => RunState::Done,
+        ProgramState::Waiting => RunState::Waiting,
         ProgramState::Error => RunState::Error,
         ProgramState::Exited => RunState::Exited,
         ProgramState::Clear => return None,
@@ -261,6 +263,9 @@ pub enum ItemKind {
     ToolCall,
     CommandExecution,
     FileChange,
+    /// A tool call that runs another agent; its conversation's items name
+    /// it as `parent`.
+    Subagent,
 }
 
 impl From<core_ev::ItemKind> for ItemKind {
@@ -272,6 +277,7 @@ impl From<core_ev::ItemKind> for ItemKind {
             core_ev::ItemKind::ToolCall => Self::ToolCall,
             core_ev::ItemKind::CommandExecution => Self::CommandExecution,
             core_ev::ItemKind::FileChange => Self::FileChange,
+            core_ev::ItemKind::Subagent => Self::Subagent,
         }
     }
 }
@@ -362,6 +368,8 @@ pub enum Event {
     ItemStarted {
         id: String,
         kind: ItemKind,
+        /// The subagent item this one ran inside, if any.
+        parent: Option<String>,
         /// Harness-specific details as JSON, if any.
         extensions_json: Option<String>,
     },
@@ -381,6 +389,12 @@ pub enum Event {
         request_id: String,
         title: String,
         options: Vec<PermissionOption>,
+        /// `Question`: any text is accepted as the option id.
+        kind: RequestKind,
+        /// The tool item the request is about, when the harness says.
+        item_id: Option<String>,
+        /// The tool input or request parameters as JSON, for previews.
+        input_json: Option<String>,
     },
     PermissionResolved {
         request_id: String,
@@ -407,6 +421,11 @@ pub enum Event {
         kind: String,
         payload_json: Option<String>,
     },
+    /// A dialog a TUI would show (MCP servers, status, rules), with the
+    /// actions it offers, as `acc_core::event::Panel` JSON.
+    Panel {
+        panel_json: String,
+    },
 }
 
 fn json(v: &Value) -> Option<String> {
@@ -427,9 +446,15 @@ impl From<core_ev::Event> for Event {
                 model,
             },
             E::StateChanged(s) => Self::StateChanged { state: (&s).into() },
-            E::ItemStarted { id, kind, extensions } => Self::ItemStarted {
+            E::ItemStarted {
+                id,
+                kind,
+                parent,
+                extensions,
+            } => Self::ItemStarted {
                 id,
                 kind: kind.into(),
+                parent,
                 extensions_json: json(&extensions),
             },
             E::ItemDelta { id, text } => Self::ItemDelta { id, text },
@@ -445,9 +470,15 @@ impl From<core_ev::Event> for Event {
                 request_id,
                 title,
                 options,
+                kind,
+                item_id,
+                input,
             } => Self::PermissionRequested {
                 request_id,
                 title,
+                kind: kind.into(),
+                item_id,
+                input_json: json(&input),
                 options: options
                     .into_iter()
                     .map(|o| PermissionOption {
@@ -468,6 +499,9 @@ impl From<core_ev::Event> for Event {
             E::Native { kind, payload } => Self::Native {
                 kind,
                 payload_json: json(&payload),
+            },
+            E::Panel(panel) => Self::Panel {
+                panel_json: serde_json::to_string(&panel).unwrap_or_default(),
             },
         }
     }
@@ -503,11 +537,39 @@ impl From<OptionId> for core_cmd::OptionId {
     }
 }
 
+/// An image sent with a prompt: `image/png`, `image/jpeg`, `image/gif` or
+/// `image/webp`, at most 5 MiB (10 MiB per prompt).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Attachment {
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+/// What a permission request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RequestKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl From<BlockKind> for RequestKind {
+    fn from(k: BlockKind) -> Self {
+        match k {
+            BlockKind::Permission => Self::Permission,
+            BlockKind::Question => Self::Question,
+            BlockKind::Auth => Self::Auth,
+        }
+    }
+}
+
 /// Commands ACC offers on every harness. Mirrors `acc_core::command::Command`.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum Command {
+    /// Text, plus images sent with it (see [`Attachment`]).
     Prompt {
         text: String,
+        attachments: Vec<Attachment>,
     },
     Interrupt,
     Compact {
@@ -541,7 +603,13 @@ pub enum Command {
 impl From<Command> for core_cmd::Command {
     fn from(c: Command) -> Self {
         match c {
-            Command::Prompt { text } => Self::Prompt { text },
+            Command::Prompt { text, attachments } => Self::Prompt {
+                text,
+                attachments: attachments
+                    .iter()
+                    .map(|a| core_cmd::Attachment::from_bytes(&a.media_type, &a.data))
+                    .collect(),
+            },
             Command::Interrupt => Self::Interrupt,
             Command::Compact { hint } => Self::Compact { hint },
             Command::New => Self::New,
@@ -567,9 +635,16 @@ impl From<Command> for core_cmd::Command {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum Exec {
     Text,
-    Rpc { method: String },
-    Endpoint { method: String, path: String },
+    Rpc {
+        method: String,
+    },
+    Endpoint {
+        method: String,
+        path: String,
+    },
     SkillItem,
+    /// Nothing on the wire runs it; open the harness's TUI (`tui_command`).
+    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -616,6 +691,7 @@ impl From<&core_cmd::CommandEntry> for CommandEntry {
                     path: path.clone(),
                 },
                 core_cmd::Exec::SkillItem => Exec::SkillItem,
+                core_cmd::Exec::Terminal => Exec::Terminal,
             },
         }
     }

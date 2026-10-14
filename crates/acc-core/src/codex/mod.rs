@@ -34,9 +34,14 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::command::{Apply, Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Apply, Attachment, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
+    offer_option, split_verb, validate_attachments,
+};
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemKind, PermissionOption, Quota, QuotaWindow, Usage};
+use crate::event::{
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+};
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -51,7 +56,7 @@ const OPT_OUT: [&str; 4] = [
 ];
 
 /// Launch and thread settings. Everything else changes at runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexConfig {
     /// Thread to resume instead of starting a new one.
     pub resume: Option<String>,
@@ -62,10 +67,14 @@ pub struct CodexConfig {
     pub approval_policy: Option<String>,
     /// Permission profile id such as `:workspace` (see `permissionProfile/list`).
     pub permissions: Option<String>,
+    /// Prefix for this client's request ids. With a tag, ids are strings
+    /// (`<tag>-<n>`) so clients sharing one detached session never mistake
+    /// each other's responses in the shared log. Without one, ids are numbers.
+    pub client_tag: Option<String>,
 }
 
 /// What a request ACC sent was for, so its response can be applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Req {
     Initialize,
     Thread,
@@ -75,18 +84,24 @@ enum Req {
     Modes,
     RateLimits,
     Skills,
+    /// Data for a panel ACC draws.
+    Panel(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
+    /// An action from a panel; the panel is fetched again afterwards.
+    PanelAction(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
+    /// `mcpServer/oauth/login`, which answers with a URL to open.
+    McpLogin,
     Other,
 }
 
 /// A request the server is waiting on ACC to answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ServerRequest {
     id: Value,
     method: String,
     params: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Skill {
     name: String,
     path: String,
@@ -94,7 +109,7 @@ struct Skill {
 }
 
 /// Option changes to send with the next `turn/start`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Overrides {
     model: Option<String>,
     effort: Option<String>,
@@ -103,12 +118,12 @@ struct Overrides {
 }
 
 /// Codex app-server driver. See the module docs.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CodexDriver {
     config: CodexConfig,
     framer: LineFramer,
     next_id: u64,
-    pending: HashMap<u64, Req>,
+    pending: HashMap<String, Req>,
     thread_id: Option<String>,
     turn_id: Option<String>,
     state: Option<RunState>,
@@ -122,6 +137,16 @@ pub struct CodexDriver {
     profiles: Vec<String>,
     overrides: Overrides,
     skills: Vec<Skill>,
+    /// Subagent threads: child thread id → the collab item that spawned it.
+    child_threads: HashMap<String, String>,
+    /// `spawnAgent` items that haven't named their thread yet, oldest first.
+    unclaimed_spawns: Vec<String>,
+    /// Each subagent thread's last agent message, its report to the parent.
+    #[serde(default)]
+    child_reports: HashMap<String, String>,
+    /// Prompts sent before `thread/start` or `thread/resume` answered,
+    /// flushed in order once the thread opens.
+    queued_prompts: Vec<(String, Vec<Attachment>)>,
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
     transmit: Vec<u8>,
@@ -153,6 +178,10 @@ impl CodexDriver {
             profiles: Vec::new(),
             overrides: Overrides::default(),
             skills: Vec::new(),
+            child_threads: HashMap::new(),
+            unclaimed_spawns: Vec::new(),
+            child_reports: HashMap::new(),
+            queued_prompts: Vec::new(),
             commands: Vec::new(),
             options: Vec::new(),
             transmit: Vec::new(),
@@ -169,12 +198,26 @@ impl CodexDriver {
 
     fn request(&mut self, method: &str, params: Value, kind: Req) -> Vec<u8> {
         self.next_id += 1;
-        self.pending.insert(self.next_id, kind);
+        let id = match &self.config.client_tag {
+            Some(tag) => Value::String(format!("{tag}-{}", self.next_id)),
+            None => json!(self.next_id),
+        };
+        self.pending.insert(request_key(&id), kind);
         if params.is_null() {
-            wire::line(&json!({"id": self.next_id, "method": method}))
+            wire::line(&json!({"id": id, "method": method}))
         } else {
-            wire::line(&json!({"id": self.next_id, "method": method, "params": params}))
+            wire::line(&json!({"id": id, "method": method, "params": params}))
         }
+    }
+
+    /// Read-only queries for the palette, options and quota.
+    fn queries(&mut self) -> Vec<u8> {
+        let mut out = self.request("model/list", json!({}), Req::ModelList);
+        out.extend(self.request("permissionProfile/list", json!({}), Req::Profiles));
+        out.extend(self.request("collaborationMode/list", json!({}), Req::Modes));
+        out.extend(self.request("account/rateLimits/read", Value::Null, Req::RateLimits));
+        out.extend(self.request("skills/list", self.skills_params(), Req::Skills));
+        out
     }
 
     fn thread(&self) -> Result<String, DriverError> {
@@ -224,11 +267,14 @@ impl CodexDriver {
     // ---- responses -------------------------------------------------------
 
     fn on_response(&mut self, id: &Value, v: &Value, out: &mut Vec<Event>) {
-        let kind = id
-            .as_u64()
-            .and_then(|n| self.pending.remove(&n))
-            .unwrap_or(Req::Other);
+        let key = request_key(id);
+        let ours = self.pending.contains_key(&key);
+        let kind = self.pending.remove(&key).unwrap_or(Req::Other);
         if let Some(err) = v.get("error") {
+            if !ours {
+                // Another client's failure, read from a shared log.
+                return;
+            }
             // Rate limits need a ChatGPT login; API-key users simply have none.
             if kind != Req::RateLimits {
                 let msg = str_at(err, "message").unwrap_or("request failed");
@@ -239,6 +285,12 @@ impl CodexDriver {
             return;
         }
         let result = v.get("result").cloned().unwrap_or(Value::Null);
+        // Another client's (or an earlier connection's) thread start, resume
+        // or fork, read from a shared log: adopt the thread it opened.
+        let kind = match kind {
+            Req::Other if !ours && result.pointer("/thread/id").is_some() => Req::Thread,
+            k => k,
+        };
         match kind {
             Req::Thread => self.on_thread(&result, out),
             Req::TurnStart => {
@@ -295,6 +347,18 @@ impl CodexDriver {
                 self.rebuild_commands();
                 out.push(Event::CommandsChanged);
             }
+            Req::Panel(id) => out.push(Event::Panel(self.panel(id, &result))),
+            Req::PanelAction(id) => {
+                let bytes = self.open_panel(id);
+                self.transmit.extend(bytes);
+            }
+            Req::McpLogin => {
+                if let Some(url) = owned(&result, "authorizationUrl") {
+                    out.push(Event::Notice {
+                        message: format!("Open to log in: {url}"),
+                    });
+                }
+            }
             Req::Initialize | Req::Other => {
                 if let Some(turn) = result.pointer("/turn/id").and_then(Value::as_str) {
                     // review/start runs as a turn too.
@@ -344,6 +408,11 @@ impl CodexDriver {
             RunState::Idle
         };
         self.set_state(state, None, out);
+        for (text, attachments) in std::mem::take(&mut self.queued_prompts) {
+            if let Ok(bytes) = self.try_prompt(text, attachments) {
+                self.transmit.extend(bytes);
+            }
+        }
     }
 
     // ---- notifications ---------------------------------------------------
@@ -355,7 +424,11 @@ impl CodexDriver {
             "thread/status/changed" if ours => {
                 let status = p.get("status").cloned().unwrap_or(Value::Null);
                 match str_at(&status, "type") {
-                    Some("idle") if !matches!(self.state, Some(RunState::Done | RunState::Error)) => {
+                    // Mid-turn, `turn/completed` reports how the turn ended.
+                    Some("idle")
+                        if self.turn_id.is_none()
+                            && !matches!(self.state, Some(RunState::Done | RunState::Error)) =>
+                    {
                         self.set_state(RunState::Idle, None, out);
                     }
                     Some("systemError") => self.set_state(RunState::Error, None, out),
@@ -384,7 +457,6 @@ impl CodexDriver {
             }
             "turn/completed" if ours => {
                 self.turn_id = None;
-                out.push(Event::TurnCompleted);
                 let turn = p.get("turn").cloned().unwrap_or(Value::Null);
                 match str_at(&turn, "status") {
                     Some("failed") => {
@@ -397,14 +469,20 @@ impl CodexDriver {
                     Some("interrupted") => self.set_state(RunState::Idle, Some("Interrupted".into()), out),
                     _ => self.set_state(RunState::Done, None, out),
                 }
+                out.push(Event::TurnCompleted);
             }
             "item/started" => {
-                if let Some(item) = p.get("item") {
+                if let Some(item) = p.get("item")
+                    && !self.subagent_finished(item, out)
+                {
                     let ext = self.item_ext(item, &p);
+                    self.adopt_children(item);
+                    let parent = self.parent_for(&p);
                     if let (Some(id), Some(kind)) = (owned(item, "id"), item_kind(item)) {
                         out.push(Event::ItemStarted {
                             id: id.clone(),
                             kind,
+                            parent,
                             extensions: ext,
                         });
                         // User messages and some others have no delta stream.
@@ -415,13 +493,27 @@ impl CodexDriver {
                 }
             }
             "item/completed" => {
+                if let Some(item) = p.get("item") {
+                    self.adopt_children(item);
+                    self.keep_report(item, &p);
+                }
                 if let Some(item) = p.get("item")
                     && let (Some(id), Some(_)) = (owned(item, "id"), item_kind(item))
                 {
-                    out.push(Event::ItemCompleted {
-                        id,
-                        extensions: item.clone(),
-                    });
+                    if is_activity(item, "completed") {
+                        // Finished by `subagent_finished` when it started.
+                    } else if is_activity(item, "started") {
+                        // The spawn call returned; the subagent runs on.
+                        out.push(Event::ItemUpdated {
+                            id,
+                            extensions: item.clone(),
+                        });
+                    } else {
+                        out.push(Event::ItemCompleted {
+                            id,
+                            extensions: item.clone(),
+                        });
+                    }
                 }
             }
             "item/agentMessage/delta"
@@ -472,6 +564,36 @@ impl CodexDriver {
                     out.push(Event::PermissionResolved { request_id: id });
                 }
             }
+            // A subagent's thread: its items carry its own thread id.
+            "thread/started"
+                if p.pointer("/thread/id").and_then(Value::as_str) != self.thread_id.as_deref() =>
+            {
+                let thread = p.get("thread").cloned().unwrap_or(Value::Null);
+                let spawn = thread
+                    .pointer("/source/subAgent/thread_spawn")
+                    .or_else(|| thread.pointer("/source/subagent/thread_spawn"));
+                if let (Some(child), Some(spawn)) = (owned(&thread, "id"), spawn)
+                    && str_at(spawn, "parent_thread_id").is_some_and(|t| {
+                        Some(t) == self.thread_id.as_deref() || self.child_threads.contains_key(t)
+                    })
+                {
+                    // The spawn item may not name its thread until it completes.
+                    if !self.child_threads.contains_key(&child) && !self.unclaimed_spawns.is_empty() {
+                        let item = self.unclaimed_spawns.remove(0);
+                        self.child_threads.insert(child.clone(), item);
+                    }
+                    out.push(Event::Native {
+                        kind: "subagent_thread".into(),
+                        payload: json!({
+                            "threadId": child,
+                            "parentThreadId": spawn.get("parent_thread_id"),
+                            "nickname": spawn.get("agent_nickname"),
+                            "role": spawn.get("agent_role"),
+                            "parentItemId": self.child_threads.get(&child),
+                        }),
+                    });
+                }
+            }
             "model/rerouted" if ours => {
                 if let Some(to) = owned(&p, "toModel") {
                     self.model = Some(to);
@@ -482,6 +604,16 @@ impl CodexDriver {
             "skills/changed" => {
                 let req = self.request("skills/list", self.skills_params(), Req::Skills);
                 self.transmit.extend(req);
+            }
+            // The turn's aggregated unified diff, for clients that show one
+            // per turn rather than per file-change item.
+            "turn/diff/updated" if ours => {
+                if let Some(diff) = owned(&p, "diff") {
+                    out.push(Event::Native {
+                        kind: "turn_diff".into(),
+                        payload: json!({"turnId": p.get("turnId"), "diff": diff}),
+                    });
+                }
             }
             "thread/compacted" if ours => out.push(Event::Notice {
                 message: "Conversation compacted".into(),
@@ -536,6 +668,80 @@ impl CodexDriver {
         }
     }
 
+    /// Remembers which item spawned which thread, so the child thread's
+    /// items can name it as their parent.
+    fn adopt_children(&mut self, item: &Value) {
+        // 0.162: a `subAgentActivity` names its thread from the start.
+        if is_activity(item, "started")
+            && let (Some(id), Some(child)) = (owned(item, "id"), owned(item, "agentThreadId"))
+        {
+            self.child_threads.entry(child).or_insert(id);
+            return;
+        }
+        if str_at(item, "type") != Some("collabAgentToolCall") || str_at(item, "tool") != Some("spawnAgent") {
+            return;
+        }
+        let Some(id) = owned(item, "id") else { return };
+        let mut named = false;
+        for child in list(item, "receiverThreadIds").filter_map(Value::as_str) {
+            named = true;
+            self.child_threads
+                .entry(child.to_owned())
+                .or_insert_with(|| id.clone());
+        }
+        let claimed = self.child_threads.values().any(|v| *v == id);
+        if named || claimed {
+            self.unclaimed_spawns.retain(|s| *s != id);
+        } else if !self.unclaimed_spawns.contains(&id) {
+            self.unclaimed_spawns.push(id);
+        }
+    }
+
+    /// A subagent thread's agent message, kept as its report.
+    fn keep_report(&mut self, item: &Value, params: &Value) {
+        if str_at(item, "type") == Some("agentMessage")
+            && let Some(thread) = str_at(params, "threadId")
+            && self.child_threads.contains_key(thread)
+            && let Some(text) = owned(item, "text").filter(|t| !t.is_empty())
+        {
+            self.child_reports.insert(thread.to_owned(), text);
+        }
+    }
+
+    /// A `subAgentActivity` other than `started` (0.162): the subagent its
+    /// thread belongs to stopped. Completes the spawning item with the
+    /// child's report instead of showing it as an item of its own.
+    fn subagent_finished(&mut self, item: &Value, out: &mut Vec<Event>) -> bool {
+        if str_at(item, "type") != Some("subAgentActivity") || is_activity(item, "started") {
+            return false;
+        }
+        let child = str_at(item, "agentThreadId");
+        if let Some(spawn) = child.and_then(|c| self.child_threads.get(c)).cloned() {
+            let status = match str_at(item, "kind") {
+                Some("completed") => "completed",
+                Some(other) => other,
+                None => "completed",
+            };
+            out.push(Event::ItemCompleted {
+                id: spawn,
+                extensions: json!({
+                    "childStatus": status,
+                    "report": child.and_then(|c| self.child_reports.get(c)),
+                }),
+            });
+        }
+        true
+    }
+
+    /// The collab item whose thread an item belongs to, for subagent items.
+    fn parent_for(&self, params: &Value) -> Option<String> {
+        let thread = str_at(params, "threadId")?;
+        if Some(thread) == self.thread_id.as_deref() {
+            return None;
+        }
+        self.child_threads.get(thread).cloned()
+    }
+
     fn item_ext(&self, item: &Value, params: &Value) -> Value {
         let mut ext = item.clone();
         if let Some(thread) = str_at(params, "threadId")
@@ -555,6 +761,7 @@ impl CodexDriver {
         out.push(Event::ItemStarted {
             id: id.clone(),
             kind,
+            parent: None,
             extensions: Value::Null,
         });
         if let Some(text) = initial_text(item).or_else(|| final_text(item)) {
@@ -648,12 +855,17 @@ impl CodexDriver {
             }
         };
         let key = request_key(&id);
+        let item_id = owned(&params, "itemId");
+        let input = params.clone();
         self.requests
             .insert(key.clone(), ServerRequest { id, method, params });
         out.push(Event::PermissionRequested {
             request_id: key,
             title,
             options,
+            kind,
+            item_id,
+            input,
         });
         self.set_state(RunState::Blocked { kind }, None, out);
     }
@@ -682,13 +894,10 @@ impl CodexDriver {
             },
             "item/tool/requestUserInput" => {
                 let mut answers = Map::new();
+                let chosen = crate::question::decode(option_id);
                 for (i, q) in list(&req.params, "questions").enumerate() {
                     if let Some(qid) = owned(q, "id") {
-                        let chosen = if i == 0 {
-                            vec![option_id.to_owned()]
-                        } else {
-                            Vec::new()
-                        };
+                        let chosen = chosen.get(i).cloned().unwrap_or_default();
                         answers.insert(qid, json!({"answers": chosen}));
                     }
                 }
@@ -716,15 +925,7 @@ impl CodexDriver {
     }
 
     fn rebuild_commands(&mut self) {
-        let rpc = |name: &str, desc: &str, hint: Option<&str>, method: &str| CommandEntry {
-            name: name.into(),
-            description: desc.into(),
-            arg_hint: hint.map(str::to_owned),
-            source: CommandSource::Acc,
-            exec: Exec::Rpc {
-                method: method.into(),
-            },
-        };
+        let rpc = CommandEntry::rpc;
         let mut c = vec![
             rpc(
                 "compact",
@@ -748,15 +949,171 @@ impl CodexDriver {
                 "thread/shellCommand",
             ),
             rpc("interrupt", "Stop the current turn", None, "turn/interrupt"),
+            rpc(
+                "mcp",
+                "MCP servers: status, reload, log in",
+                None,
+                "mcpServerStatus/list",
+            ),
+            rpc("status", "Account, model and permissions", None, "account/read"),
+            rpc(
+                "experimental",
+                "Turn experimental features on or off",
+                None,
+                "experimentalFeature/list",
+            ),
         ];
+        // Option changes ride on the next `turn/start`.
+        for (id, name, description) in [
+            (OptionId::Model, "model", "Choose the model"),
+            (OptionId::Effort, "effort", "Choose reasoning effort"),
+            (OptionId::Mode, "mode", "Collaboration mode, such as plan"),
+            (
+                OptionId::Permission,
+                "permissions",
+                "Choose what Codex may do without asking",
+            ),
+        ] {
+            offer_option(
+                &mut c,
+                &self.options,
+                id,
+                rpc(name, description, Some("<value>"), "turn/start"),
+            );
+        }
         c.extend(self.skills.iter().map(|s| CommandEntry {
             name: s.name.clone(),
             description: s.description.clone(),
             arg_hint: None,
             source: CommandSource::Skill,
             exec: Exec::SkillItem,
+            input: CommandInput::None,
         }));
         self.commands = c;
+    }
+
+    /// Runs one of the panel entries (`mcp`, `status`, `experimental`).
+    fn panel_command(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let (verb, target) = split_verb(args);
+        Ok(match (name, verb) {
+            ("mcp", "") => self.open_panel("mcp"),
+            ("mcp", "reload") => {
+                self.request("config/mcpServer/reload", Value::Null, Req::PanelAction("mcp"))
+            }
+            ("mcp", "login") if !target.is_empty() => {
+                self.request("mcpServer/oauth/login", json!({"name": target}), Req::McpLogin)
+            }
+            ("experimental", "") => self.open_panel("experimental"),
+            ("experimental", "enable" | "disable") if !target.is_empty() => self.request(
+                "experimentalFeature/enablement/set",
+                json!({"enablement": {target: verb == "enable"}}),
+                Req::PanelAction("experimental"),
+            ),
+            ("status", _) => self.open_panel("status"),
+            (_, "login" | "enable" | "disable") => return Err(DriverError::MissingArgument("a name")),
+            (_, v) => return Err(DriverError::InvalidOption(v.to_owned())),
+        })
+    }
+
+    fn open_panel(&mut self, id: &'static str) -> Vec<u8> {
+        match id {
+            "mcp" => self.request(
+                "mcpServerStatus/list",
+                json!({"detail": "toolsAndAuthOnly"}),
+                Req::Panel(id),
+            ),
+            "experimental" => self.request("experimentalFeature/list", json!({}), Req::Panel(id)),
+            "status" => self.request("account/read", json!({"refreshToken": false}), Req::Panel(id)),
+            _ => Vec::new(),
+        }
+    }
+
+    fn panel(&self, id: &str, result: &Value) -> Panel {
+        let mut rows = Vec::new();
+        let mut actions = Vec::new();
+        let title = match id {
+            "mcp" => {
+                for s in list(result, "data") {
+                    let Some(name) = owned(s, "name") else { continue };
+                    let tools = s.get("tools").and_then(Value::as_object).map_or(0, Map::len);
+                    let auth = str_at(s, "authStatus").unwrap_or_default();
+                    let mut row_actions = Vec::new();
+                    if auth == "notLoggedIn" {
+                        row_actions.push(PanelAction::new("Log in", "mcp", format!("login {name}")));
+                    }
+                    rows.push(PanelRow {
+                        label: name,
+                        value: Some(format!("{tools} tools")),
+                        detail: Some(auth_label(auth).to_owned()).filter(|a| !a.is_empty()),
+                        actions: row_actions,
+                    });
+                }
+                actions.push(PanelAction::new("Reload", "mcp", "reload"));
+                "MCP servers"
+            }
+            "experimental" => {
+                for f in list(result, "data").filter(|f| str_at(f, "stage") == Some("beta")) {
+                    let Some(name) = owned(f, "name") else { continue };
+                    let on = f.get("enabled").and_then(Value::as_bool) == Some(true);
+                    let verb = if on { "disable" } else { "enable" };
+                    rows.push(PanelRow {
+                        label: owned(f, "displayName").unwrap_or_else(|| name.clone()),
+                        value: Some(if on { "on" } else { "off" }.into()),
+                        detail: owned(f, "description"),
+                        actions: vec![PanelAction::new(
+                            if on { "Turn off" } else { "Turn on" },
+                            "experimental",
+                            format!("{verb} {name}"),
+                        )],
+                    });
+                }
+                "Experimental features"
+            }
+            "status" => {
+                let account = result.get("account").filter(|a| !a.is_null());
+                let login = match account.and_then(|a| str_at(a, "type")) {
+                    Some("chatgpt") => account
+                        .and_then(|a| owned(a, "email"))
+                        .map(|e| format!("ChatGPT ({e})")),
+                    Some("apiKey") => Some("API key".into()),
+                    Some(other) => Some(other.to_owned()),
+                    None => Some("not logged in".into()),
+                };
+                let plan = account.and_then(|a| owned(a, "planType"));
+                let mut push = |label: &str, value: Option<String>| {
+                    if value.is_some() {
+                        rows.push(PanelRow {
+                            label: label.into(),
+                            value,
+                            ..PanelRow::default()
+                        });
+                    }
+                };
+                push("Account", login);
+                push("Plan", plan);
+                push("Thread", self.thread_id.clone());
+                for o in &self.options {
+                    let label = match o.id {
+                        OptionId::Model => "Model",
+                        OptionId::Effort => "Reasoning effort",
+                        OptionId::Mode => "Mode",
+                        OptionId::Permission => "Permissions",
+                    };
+                    push(label, o.current.clone());
+                }
+                "Status"
+            }
+            _ => "",
+        };
+        Panel {
+            id: id.to_owned(),
+            title: title.into(),
+            sections: vec![PanelSection {
+                title: None,
+                rows,
+                actions,
+            }],
+        }
     }
 
     fn current_model(&self) -> Option<&str> {
@@ -770,6 +1127,11 @@ impl CodexDriver {
     }
 
     fn rebuild_options(&mut self) {
+        self.rebuild_option_defs();
+        self.rebuild_commands();
+    }
+
+    fn rebuild_option_defs(&mut self) {
         let model = self.current_model().map(str::to_owned);
         let info = model.as_deref().and_then(|m| self.model_info(m));
         let efforts: Vec<String> = info
@@ -843,6 +1205,18 @@ impl CodexDriver {
         }
     }
 
+    /// Builds a turn's input blocks and sends it, for a prompt whose thread
+    /// is ready (either immediately, or flushed from
+    /// [`Self::queued_prompts`]).
+    fn try_prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<Vec<u8>, DriverError> {
+        let mut input = Vec::new();
+        if !text.is_empty() || attachments.is_empty() {
+            input.push(text_input(&text));
+        }
+        input.extend(attachments.iter().map(image_input));
+        self.turn(input)
+    }
+
     /// `turn/start`, or `turn/steer` while a turn is running.
     fn turn(&mut self, input: Vec<Value>) -> Result<Vec<u8>, DriverError> {
         let thread = self.thread()?;
@@ -888,6 +1262,10 @@ impl Driver for CodexDriver {
         Harness::Codex
     }
 
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+
     /// Resume happens in-protocol: set [`CodexConfig::resume`] instead.
     fn launch(&self, resume: Option<&str>) -> LaunchSpec {
         Harness::Codex.launch(resume)
@@ -916,16 +1294,18 @@ impl Driver for CodexDriver {
             None => self.request("thread/start", self.thread_params(), Req::Thread),
         };
         out.extend(thread);
-        out.extend(self.request("model/list", json!({}), Req::ModelList));
-        out.extend(self.request("permissionProfile/list", json!({}), Req::Profiles));
-        out.extend(self.request("collaborationMode/list", json!({}), Req::Modes));
-        out.extend(self.request("account/rateLimits/read", Value::Null, Req::RateLimits));
-        out.extend(self.request("skills/list", self.skills_params(), Req::Skills));
+        out.extend(self.queries());
         out
+    }
+
+    /// The thread comes from the log; only the side queries are repeated.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        self.queries()
     }
 
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
         let mut out = Vec::new();
+        let palette = self.commands.len();
         for frame in self.framer.feed(bytes) {
             match frame {
                 Frame::Line(line) => match serde_json::from_str::<Value>(&line) {
@@ -940,6 +1320,10 @@ impl Driver for CodexDriver {
                 }),
             }
         }
+        // Option pickers join the palette once Codex reports the option.
+        if self.commands.len() != palette && !out.contains(&Event::CommandsChanged) {
+            out.push(Event::CommandsChanged);
+        }
         out
     }
 
@@ -949,7 +1333,17 @@ impl Driver for CodexDriver {
             what,
         };
         match cmd {
-            Command::Prompt { text } => self.turn(vec![text_input(&text)]),
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                // `thread/start` or `thread/resume` hasn't answered yet: hold
+                // the prompt instead of `turn()` dropping it with
+                // `DriverError::NotStarted`, and send it once the thread opens.
+                if self.thread_id.is_none() {
+                    self.queued_prompts.push((text, attachments));
+                    return Ok(Vec::new());
+                }
+                self.try_prompt(text, attachments)
+            }
             Command::Interrupt => match (self.thread_id.clone(), self.turn_id.clone()) {
                 (Some(thread), Some(turn)) => Ok(self.request(
                     "turn/interrupt",
@@ -1012,7 +1406,19 @@ impl Driver for CodexDriver {
             } => self.answer(&request_id, &option_id),
             Command::Invoke { name, args } => {
                 let args = args.trim().to_owned();
+                let set = |id| Command::SetOption {
+                    id,
+                    value: args.clone(),
+                };
                 match name.trim_start_matches('/') {
+                    "model" | "effort" | "mode" | "permissions" if args.is_empty() => {
+                        Err(DriverError::MissingArgument("a value"))
+                    }
+                    "model" => self.command(set(OptionId::Model)),
+                    "effort" => self.command(set(OptionId::Effort)),
+                    "mode" => self.command(set(OptionId::Mode)),
+                    "permissions" => self.command(set(OptionId::Permission)),
+                    n @ ("mcp" | "status" | "experimental") => self.panel_command(n, &args),
                     "compact" => self.command(Command::Compact { hint: None }),
                     "new" => self.command(Command::New),
                     "fork" => self.command(Command::Fork),
@@ -1075,11 +1481,27 @@ fn text_input(text: &str) -> Value {
     json!({"type": "text", "text": text, "text_elements": []})
 }
 
+/// An image input item as 0.128 takes it: a data URL. (Upstream `main`
+/// renames `url` to `image_url`; `localImage` with a host path is the other
+/// option, but ACC's images live on the client.)
+fn image_input(a: &Attachment) -> Value {
+    json!({"type": "image", "url": a.data_url()})
+}
+
 fn list<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
     v.get(key).and_then(Value::as_array).into_iter().flatten()
 }
 
 /// JSON-RPC ids may be numbers or strings; ACC exposes them as strings.
+fn auth_label(status: &str) -> &'static str {
+    match status {
+        "notLoggedIn" => "needs login",
+        "oAuth" => "logged in",
+        "bearerToken" => "token",
+        _ => "",
+    }
+}
+
 fn request_key(id: &Value) -> String {
     match id {
         Value::String(s) => s.clone(),
@@ -1110,9 +1532,15 @@ fn item_kind(item: &Value) -> Option<ItemKind> {
         "reasoning" => ItemKind::Reasoning,
         "commandExecution" => ItemKind::CommandExecution,
         "fileChange" => ItemKind::FileChange,
+        "collabAgentToolCall" | "subAgentActivity" => ItemKind::Subagent,
         "hookPrompt" | "functionCallOutput" => return None,
         _ => ItemKind::ToolCall,
     })
+}
+
+/// A 0.162 `subAgentActivity` item of this `kind` (`started`, `completed`).
+fn is_activity(item: &Value, kind: &str) -> bool {
+    str_at(item, "type") == Some("subAgentActivity") && str_at(item, "kind") == Some(kind)
 }
 
 /// Text an item carries when it starts (user input has no delta stream).
@@ -1120,7 +1548,12 @@ fn initial_text(item: &Value) -> Option<String> {
     match str_at(item, "type")? {
         "userMessage" => {
             let text: Vec<&str> = list(item, "content").filter_map(|c| str_at(c, "text")).collect();
-            (!text.is_empty()).then(|| text.join("\n"))
+            if text.is_empty() {
+                let images =
+                    list(item, "content").any(|c| matches!(str_at(c, "type"), Some("image" | "localImage")));
+                return images.then(|| "[image]".to_owned());
+            }
+            Some(text.join("\n"))
         }
         "commandExecution" => owned(item, "command").map(|c| format!("$ {c}\n")),
         _ => None,

@@ -20,9 +20,12 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::command::{Apply, Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Apply, Attachment, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
+    split_verb, validate_attachments,
+};
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemKind, PermissionOption, Usage};
+use crate::event::{Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Usage};
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -35,15 +38,19 @@ const MAX_LINE: usize = 64 * 1024 * 1024;
 pub const CANCEL: &str = "cancel";
 
 /// What an RPC request ACC sent was for, keyed by its `id`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Pending {
     SetThinking(String),
+    /// Data for a panel ACC draws; the response is also handled as usual.
+    Panel(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
+    /// A change made from a panel; the panel is fetched again afterwards.
+    PanelAction(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
     /// Any other request; its response is handled by `command`.
     Plain,
 }
 
 /// An open extension dialog.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Dialog {
     Select(Vec<String>),
     Confirm,
@@ -52,7 +59,7 @@ enum Dialog {
 }
 
 /// Drives `pi --mode rpc`.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct PiDriver {
     framer: LineFramer,
     id_prefix: String,
@@ -69,6 +76,10 @@ pub struct PiDriver {
     msg_seq: u64,
     current_msg: Option<String>,
     shell_items: HashMap<String, bool>,
+    /// pi-subagents runs launched with `async: true` and not yet reported
+    /// back, by run id, with the `subagent` call that launched them. Each
+    /// one's `subagent-notify` wakes the agent for another turn.
+    background: HashMap<String, String>,
     usage: Usage,
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
@@ -97,6 +108,7 @@ impl PiDriver {
             msg_seq: 0,
             current_msg: None,
             shell_items: HashMap::new(),
+            background: HashMap::new(),
             usage: Usage::default(),
             commands: canonical_commands(),
             options: vec![
@@ -192,6 +204,7 @@ impl PiDriver {
                 let state = match (aborted, self.last_error.take()) {
                     (true, _) => self.state(RunState::Idle, None),
                     (false, Some(err)) => self.state(RunState::Error, Some(err)),
+                    (false, None) if !self.background.is_empty() => self.state(RunState::Waiting, None),
                     (false, None) => self.state(RunState::Done, None),
                 };
                 out.push(state);
@@ -208,20 +221,26 @@ impl PiDriver {
                 out.push(Event::ItemStarted {
                     id,
                     kind: tool_kind(&tool),
-                    extensions: json!({ "tool": tool, "args": v.get("args").cloned().unwrap_or(Value::Null) }),
+                    parent: None, extensions: json!({ "tool": tool, "args": v.get("args").cloned().unwrap_or(Value::Null) }),
                 });
             }
             "tool_execution_update" => self.resume_working(out),
             "tool_execution_end" => {
                 self.resume_working(out);
-                out.push(Event::ItemCompleted {
-                    id: str_field(&v, "toolCallId"),
-                    extensions: json!({
-                        "result": v.get("result").cloned().unwrap_or(Value::Null),
-                        "is_error": v.get("isError").and_then(Value::as_bool).unwrap_or(false),
-                        "duration_ms": v.get("durationMs").cloned().unwrap_or(Value::Null),
-                    }),
+                let id = str_field(&v, "toolCallId");
+                let is_error = v.get("isError").and_then(Value::as_bool).unwrap_or(false);
+                let extensions = json!({
+                    "result": v.get("result").cloned().unwrap_or(Value::Null),
+                    "is_error": is_error,
+                    "duration_ms": v.get("durationMs").cloned().unwrap_or(Value::Null),
                 });
+                let details = v.pointer("/result/details");
+                if let Some(run) = async_run(&str_field(&v, "toolName"), details, is_error) {
+                    self.background.insert(run.to_owned(), id.clone());
+                    out.push(Event::ItemUpdated { id, extensions });
+                } else {
+                    out.push(Event::ItemCompleted { id, extensions });
+                }
             }
             "bash_execution_update" => {
                 let id = format!("bash-{}", str_field(&v, "id"));
@@ -229,6 +248,7 @@ impl PiDriver {
                     out.push(Event::ItemStarted {
                         id: id.clone(),
                         kind: ItemKind::CommandExecution,
+                        parent: None,
                         extensions: Value::Null,
                     });
                 }
@@ -307,6 +327,21 @@ impl PiDriver {
             return;
         }
         let data = v.get("data").cloned().unwrap_or(Value::Null);
+        match &pending {
+            Some(Pending::Panel(panel_id)) => out.push(Event::Panel(panel(panel_id, &data))),
+            Some(Pending::PanelAction(panel_id)) => {
+                let req = self.open_panel(panel_id);
+                self.outgoing.extend(req);
+            }
+            _ => {}
+        }
+        if command == "export_html"
+            && let Some(path) = data.get("path").and_then(Value::as_str)
+        {
+            out.push(Event::Notice {
+                message: format!("Exported to {path}"),
+            });
+        }
         let changed = match command.as_str() {
             "get_commands" => Some(Event::CommandsChanged),
             "get_state"
@@ -391,6 +426,7 @@ impl PiDriver {
                     out.push(Event::ItemStarted {
                         id: item.clone(),
                         kind: ItemKind::CommandExecution,
+                        parent: None,
                         extensions: Value::Null,
                     });
                 }
@@ -464,6 +500,7 @@ impl PiDriver {
                 arg_hint: None,
                 source,
                 exec: Exec::Text,
+                input: CommandInput::None,
             });
         }
         self.commands = entries;
@@ -478,9 +515,10 @@ impl PiDriver {
                 out.push(Event::ItemStarted {
                     id: id.clone(),
                     kind: ItemKind::UserMessage,
+                    parent: None,
                     extensions: Value::Null,
                 });
-                let text = content_text(msg.get("content"));
+                let text = user_text(msg.get("content"));
                 if !text.is_empty() {
                     out.push(Event::ItemDelta { id, text });
                 }
@@ -495,6 +533,7 @@ impl PiDriver {
                 out.push(Event::ItemStarted {
                     id,
                     kind: ItemKind::AgentMessage,
+                    parent: None,
                     extensions: Value::Null,
                 });
             }
@@ -519,6 +558,7 @@ impl PiDriver {
             Some("thinking_start") => out.push(Event::ItemStarted {
                 id: reasoning,
                 kind: ItemKind::Reasoning,
+                parent: None,
                 extensions: Value::Null,
             }),
             Some("thinking_delta") => out.push(Event::ItemDelta {
@@ -536,6 +576,7 @@ impl PiDriver {
     fn on_message_end(&mut self, v: &Value, out: &mut Vec<Event>) {
         let Some(msg) = v.get("message") else { return };
         match msg.get("role").and_then(Value::as_str) {
+            Some("custom") => subagent_notify(&mut self.background, msg, out),
             Some("user") => out.push(Event::ItemCompleted {
                 id: format!("u{}", self.msg_seq),
                 extensions: Value::Null,
@@ -626,6 +667,9 @@ impl PiDriver {
             request_id: id,
             title,
             options,
+            kind,
+            item_id: None,
+            input: v.clone(),
         });
     }
 
@@ -661,11 +705,21 @@ impl PiDriver {
         Ok(line)
     }
 
-    fn prompt(&mut self, text: String) -> Vec<u8> {
-        if let Some(bytes) = self.builtin(&text) {
+    fn prompt(&mut self, text: String, attachments: &[Attachment]) -> Vec<u8> {
+        // A slash command with an image attached is a prompt for the model.
+        if attachments.is_empty()
+            && let Some(bytes) = self.builtin(&text)
+        {
             return bytes;
         }
         let mut body = obj(json!({ "type": "prompt", "message": text }));
+        if !attachments.is_empty() {
+            let images: Vec<Value> = attachments
+                .iter()
+                .map(|a| json!({ "type": "image", "data": a.data, "mimeType": a.media_type }))
+                .collect();
+            body.insert("images".into(), Value::Array(images));
+        }
         if self.streaming {
             // Like pressing Enter in pi's TUI while it works.
             body.insert("streamingBehavior".into(), Value::String("steer".into()));
@@ -695,6 +749,54 @@ impl PiDriver {
             _ => return None,
         };
         Some(bytes)
+    }
+
+    /// Runs a palette entry. Built-in names go through `builtin` or a
+    /// panel; pi expands the rest.
+    fn invoke(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let (verb, rest) = split_verb(args);
+        Ok(match (name, args) {
+            // pi would send these to the model as text.
+            ("model" | "thinking" | "name", "") => return Err(DriverError::MissingArgument("a value")),
+            ("session", "") => self.open_panel("session"),
+            ("settings", "") => self.open_panel("settings"),
+            ("settings", _) => {
+                let body = match (verb, rest) {
+                    ("auto-compaction", v @ ("on" | "off")) => {
+                        json!({ "type": "set_auto_compaction", "enabled": v == "on" })
+                    }
+                    ("steering", mode) if !mode.is_empty() => {
+                        json!({ "type": "set_steering_mode", "mode": mode })
+                    }
+                    ("follow-up", mode) if !mode.is_empty() => {
+                        json!({ "type": "set_follow_up_mode", "mode": mode })
+                    }
+                    _ => return Err(DriverError::InvalidOption(args.to_owned())),
+                };
+                self.request(obj(body), Pending::PanelAction("settings"))
+            }
+            ("fork", "") => self.open_panel("fork"),
+            ("fork", entry) => self.request(obj(json!({ "type": "fork", "entryId": entry })), Pending::Plain),
+            ("export", path) => {
+                let mut body = obj(json!({ "type": "export_html" }));
+                if !path.is_empty() {
+                    body.insert("outputPath".into(), Value::String(path.to_owned()));
+                }
+                self.request(body, Pending::Plain)
+            }
+            (name, "") => self.prompt(format!("/{name}"), &[]),
+            (name, args) => self.prompt(format!("/{name} {args}"), &[]),
+        })
+    }
+
+    fn open_panel(&mut self, id: &'static str) -> Vec<u8> {
+        let kind = match id {
+            "session" => "get_session_stats",
+            "settings" => "get_state",
+            "fork" => "get_fork_messages",
+            _ => return Vec::new(),
+        };
+        self.request(obj(json!({ "type": kind })), Pending::Panel(id))
     }
 
     fn compact(&mut self, hint: Option<&str>) -> Vec<u8> {
@@ -729,6 +831,10 @@ impl Driver for PiDriver {
         Harness::Pi
     }
 
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+
     fn launch(&self, resume: Option<&str>) -> LaunchSpec {
         Harness::Pi.launch(resume)
     }
@@ -746,6 +852,11 @@ impl Driver for PiDriver {
             out.extend(req);
         }
         out
+    }
+
+    /// pi's handshake is read-only queries, so a joining client repeats it.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        self.handshake()
     }
 
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
@@ -769,7 +880,10 @@ impl Driver for PiDriver {
 
     fn command(&mut self, cmd: Command) -> Result<Vec<u8>, DriverError> {
         Ok(match cmd {
-            Command::Prompt { text } => self.prompt(text),
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                self.prompt(text, &attachments)
+            }
             Command::Interrupt => self.simple("abort"),
             Command::Compact { hint } => self.compact(hint.as_deref()),
             Command::New => self.simple("new_session"),
@@ -803,15 +917,7 @@ impl Driver for PiDriver {
                 request_id,
                 option_id,
             } => self.answer(&request_id, &option_id)?,
-            // Built-in names go through `builtin`; pi expands the rest.
-            Command::Invoke { name, args } => {
-                let name = name.trim_start_matches('/');
-                self.prompt(if args.is_empty() {
-                    format!("/{name}")
-                } else {
-                    format!("/{name} {args}")
-                })
-            }
+            Command::Invoke { name, args } => self.invoke(name.trim_start_matches('/'), args.trim())?,
             Command::Refresh => self.handshake(),
         })
     }
@@ -832,14 +938,10 @@ impl Driver for PiDriver {
 /// Built-in pi commands ACC runs through RPC.
 fn canonical_commands() -> Vec<CommandEntry> {
     let e = |name: &str, description: &str, arg: Option<&str>, method: &str| CommandEntry {
-        name: name.into(),
-        description: description.into(),
-        arg_hint: arg.map(str::to_owned),
         source: CommandSource::Builtin,
-        exec: Exec::Rpc {
-            method: method.into(),
-        },
+        ..CommandEntry::rpc(name, description, arg, method)
     };
+    let option = |id| CommandInput::Option { id };
     vec![
         e(
             "compact",
@@ -849,16 +951,155 @@ fn canonical_commands() -> Vec<CommandEntry> {
         ),
         e("new", "Start a new session", None, "new_session"),
         e("clone", "Copy this session into a new one", None, "clone"),
+        e(
+            "fork",
+            "Continue from an earlier message in a new session",
+            None,
+            "fork",
+        ),
         e("name", "Name this session", Some("<name>"), "set_session_name"),
-        e("model", "Switch model", Some("<provider/model>"), "set_model"),
+        e("model", "Switch model", Some("<provider/model>"), "set_model").with_input(option(OptionId::Model)),
         e(
             "thinking",
             "Set thinking level",
             Some("<level>"),
             "set_thinking_level",
+        )
+        .with_input(option(OptionId::Effort)),
+        e(
+            "session",
+            "Session info, tokens and cost",
+            None,
+            "get_session_stats",
         ),
-        e("session", "Show token and cost totals", None, "get_session_stats"),
+        e(
+            "settings",
+            "Auto-compaction and message queueing",
+            None,
+            "get_state",
+        ),
+        e(
+            "export",
+            "Export the session to HTML",
+            Some("[path]"),
+            "export_html",
+        ),
     ]
+}
+
+/// Draws an RPC response as panel `id`.
+fn panel(id: &str, data: &Value) -> Panel {
+    let row = |label: &str, value: Option<String>| PanelRow {
+        label: label.into(),
+        value,
+        ..PanelRow::default()
+    };
+    let num = |ptr: &str| data.pointer(ptr).and_then(Value::as_u64).map(|n| n.to_string());
+    let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
+    let (title, rows) = match id {
+        "session" => (
+            "Session",
+            vec![
+                row("Session", text("sessionId")),
+                row("File", text("sessionFile")),
+                row("User messages", num("/userMessages")),
+                row("Assistant messages", num("/assistantMessages")),
+                row("Tool calls", num("/toolCalls")),
+                row("Input tokens", num("/tokens/input")),
+                row("Output tokens", num("/tokens/output")),
+                row("Cache read", num("/tokens/cacheRead")),
+                row("Cache write", num("/tokens/cacheWrite")),
+                row(
+                    "Cost",
+                    data.get("cost")
+                        .and_then(Value::as_f64)
+                        .map(|c| format!("${c:.4}")),
+                ),
+                row(
+                    "Context",
+                    num("/contextUsage/tokens")
+                        .map(|t| format!("{t} / {}", num("/contextUsage/contextWindow").unwrap_or_default())),
+                ),
+            ],
+        ),
+        "settings" => {
+            let auto = data.get("autoCompactionEnabled").and_then(Value::as_bool);
+            let modes = |key: &str, verb: &str| {
+                let current = text(key);
+                PanelRow {
+                    actions: ["all", "one-at-a-time"]
+                        .iter()
+                        .filter(|m| current.as_deref() != Some(**m))
+                        .map(|m| PanelAction::new(format!("Use {m}"), "settings", format!("{verb} {m}")))
+                        .collect(),
+                    ..row(
+                        if verb == "steering" {
+                            "Steering"
+                        } else {
+                            "Follow-ups"
+                        },
+                        current,
+                    )
+                }
+            };
+            (
+                "Settings",
+                vec![
+                    PanelRow {
+                        actions: auto
+                            .map(|on| {
+                                let (label, v) = if on {
+                                    ("Turn off", "off")
+                                } else {
+                                    ("Turn on", "on")
+                                };
+                                vec![PanelAction::new(
+                                    label,
+                                    "settings",
+                                    format!("auto-compaction {v}"),
+                                )]
+                            })
+                            .unwrap_or_default(),
+                        ..row(
+                            "Auto-compaction",
+                            auto.map(|on| if on { "on" } else { "off" }.into()),
+                        )
+                    },
+                    modes("steeringMode", "steering"),
+                    modes("followUpMode", "follow-up"),
+                ],
+            )
+        }
+        "fork" => (
+            "Fork from a message",
+            data.get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|m| {
+                    let entry = m.get("entryId").and_then(Value::as_str)?;
+                    let text = m.get("text").and_then(Value::as_str).unwrap_or_default();
+                    Some(PanelRow {
+                        label: text.lines().next().unwrap_or_default().to_owned(),
+                        actions: vec![PanelAction::new("Fork here", "fork", entry)],
+                        ..PanelRow::default()
+                    })
+                })
+                .collect(),
+        ),
+        _ => ("", Vec::new()),
+    };
+    Panel {
+        id: id.to_owned(),
+        title: title.into(),
+        sections: vec![PanelSection {
+            rows: rows
+                .into_iter()
+                .filter(|r| r.value.is_some() || !r.actions.is_empty())
+                .collect(),
+            ..PanelSection::default()
+        }],
+    }
 }
 
 fn obj(v: Value) -> Map<String, Value> {
@@ -883,6 +1124,8 @@ fn tool_kind(tool: &str) -> ItemKind {
     match tool {
         "bash" | "powershell" => ItemKind::CommandExecution,
         "edit" | "write" => ItemKind::FileChange,
+        // The pi-subagents extension's tool.
+        "subagent" => ItemKind::Subagent,
         _ => ItemKind::ToolCall,
     }
 }
@@ -898,6 +1141,61 @@ fn content_text(content: Option<&Value>) -> String {
             .collect::<Vec<_>>()
             .join(""),
         _ => String::new(),
+    }
+}
+
+/// What to show for a user message: its text, or `[image]` when it is only images.
+/// An async `subagent` launch's run id (pi-subagents `async: true`): its
+/// result only acknowledges it, and its `subagent-notify` completes it.
+fn async_run<'a>(tool: &str, details: Option<&'a Value>, is_error: bool) -> Option<&'a str> {
+    details
+        .and_then(|d| d.get("asyncId"))
+        .and_then(Value::as_str)
+        .filter(|_| !is_error && tool == "subagent")
+}
+
+/// pi-subagents' report of finished async runs (a `subagent-notify` custom
+/// message): completes the calls that launched them, with the report as
+/// their output.
+fn subagent_notify(background: &mut HashMap<String, String>, msg: &Value, out: &mut Vec<Event>) {
+    if msg.get("customType").and_then(Value::as_str) != Some("subagent-notify") {
+        return;
+    }
+    let Some(runs) = msg.pointer("/details/runs").and_then(Value::as_array) else {
+        return;
+    };
+    let text = content_text(msg.get("content"));
+    for run in runs {
+        let Some(id) = run
+            .get("runId")
+            .and_then(Value::as_str)
+            .and_then(|r| background.remove(r))
+        else {
+            continue;
+        };
+        let failed = run.get("status").and_then(Value::as_str) != Some("completed");
+        out.push(Event::ItemCompleted {
+            id,
+            extensions: json!({
+                "notify": run,
+                "result": {"content": [{"type": "text", "text": text}]},
+                "is_error": failed,
+            }),
+        });
+    }
+}
+
+fn user_text(content: Option<&Value>) -> String {
+    let text = content_text(content);
+    let images = content.and_then(Value::as_array).is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+    });
+    if text.is_empty() && images {
+        "[image]".to_owned()
+    } else {
+        text
     }
 }
 
@@ -938,11 +1236,14 @@ pub fn session_dir(cwd: &str) -> String {
 /// State comes from the transcript ([`StateSource::Transcript`]): a user
 /// message means working, an assistant message that stops for tool use means
 /// still working, a final one means done, an error stop means error and an
-/// aborted one means idle. pi never shows "blocked" in its transcript.
+/// aborted one means idle, and a final one with async pi-subagents runs still
+/// out means waiting. pi never shows "blocked" in its transcript.
 #[derive(Debug)]
 pub struct Transcript {
     framer: LineFramer,
     open_tools: Vec<String>,
+    /// Async pi-subagents runs not yet reported back, as in [`PiDriver`].
+    background: HashMap<String, String>,
     usage: Usage,
 }
 
@@ -957,8 +1258,14 @@ impl Transcript {
         Self {
             framer: LineFramer::new(MAX_LINE),
             open_tools: Vec::new(),
+            background: HashMap::new(),
             usage: Usage::default(),
         }
+    }
+
+    /// Tool calls with no result yet.
+    pub fn pending_tools(&self) -> usize {
+        self.open_tools.len()
     }
 
     /// Feeds bytes from the session file (from a `tail -c +N -f`).
@@ -999,11 +1306,12 @@ impl Transcript {
                         out.push(Event::ItemStarted {
                             id: id.clone(),
                             kind: ItemKind::UserMessage,
+                            parent: None,
                             extensions: Value::Null,
                         });
                         out.push(Event::ItemDelta {
                             id: id.clone(),
-                            text: content_text(msg.get("content")),
+                            text: user_text(msg.get("content")),
                         });
                         out.push(Event::ItemCompleted {
                             id,
@@ -1015,17 +1323,23 @@ impl Transcript {
                     Some("toolResult") => {
                         let call = str_field(msg, "toolCallId");
                         self.open_tools.retain(|t| *t != call);
-                        out.push(Event::ItemCompleted {
-                            id: call,
-                            extensions: json!({
-                                "result": { "content": msg.get("content") },
-                                "is_error": msg.get("isError").and_then(Value::as_bool).unwrap_or(false),
-                            }),
+                        let is_error = msg.get("isError").and_then(Value::as_bool).unwrap_or(false);
+                        let details = msg.get("details");
+                        let extensions = json!({
+                            "result": { "content": msg.get("content"), "details": details },
+                            "is_error": is_error,
                         });
+                        if let Some(run) = async_run(&str_field(msg, "toolName"), details, is_error) {
+                            self.background.insert(run.to_owned(), call.clone());
+                            out.push(Event::ItemUpdated { id: call, extensions });
+                        } else {
+                            out.push(Event::ItemCompleted { id: call, extensions });
+                        }
                     }
                     _ => {}
                 }
             }
+            Some("custom_message") => subagent_notify(&mut self.background, v, out),
             _ => {}
         }
     }
@@ -1034,6 +1348,7 @@ impl Transcript {
         out.push(Event::ItemStarted {
             id: id.clone(),
             kind: ItemKind::AgentMessage,
+            parent: None,
             extensions: Value::Null,
         });
         let text = content_text(msg.get("content"));
@@ -1057,6 +1372,7 @@ impl Transcript {
                 out.push(Event::ItemStarted {
                     id: call,
                     kind: tool_kind(&tool),
+                    parent: None,
                     extensions: json!({ "tool": tool, "args": block.get("arguments") }),
                 });
             }
@@ -1069,6 +1385,7 @@ impl Transcript {
             "toolUse" => RunState::Working { progress: None },
             "error" => RunState::Error,
             "aborted" => RunState::Idle,
+            _ if !self.background.is_empty() => RunState::Waiting,
             _ => RunState::Done,
         };
         let message = (stop == "error")
@@ -1264,9 +1581,7 @@ mod tests {
     #[test]
     fn builtins_map_to_rpc_and_others_are_prompts() {
         let mut d = PiDriver::new();
-        let one = |d: &mut PiDriver, text: &str| {
-            sent(&d.command(Command::Prompt { text: text.into() }).unwrap()).remove(0)
-        };
+        let one = |d: &mut PiDriver, text: &str| sent(&d.command(Command::prompt(text)).unwrap()).remove(0);
         assert_eq!(
             one(&mut d, "/compact keep the API notes")["customInstructions"],
             "keep the API notes"
@@ -1289,6 +1604,47 @@ mod tests {
 
         d.on_output(b"{\"type\":\"agent_start\"}\n");
         assert_eq!(one(&mut d, "also check tests")["streamingBehavior"], "steer");
+    }
+
+    #[test]
+    fn prompts_with_images_carry_them_and_skip_builtins() {
+        let mut d = PiDriver::new();
+        let png = Attachment::from_bytes("image/png", b"PNG");
+        let p = sent(
+            &d.command(Command::Prompt {
+                text: "what is this".into(),
+                attachments: vec![png.clone()],
+            })
+            .unwrap(),
+        )
+        .remove(0);
+        assert_eq!(p["type"], "prompt");
+        assert_eq!(p["message"], "what is this");
+        assert_eq!(
+            p["images"],
+            json!([{ "type": "image", "data": "UE5H", "mimeType": "image/png" }])
+        );
+        // A slash command with an image is for the model, not an RPC.
+        let c = sent(
+            &d.command(Command::Prompt {
+                text: "/compact".into(),
+                attachments: vec![png],
+            })
+            .unwrap(),
+        )
+        .remove(0);
+        assert_eq!(c["type"], "prompt");
+        assert_eq!(c["images"].as_array().unwrap().len(), 1);
+
+        // pi echoes the user message; image-only shows as `[image]`.
+        let events = d.on_output(
+            br#"{"type":"message_start","message":{"role":"user","content":[{"type":"image","data":"UE5H","mimeType":"image/png"}]}}
+"#,
+        );
+        assert!(events.contains(&Event::ItemDelta {
+            id: "u1".into(),
+            text: "[image]".into()
+        }));
     }
 
     #[test]
@@ -1383,6 +1739,93 @@ mod tests {
         assert_eq!(last.message.as_deref(), Some("429 rate limited"));
     }
 
+    /// Synthetic (pi isn't recorded with pi-subagents): an `async: true`
+    /// launch, the turn ending while it runs, then pi-subagents' idle wake —
+    /// the `subagent-notify` custom message and a steered prompt that starts
+    /// a second run. Shapes from pi's `agent-session.ts` and pi-subagents'
+    /// `async-execution.ts`/`notify.ts`.
+    const ASYNC_SUBAGENT: &str = r#"{"type":"agent_start"}
+{"type":"tool_execution_start","toolCallId":"call_1","toolName":"subagent","args":{"agent":"scout","task":"Map the repo","async":true}}
+{"type":"tool_execution_end","toolCallId":"call_1","toolName":"subagent","result":{"content":[{"type":"text","text":"Async: scout [run-7]"}],"details":{"mode":"single","runId":"run-7","results":[],"asyncId":"run-7"}},"isError":false}
+{"type":"agent_settled","aborted":false}
+{"type":"message_start","message":{"role":"custom","customType":"subagent-notify","content":"scout completed: 12 files","display":false,"details":{"runs":[{"agent":"scout","status":"completed","source":"async","runId":"run-7"}]}}}
+{"type":"message_end","message":{"role":"custom","customType":"subagent-notify","content":"scout completed: 12 files","display":false,"details":{"runs":[{"agent":"scout","status":"completed","source":"async","runId":"run-7"}]}}}
+{"type":"agent_start"}
+{"type":"agent_settled","aborted":false}
+"#;
+
+    #[test]
+    fn a_run_left_waiting_on_an_async_subagent_is_not_done() {
+        use crate::item::ItemDetail;
+        use crate::transcript::{ItemStatus, Transcript as Items};
+        let mut d = PiDriver::new();
+        let mut t = Items::new();
+        let mut states = Vec::new();
+        let mut while_waiting = None;
+        for line in ASYNC_SUBAGENT.split_inclusive('\n') {
+            for e in d.on_output(line.as_bytes()) {
+                t.settle(&e);
+                t.apply(&e);
+                if let Event::StateChanged(s) = &e {
+                    states.push(s.state.clone());
+                    if s.state == RunState::Waiting {
+                        while_waiting = t.get("call_1").map(|i| (i.status, i.detail(Harness::Pi)));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            states,
+            [
+                RunState::Working { progress: None },
+                RunState::Waiting,
+                RunState::Working { progress: None },
+                RunState::Done,
+            ]
+        );
+        let (status, detail) = while_waiting.unwrap();
+        assert_eq!(status, ItemStatus::Running);
+        assert!(matches!(detail, ItemDetail::Subagent { status: Some(s), .. } if s == "running"));
+        let item = t.get("call_1").unwrap();
+        assert_eq!(item.status, ItemStatus::Completed);
+        let ItemDetail::Subagent { status, output, .. } = item.detail(Harness::Pi) else {
+            panic!()
+        };
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(output.as_deref(), Some("scout completed: 12 files"));
+    }
+
+    #[test]
+    fn transcript_waits_on_an_async_subagent() {
+        let session = r#"{"type":"message","id":"u1","message":{"role":"user","content":"map it","timestamp":1}}
+{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_1","name":"subagent","arguments":{"agent":"scout","async":true}}],"stopReason":"toolUse","timestamp":2}}
+{"type":"message","id":"r1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"subagent","content":[{"type":"text","text":"Async: scout [run-7]"}],"details":{"asyncId":"run-7","runId":"run-7"},"isError":false,"timestamp":3}}
+{"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"text","text":"Launched."}],"stopReason":"stop","timestamp":4}}
+{"type":"custom_message","id":"c1","customType":"subagent-notify","content":"scout completed","display":false,"details":{"runs":[{"agent":"scout","status":"completed","runId":"run-7"}]}}
+{"type":"message","id":"u2","message":{"role":"user","content":"Inspect subagent updates above.","timestamp":5}}
+{"type":"message","id":"a3","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"stopReason":"stop","timestamp":6}}
+"#;
+        let events = Transcript::new().feed(session.as_bytes());
+        assert_eq!(
+            states(&events),
+            [
+                RunState::Working { progress: None },
+                RunState::Working { progress: None },
+                RunState::Waiting,
+                RunState::Working { progress: None },
+                RunState::Done,
+            ]
+        );
+        let call = |completed: bool| {
+            events.iter().position(|e| match e {
+                Event::ItemCompleted { id, .. } => completed && id == "call_1",
+                Event::ItemUpdated { id, .. } => !completed && id == "call_1",
+                _ => false,
+            })
+        };
+        assert!(call(false) < call(true), "launched, then reported back");
+    }
+
     #[test]
     fn transcript_replays_recorded_session() {
         let mut t = Transcript::new();
@@ -1413,5 +1856,117 @@ mod tests {
             ".pi/agent/sessions/--home-u-my proj--"
         );
         assert_eq!(session_dir("C:\\src\\x"), ".pi/agent/sessions/--C--src-x--");
+    }
+
+    fn invoke(d: &mut PiDriver, name: &str, args: &str) -> Result<Vec<Value>, DriverError> {
+        d.command(Command::Invoke {
+            name: name.into(),
+            args: args.into(),
+        })
+        .map(|b| sent(&b))
+    }
+
+    fn reply(id: &Value, command: &str, data: Value) -> String {
+        format!(
+            "{}\n",
+            json!({ "type": "response", "id": id, "command": command, "success": true, "data": data })
+        )
+    }
+
+    fn panel(events: &[Event]) -> &Panel {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::Panel(p) => Some(p),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no panel in {events:?}"))
+    }
+
+    #[test]
+    fn pickers_never_reach_the_model_without_a_value() {
+        let mut d = PiDriver::new();
+        let model = d.commands().iter().find(|c| c.name == "model").unwrap();
+        assert_eq!(model.input, CommandInput::Option { id: OptionId::Model });
+        assert!(matches!(
+            invoke(&mut d, "model", ""),
+            Err(DriverError::MissingArgument(_))
+        ));
+        assert!(matches!(
+            invoke(&mut d, "thinking", ""),
+            Err(DriverError::MissingArgument(_))
+        ));
+        assert_eq!(
+            invoke(&mut d, "thinking", "high").unwrap()[0]["type"],
+            "set_thinking_level"
+        );
+    }
+
+    #[test]
+    fn session_and_fork_panels() {
+        let mut d = PiDriver::new();
+        let req = invoke(&mut d, "session", "").unwrap();
+        assert_eq!(req[0]["type"], "get_session_stats");
+        let events = d.on_output(
+            reply(
+                &req[0]["id"],
+                "get_session_stats",
+                json!({ "sessionId": "abc", "userMessages": 2, "tokens": { "input": 10, "output": 5 }, "cost": 0.5 }),
+            )
+            .as_bytes(),
+        );
+        let rows = &panel(&events).sections[0].rows;
+        assert_eq!(rows[0].value.as_deref(), Some("abc"));
+        assert!(
+            rows.iter()
+                .any(|r| r.label == "Cost" && r.value.as_deref() == Some("$0.5000"))
+        );
+        // The stats still update usage.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Usage(u) if u.input_tokens == Some(10)))
+        );
+
+        let req = invoke(&mut d, "fork", "").unwrap();
+        assert_eq!(req[0]["type"], "get_fork_messages");
+        let events = d.on_output(
+            reply(
+                &req[0]["id"],
+                "get_fork_messages",
+                json!({ "messages": [{ "entryId": "e1", "text": "First prompt\nmore" }] }),
+            )
+            .as_bytes(),
+        );
+        let row = &panel(&events).sections[0].rows[0];
+        assert_eq!(row.label, "First prompt");
+        assert_eq!(row.actions[0].args, "e1");
+        let fork = invoke(&mut d, "fork", "e1").unwrap();
+        assert_eq!(fork[0]["type"], "fork");
+        assert_eq!(fork[0]["entryId"], "e1");
+    }
+
+    #[test]
+    fn settings_panel_toggles_and_refreshes() {
+        let mut d = PiDriver::new();
+        let req = invoke(&mut d, "settings", "").unwrap();
+        let events = d.on_output(
+            reply(
+                &req[0]["id"],
+                "get_state",
+                json!({ "autoCompactionEnabled": true, "steeringMode": "all", "followUpMode": "one-at-a-time" }),
+            )
+            .as_bytes(),
+        );
+        let rows = &panel(&events).sections[0].rows;
+        assert_eq!(rows[0].actions[0].args, "auto-compaction off");
+        assert_eq!(rows[1].actions[0].args, "steering one-at-a-time");
+        assert_eq!(rows[2].actions[0].args, "follow-up all");
+
+        let set = invoke(&mut d, "settings", "auto-compaction off").unwrap();
+        assert_eq!(set[0]["type"], "set_auto_compaction");
+        assert_eq!(set[0]["enabled"], false);
+        d.on_output(reply(&set[0]["id"], "set_auto_compaction", Value::Null).as_bytes());
+        assert_eq!(sent(&d.poll_transmit())[0]["type"], "get_state");
     }
 }

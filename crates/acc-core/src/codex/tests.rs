@@ -6,6 +6,7 @@ use super::*;
 
 const HANDSHAKE: &str = include_str!("../../tests/fixtures/codex/handshake.ndjson");
 const TURN: &str = include_str!("../../tests/fixtures/codex/turn-network-error.ndjson");
+const SUBAGENT: &str = include_str!("../../tests/fixtures/codex/subagent-0.162.1.ndjson");
 const THREAD: &str = "01a125ba-bc10-7a62-8401-c7b0088728d3";
 
 fn replay(d: &mut CodexDriver, recording: &str) -> Vec<Event> {
@@ -153,12 +154,7 @@ fn recorded_turn_streams_user_item_and_retry_state() {
     );
 
     // A prompt during a running turn steers it.
-    let steer = sent(
-        &d.command(Command::Prompt {
-            text: "also this".into(),
-        })
-        .unwrap(),
-    );
+    let steer = sent(&d.command(Command::prompt("also this")).unwrap());
     assert_eq!(steer[0]["method"], "turn/steer");
     assert_eq!(
         steer[0]["params"]["expectedTurnId"],
@@ -198,7 +194,7 @@ fn prompt_sends_turn_start_with_pending_option_changes_once() {
         Err(DriverError::InvalidOption(":root".into()))
     );
 
-    let first = sent(&d.command(Command::Prompt { text: "go".into() }).unwrap());
+    let first = sent(&d.command(Command::prompt("go")).unwrap());
     let p = &first[0]["params"];
     assert_eq!(first[0]["method"], "turn/start");
     assert_eq!(p["threadId"], THREAD);
@@ -216,7 +212,7 @@ fn prompt_sends_turn_start_with_pending_option_changes_once() {
         &mut d,
         json!({"method": "turn/completed", "params": {"threadId": THREAD, "turn": {"id": "t1", "status": "completed"}}}),
     );
-    let second = sent(&d.command(Command::Prompt { text: "again".into() }).unwrap());
+    let second = sent(&d.command(Command::prompt("again")).unwrap());
     assert!(second[0]["params"].get("effort").is_none());
     assert_eq!(option(&d, OptionId::Mode).current.as_deref(), Some("plan"));
 }
@@ -249,6 +245,7 @@ fn turn_lifecycle_and_sticky_done() {
     assert!(events.contains(&Event::ItemStarted {
         id: "a1".into(),
         kind: ItemKind::AgentMessage,
+        parent: None,
         extensions: json!({"type": "agentMessage", "id": "a1", "text": ""})
     }));
     assert!(events.contains(&Event::ItemDelta {
@@ -284,6 +281,8 @@ fn failed_turn_is_error_with_message() {
     );
     assert!(events.iter().any(|e| matches!(e,
         Event::StateChanged(s) if s.state == RunState::Error && s.message.as_deref() == Some("stream disconnected"))));
+    // The state the turn ended in comes first, on every harness.
+    assert_eq!(events.last(), Some(&Event::TurnCompleted));
 }
 
 #[test]
@@ -302,6 +301,7 @@ fn command_approval_round_trip() {
                 request_id,
                 title,
                 options,
+                ..
             } => Some((request_id.clone(), title.clone(), options.clone())),
             _ => None,
         })
@@ -354,6 +354,33 @@ fn request_resolved_elsewhere_is_reported() {
         [Event::PermissionResolved {
             request_id: "r9".into()
         }]
+    );
+}
+
+#[test]
+fn user_input_answers_every_question() {
+    let mut d = started();
+    feed(
+        &mut d,
+        json!({"id": 7, "method": "item/tool/requestUserInput", "params": {
+        "threadId": THREAD, "turnId": "t1", "itemId": "u2", "isBlocking": true, "autoResolutionMs": null,
+        "questions": [
+            {"id": "q1", "header": "DB", "question": "Which DB?", "isOther": false, "isSecret": false,
+                "options": [{"label": "Postgres", "description": ""}]},
+            {"id": "q2", "header": "Name", "question": "Name it?", "isOther": true, "isSecret": false,
+                "options": null}]}}),
+    );
+    let answers = vec![vec!["Postgres".to_owned()], vec!["acme".to_owned()]];
+    let reply = sent(
+        &d.command(Command::AnswerPermission {
+            request_id: "7".into(),
+            option_id: crate::question::encode(&answers),
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        reply[0]["result"],
+        json!({"answers": {"q1": {"answers": ["Postgres"]}, "q2": {"answers": ["acme"]}}})
     );
 }
 
@@ -554,10 +581,403 @@ fn resumed_history_is_replayed_as_items() {
 }
 
 #[test]
-fn prompt_before_thread_is_not_started() {
+fn prompt_before_thread_is_queued_not_dropped() {
     let mut d = CodexDriver::default();
-    assert_eq!(
-        d.command(Command::Prompt { text: "x".into() }),
-        Err(DriverError::NotStarted)
+    let bytes = d.command(Command::prompt("x")).expect("queued");
+    assert!(bytes.is_empty());
+
+    d.handshake();
+    replay(&mut d, HANDSHAKE);
+
+    let msgs = sent(&d.poll_transmit());
+    let turn = msgs
+        .iter()
+        .find(|m| m["method"] == "turn/start")
+        .expect("the queued prompt went out once the thread opened");
+    assert_eq!(turn["params"]["threadId"], THREAD);
+    assert_eq!(turn["params"]["input"][0]["text"], "x");
+}
+
+#[test]
+fn client_tag_makes_string_ids_and_attach_skips_initialize() {
+    let mut d = CodexDriver::new(CodexConfig {
+        client_tag: Some("ph".into()),
+        ..CodexConfig::default()
+    });
+    let msgs = sent(&d.handshake());
+    assert_eq!(msgs[0]["id"], "ph-1");
+    let attach = sent(&d.attach_handshake());
+    assert!(
+        attach
+            .iter()
+            .all(|m| m["id"].as_str().is_some_and(|i| i.starts_with("ph-")))
     );
+    let methods: Vec<_> = attach.iter().map(|m| m["method"].as_str().unwrap()).collect();
+    assert!(
+        !methods
+            .iter()
+            .any(|m| *m == "initialize" || m.starts_with("thread/"))
+    );
+    assert!(methods.contains(&"model/list"));
+}
+
+#[test]
+fn late_client_adopts_thread_from_shared_log_and_ignores_foreign_errors() {
+    let mut late = CodexDriver::new(CodexConfig {
+        client_tag: Some("late".into()),
+        ..CodexConfig::default()
+    });
+    let events = replay(&mut late, HANDSHAKE);
+    assert_eq!(late.thread_id(), Some(THREAD));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::SessionStarted { native_id, .. } if native_id == THREAD))
+    );
+    assert!(feed(&mut late, json!({"id": 9, "error": {"message": "nope"}})).is_empty());
+}
+
+#[test]
+fn turn_diff_is_passed_through() {
+    let mut d = started();
+    let events = feed(
+        &mut d,
+        json!({"method": "turn/diff/updated", "params": {"threadId": THREAD, "turnId": "t1", "diff": "diff --git a/x b/x\n"}}),
+    );
+    assert!(events.iter().any(|e| matches!(e, Event::Native { kind, payload } if kind == "turn_diff" && payload["diff"].as_str().is_some())));
+}
+
+fn invoke(d: &mut CodexDriver, name: &str, args: &str) -> Result<Vec<Value>, DriverError> {
+    d.command(Command::Invoke {
+        name: name.into(),
+        args: args.into(),
+    })
+    .map(|b| sent(&b))
+}
+
+fn panel(events: &[Event]) -> &Panel {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::Panel(p) => Some(p),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no panel in {events:?}"))
+}
+
+#[test]
+fn option_commands_become_pickers() {
+    let mut d = started();
+    for (name, id) in [("model", OptionId::Model), ("effort", OptionId::Effort)] {
+        let entry = d.commands().iter().find(|c| c.name == name).unwrap();
+        assert_eq!(entry.input, CommandInput::Option { id });
+    }
+    let model = option(&d, OptionId::Model).values[0].clone();
+    assert_eq!(invoke(&mut d, "model", &model).unwrap(), Vec::<Value>::new());
+    assert_eq!(
+        option(&d, OptionId::Model).current.as_deref(),
+        Some(model.as_str())
+    );
+    assert!(matches!(
+        invoke(&mut d, "effort", ""),
+        Err(DriverError::MissingArgument(_))
+    ));
+}
+
+#[test]
+fn mcp_panel_lists_servers_and_logs_in() {
+    let mut d = started();
+    let req = invoke(&mut d, "mcp", "").unwrap();
+    assert_eq!(req[0]["method"], "mcpServerStatus/list");
+    assert_eq!(req[0]["params"]["detail"], "toolsAndAuthOnly");
+    // Shapes from `codex app-server generate-ts` (ListMcpServerStatusResponse).
+    let events = feed(
+        &mut d,
+        json!({"id": req[0]["id"], "result": {"data": [
+            {"name": "linear", "tools": {"a": {}, "b": {}}, "resources": [], "resourceTemplates": [], "authStatus": "notLoggedIn"},
+            {"name": "fs", "tools": {}, "resources": [], "resourceTemplates": [], "authStatus": "unsupported"},
+        ], "nextCursor": null}}),
+    );
+    let p = panel(&events);
+    assert_eq!(p.sections[0].rows[0].value.as_deref(), Some("2 tools"));
+    assert_eq!(p.sections[0].rows[0].actions[0].args, "login linear");
+    assert!(p.sections[0].rows[1].actions.is_empty());
+    assert_eq!(p.sections[0].actions[0].args, "reload");
+
+    let login = invoke(&mut d, "mcp", "login linear").unwrap();
+    assert_eq!(login[0]["method"], "mcpServer/oauth/login");
+    assert_eq!(login[0]["params"]["name"], "linear");
+    let events = feed(
+        &mut d,
+        json!({"id": login[0]["id"], "result": {"authorizationUrl": "https://auth.example/x"}}),
+    );
+    assert!(events.contains(&Event::Notice {
+        message: "Open to log in: https://auth.example/x".into()
+    }));
+
+    let reload = invoke(&mut d, "mcp", "reload").unwrap();
+    assert_eq!(reload[0]["method"], "config/mcpServer/reload");
+    feed(&mut d, json!({"id": reload[0]["id"], "result": {}}));
+    assert_eq!(sent(&d.poll_transmit())[0]["method"], "mcpServerStatus/list");
+}
+
+#[test]
+fn experimental_panel_toggles_features() {
+    let mut d = started();
+    let req = invoke(&mut d, "experimental", "").unwrap();
+    let events = feed(
+        &mut d,
+        json!({"id": req[0]["id"], "result": {"data": [
+            {"name": "web_search", "stage": "beta", "displayName": "Web search", "description": "Search the web",
+             "announcement": null, "enabled": false, "defaultEnabled": false},
+            {"name": "internal", "stage": "underDevelopment", "displayName": null, "description": null,
+             "announcement": null, "enabled": false, "defaultEnabled": false},
+        ], "nextCursor": null}}),
+    );
+    let rows = &panel(&events).sections[0].rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "Web search");
+    assert_eq!(rows[0].actions[0].args, "enable web_search");
+
+    let set = invoke(&mut d, "experimental", "enable web_search").unwrap();
+    assert_eq!(set[0]["method"], "experimentalFeature/enablement/set");
+    assert_eq!(set[0]["params"]["enablement"]["web_search"], true);
+}
+
+#[test]
+fn status_panel_shows_account_and_options() {
+    let mut d = started();
+    let req = invoke(&mut d, "status", "").unwrap();
+    assert_eq!(req[0]["method"], "account/read");
+    let events = feed(
+        &mut d,
+        json!({"id": req[0]["id"], "result": {"account": {"type": "chatgpt", "email": "v@example.com", "planType": "pro"}, "requiresOpenaiAuth": true}}),
+    );
+    let rows = &panel(&events).sections[0].rows;
+    assert_eq!(rows[0].value.as_deref(), Some("ChatGPT (v@example.com)"));
+    assert_eq!(rows[1].value.as_deref(), Some("pro"));
+    assert!(rows.iter().any(|r| r.label == "Model"));
+}
+
+#[test]
+fn prompts_with_images_are_data_url_inputs() {
+    let mut d = started();
+    let png = Attachment::from_bytes("image/png", b"PNG");
+    let first = sent(
+        &d.command(Command::Prompt {
+            text: "what is this".into(),
+            attachments: vec![png.clone()],
+        })
+        .unwrap(),
+    );
+    assert_eq!(first[0]["method"], "turn/start");
+    assert_eq!(
+        first[0]["params"]["input"],
+        json!([
+            {"type": "text", "text": "what is this", "text_elements": []},
+            {"type": "image", "url": "data:image/png;base64,UE5H"},
+        ])
+    );
+    // Mid-turn the same input steers; an image-only prompt has no text item.
+    feed(
+        &mut d,
+        json!({"method": "turn/started", "params": {"threadId": THREAD, "turn": {"id": "t1"}}}),
+    );
+    let steer = sent(
+        &d.command(Command::Prompt {
+            text: String::new(),
+            attachments: vec![png],
+        })
+        .unwrap(),
+    );
+    assert_eq!(steer[0]["method"], "turn/steer");
+    assert_eq!(
+        steer[0]["params"]["input"],
+        json!([{"type": "image", "url": "data:image/png;base64,UE5H"}])
+    );
+    let events = feed(
+        &mut d,
+        json!({"method": "item/started", "params": {"threadId": THREAD, "turnId": "t1",
+        "item": {"type": "userMessage", "id": "u9", "content": [{"type": "image", "url": "data:image/png;base64,UE5H"}]}}}),
+    );
+    assert!(events.contains(&Event::ItemDelta {
+        id: "u9".into(),
+        text: "[image]".into()
+    }));
+}
+
+/// Recorded from 0.162.1 (`acc run codex`): the parent spawns one subagent,
+/// waits for it and reports what it said. The spawn is a `subAgentActivity`
+/// naming the child thread, the child's items stream on that thread, and a
+/// second `subAgentActivity` (`kind: completed`) says it stopped.
+#[test]
+fn recorded_subagent_is_one_item_with_its_childs_conversation() {
+    use crate::item::ItemDetail;
+    use crate::transcript::{ItemStatus, Transcript};
+    let mut d = CodexDriver::default();
+    d.handshake();
+    let mut t = Transcript::new();
+    let mut events = Vec::new();
+    for line in SUBAGENT.split_inclusive('\n') {
+        for e in d.on_output(line.as_bytes()) {
+            t.apply(&e);
+            if matches!(e, Event::SessionStarted { .. }) {
+                d.command(Command::prompt("spawn one")).unwrap();
+            }
+            events.push(e);
+        }
+    }
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Unrecognized { .. })),
+        "{events:#?}"
+    );
+    let subs: Vec<_> = t
+        .subagents()
+        .filter(|i| i.ext["type"] == "subAgentActivity")
+        .collect();
+    assert_eq!(subs.len(), 1, "the completion activity isn't an item of its own");
+    let sub = subs[0];
+    assert_eq!(sub.status, ItemStatus::Completed);
+    let ItemDetail::Subagent {
+        agent,
+        child,
+        status,
+        output,
+        model,
+        ..
+    } = sub.detail(Harness::Codex)
+    else {
+        panic!()
+    };
+    assert_eq!(agent.as_deref(), Some("pong"));
+    assert_eq!(child.as_deref(), Some("01a13c40-d0f6-7b91-8fb1-48b77d83bdfb"));
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert_eq!(output.as_deref(), Some("pong"));
+    assert_eq!(model.as_deref(), Some("gpt-6-luna"));
+    // The child's reply belongs to the subagent, not the main conversation.
+    let children: Vec<_> = t.children(&sub.id).collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        (children[0].kind, children[0].text.as_str()),
+        (ItemKind::AgentMessage, "pong")
+    );
+    let top: Vec<_> = t
+        .top_level()
+        .filter(|i| i.kind == ItemKind::AgentMessage)
+        .collect();
+    assert_eq!(top.len(), 1);
+    assert!(top[0].text.contains("pong"));
+    // No idle flicker before the turn reports how it ended.
+    let states: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::StateChanged(s) => Some(s.state.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            RunState::Idle,
+            RunState::Working { progress: None },
+            RunState::Done
+        ]
+    );
+    assert_eq!(events.last(), Some(&Event::TurnCompleted));
+}
+
+/// Frames shaped by the 0.128 app-server types (`collabAgentToolCall`,
+/// `SessionSource.subAgent.thread_spawn`), which 0.162 still sends for
+/// `wait`; the spawn itself is recorded above.
+#[test]
+fn collab_spawn_is_a_subagent_and_child_thread_items_belong_to_it() {
+    use crate::item::ItemDetail;
+    use crate::transcript::Transcript;
+    let mut d = started();
+    let child = "019a0000-0000-7000-8000-00000000c41d";
+    let mut t = Transcript::new();
+    let apply = |events: Vec<Event>, t: &mut Transcript| {
+        for e in &events {
+            t.apply(e);
+        }
+        events
+    };
+    let spawn = json!({"type": "collabAgentToolCall", "id": "call_spawn", "tool": "spawnAgent",
+        "status": "inProgress", "senderThreadId": THREAD, "receiverThreadIds": [],
+        "prompt": "Count the lines in README.txt", "model": "gpt-6.1-sol", "reasoningEffort": null,
+        "agentsStates": {}});
+    apply(
+        feed(
+            &mut d,
+            json!({"method": "item/started", "params": {"threadId": THREAD, "turnId": "t1", "item": spawn}}),
+        ),
+        &mut t,
+    );
+    // The child thread starts before the spawn item names it.
+    let ev = apply(
+        feed(
+            &mut d,
+            json!({"method": "thread/started", "params": {"thread": {"id": child,
+        "source": {"subAgent": {"thread_spawn": {"parent_thread_id": THREAD, "depth": 1,
+            "agent_path": null, "agent_nickname": "Lovelace", "agent_role": "explorer"}}}}}}),
+        ),
+        &mut t,
+    );
+    assert!(ev.iter().any(|e| matches!(e, Event::Native { kind, payload }
+        if kind == "subagent_thread" && payload["parentItemId"] == "call_spawn")));
+    let ev = apply(
+        feed(
+            &mut d,
+            json!({"method": "item/started", "params": {"threadId": child, "turnId": "c1",
+        "item": {"type": "commandExecution", "id": "child_cmd", "command": "wc -l README.txt", "cwd": "/w",
+            "status": "inProgress", "aggregatedOutput": null, "exitCode": null}}}),
+        ),
+        &mut t,
+    );
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::ItemStarted { id, parent: Some(p), .. }
+        if id == "child_cmd" && p == "call_spawn"))
+    );
+    // The child's turn doesn't move the parent's state.
+    let ev = feed(
+        &mut d,
+        json!({"method": "turn/completed", "params": {"threadId": child,
+        "turn": {"id": "c1", "items": [], "status": "completed"}}}),
+    );
+    assert!(
+        !ev.iter()
+            .any(|e| matches!(e, Event::TurnCompleted | Event::StateChanged(_)))
+    );
+    let mut done = spawn.clone();
+    done["status"] = json!("completed");
+    done["receiverThreadIds"] = json!([child]);
+    done["agentsStates"] = json!({child: {"status": "completed", "message": "3 lines"}});
+    apply(
+        feed(
+            &mut d,
+            json!({"method": "item/completed", "params": {"threadId": THREAD, "turnId": "t1", "item": done}}),
+        ),
+        &mut t,
+    );
+
+    let sub = t.get("call_spawn").unwrap();
+    assert_eq!(sub.kind, ItemKind::Subagent);
+    let ItemDetail::Subagent {
+        child: c,
+        status,
+        output,
+        prompt,
+        model,
+        ..
+    } = sub.detail(Harness::Codex)
+    else {
+        panic!()
+    };
+    assert_eq!(c.as_deref(), Some(child));
+    assert_eq!(status.as_deref(), Some("completed"));
+    assert_eq!(output.as_deref(), Some("3 lines"));
+    assert_eq!(prompt.as_deref(), Some("Count the lines in README.txt"));
+    assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(t.children("call_spawn").count(), 1);
 }

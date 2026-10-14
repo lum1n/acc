@@ -55,6 +55,17 @@ pub(crate) fn one_line(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Spelled as an alias so serde doesn't treat it as borrowed from the input.
+pub(crate) type StaticStr = &'static str;
+
+/// Deserializes a [`StaticStr`] (a panel id in a pending request) by
+/// leaking it. Only restored snapshots take this path, and their few
+/// in-flight requests are tiny.
+pub(crate) fn static_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<StaticStr, D::Error> {
+    let s = <String as serde::Deserialize>::deserialize(d)?;
+    Ok(Box::leak(s.into_boxed_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

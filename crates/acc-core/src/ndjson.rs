@@ -6,7 +6,7 @@
 //! and ACP too.
 
 /// Splits an incoming byte stream into complete lines.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct LineFramer {
     buf: Vec<u8>,
     max_line: usize,

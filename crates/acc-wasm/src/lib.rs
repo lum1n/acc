@@ -8,15 +8,31 @@
 //! Values cross as plain JS objects shaped exactly like the core's serde
 //! types (snake_case keys, `type`-tagged unions), so they match the JSON that
 //! `acc run --json` prints. The TypeScript declarations below spell them out.
+//!
+//! Beside that live [`Session`], the detached-session objects acc-ffi has
+//! ([`AccSession`], [`AccFanIn`], [`AccObserved`], [`AccTakeover`] and the
+//! host scripts) are here under the same names, so every embedder gets the
+//! same API (`tests/parity.rs` keeps the two in step). Their records are JS
+//! objects too; the ones that carry bytes ([`AccExec`], [`AccOutbound`],
+//! [`AccFeedLine`]) are classes with `Uint8Array` fields. They throw `Error`s
+//! named `AccError` with a `kind` (acc-ffi's `AccError` variant names).
 
+use acc_core::Exec;
 use acc_core::command::Command;
 use acc_core::detached::SessionDir;
 use acc_core::harness::LaunchSpec;
-use acc_core::session::{self as core_session, Opening};
+use acc_core::live::{self as core_session, Opening};
 use acc_core::state::SessionState;
+use acc_core::transcript::Item;
 use acc_core::{Harness, osc7501};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+
+pub mod observe;
+pub mod session;
+
+pub use observe::*;
+pub use session::*;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_TYPES: &str = r#"
@@ -166,7 +182,7 @@ export type ProgramStatus =
 /// Converts a Rust value to a plain JS value: objects rather than `Map`s,
 /// `null` for `None`, numbers for u64 (all values ACC sends fit in 2^53),
 /// and `Uint8Array` for bytes.
-fn to_js<T: Serialize + ?Sized>(value: &T) -> Result<JsValue, JsError> {
+pub(crate) fn to_js<T: Serialize + ?Sized>(value: &T) -> Result<JsValue, JsError> {
     let serializer = serde_wasm_bindgen::Serializer::new()
         .serialize_maps_as_objects(true)
         .serialize_missing_as_null(true);
@@ -175,12 +191,12 @@ fn to_js<T: Serialize + ?Sized>(value: &T) -> Result<JsValue, JsError> {
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
-fn from_js<T: for<'de> Deserialize<'de>>(value: JsValue, what: &str) -> Result<T, JsError> {
+pub(crate) fn from_js<T: for<'de> Deserialize<'de>>(value: JsValue, what: &str) -> Result<T, JsError> {
     serde_wasm_bindgen::from_value(value).map_err(|e| JsError::new(&format!("invalid {what}: {e}")))
 }
 
 /// JS numbers for epoch milliseconds; negative or NaN become 0.
-fn ms(now_ms: f64) -> u64 {
+pub(crate) fn ms(now_ms: f64) -> u64 {
     if now_ms.is_finite() && now_ms > 0.0 {
         now_ms as u64
     } else {
@@ -189,8 +205,8 @@ fn ms(now_ms: f64) -> u64 {
 }
 
 /// Version of the core library.
-#[wasm_bindgen]
-pub fn version() -> String {
+#[wasm_bindgen(js_name = version)]
+pub fn acc_version() -> String {
     acc_core::VERSION.to_owned()
 }
 
@@ -480,4 +496,84 @@ impl Osc7501Scanner {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<JsValue, JsError> {
         to_js(&self.inner.feed(bytes))
     }
+}
+
+/// A command to run on the host, for example over an SSH exec channel:
+/// write `stdin` to it (when not empty), then close it.
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccExec {
+    /// A POSIX `sh` script.
+    pub script: String,
+    pub stdin: Vec<u8>,
+}
+
+impl From<Exec> for AccExec {
+    fn from(e: Exec) -> Self {
+        Self {
+            script: e.script,
+            stdin: e.stdin,
+        }
+    }
+}
+
+impl AccExec {
+    fn script(script: String) -> Self {
+        Self {
+            script,
+            stdin: Vec::new(),
+        }
+    }
+}
+
+/// An `Error` named `AccError` whose `kind` says what went wrong.
+pub(crate) fn error(kind: &str, message: &str) -> JsValue {
+    let e = js_sys::Error::new(message);
+    e.set_name("AccError");
+    // Setting a property on a fresh object can't fail.
+    let _ = js_sys::Reflect::set(&e, &JsValue::from_str("kind"), &JsValue::from_str(kind));
+    e.into()
+}
+
+/// [`to_js`] for values that always serialize (every core type does).
+pub(crate) fn js<T: Serialize + ?Sized>(value: &T) -> JsValue {
+    to_js(value).unwrap_or(JsValue::NULL)
+}
+
+/// [`from_js`] that throws an `AccError` (`InvalidArgument`).
+pub(crate) fn arg<T: for<'de> Deserialize<'de>>(value: JsValue, what: &str) -> Result<T, JsValue> {
+    serde_wasm_bindgen::from_value(value)
+        .map_err(|e| error("InvalidArgument", &format!("invalid {what}: {e}")))
+}
+
+/// A harness by the name records use (`claude`) or its id (`claude-code`).
+pub(crate) fn harness(name: &str) -> Result<Harness, JsValue> {
+    Harness::ALL
+        .into_iter()
+        .find(|h| {
+            serde_json::to_value(h)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .as_deref()
+                == Some(name)
+                || h.id() == name
+        })
+        .ok_or_else(|| error("InvalidArgument", &format!("unknown harness {name:?}")))
+}
+
+/// An item as the core serializes it, plus its harness-independent `detail`.
+pub(crate) fn item_json(i: &Item, h: Harness) -> serde_json::Value {
+    let mut v = serde_json::to_value(i).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.insert(
+            "detail".into(),
+            serde_json::to_value(i.detail(h)).unwrap_or_default(),
+        );
+    }
+    v
+}
+
+/// Byte offsets as JS numbers (exact up to 2^53).
+pub(crate) fn num(n: u64) -> f64 {
+    n as f64
 }

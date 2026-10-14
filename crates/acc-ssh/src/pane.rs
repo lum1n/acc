@@ -12,11 +12,11 @@ use std::time::Duration;
 use acc_core::Event;
 use acc_core::command::Command;
 use acc_core::harness::Harness;
+use acc_core::live::DEFAULT_STALE_AFTER_MS;
 use acc_core::multiplexer::{
     self, Backend, Exec, Input, PaneInfo, PaneObserver, PaneRef, Program, StreamKind, Target, rex,
     screen_match, tmux, tui, zellij,
 };
-use acc_core::session::DEFAULT_STALE_AFTER_MS;
 use acc_core::state::{SessionState, StateTracker};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep, timeout_at};

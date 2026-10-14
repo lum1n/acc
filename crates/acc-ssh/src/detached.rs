@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use acc_core::detached::{self as scripts, EXIT_INCOMPLETE, EXIT_NOT_RUNNING, Listed, SessionDir, Status};
+use acc_core::detached::{self as scripts, EXIT_INCOMPLETE, EXIT_NOT_RUNNING, Listing, SessionDir, Status};
 use acc_core::harness::LaunchSpec;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
@@ -86,21 +86,29 @@ pub struct Detached {
 }
 
 /// Lists the detached sessions on a host.
-pub async fn list(host: &Host) -> Result<Vec<Listed>> {
+pub async fn list(host: &Host) -> Result<Vec<Listing>> {
     let out = host.exec(&scripts::list_script(), b"").await?.ok()?;
     Ok(scripts::parse_list(&out.stdout_str()))
 }
 
 impl Detached {
-    /// Starts `spec` detached in `cwd` on the host as session `id`.
+    /// Starts `spec` detached in `cwd` on the host as session `id`,
+    /// recording `spec_json` (a [`acc_core::session::SessionSpec`]) so any
+    /// client can list and attach it.
     ///
     /// Relaunching an id whose harness has exited (to resume it) appends to
     /// the same log; the returned handle reads from the log's current end.
-    pub async fn launch(host: Arc<Host>, id: &str, spec: &LaunchSpec, cwd: &str) -> Result<Self> {
+    pub async fn launch(
+        host: Arc<Host>,
+        id: &str,
+        spec: &LaunchSpec,
+        cwd: &str,
+        spec_json: Option<&str>,
+    ) -> Result<Self> {
         let dir = SessionDir::new(id).ok_or_else(|| Error::InvalidId(id.to_owned()))?;
         // Remember where this run's output starts.
         let before = list(&host).await?;
-        let offset = before.iter().find(|l| l.id == id).map_or(0, |l| l.log_bytes);
+        let offset = before.iter().find(|l| l.id == id).map_or(0, |l| l.status.size());
         if before
             .iter()
             .any(|l| l.id == id && matches!(l.status, Status::Alive { .. }))
@@ -110,7 +118,9 @@ impl Detached {
                 stderr: format!("session {id} is already running"),
             });
         }
-        host.exec(&dir.launch_script(spec, cwd), b"").await?.ok()?;
+        host.exec(&dir.launch_script_with_spec(spec, cwd, spec_json), b"")
+            .await?
+            .ok()?;
         let me = Self::attach(host, id, offset)?;
         Ok(me)
     }
@@ -177,7 +187,7 @@ impl Detached {
                     }
                     Ok((_, status)) => {
                         let code = match status {
-                            Status::Exited { code } => code,
+                            Status::Exited { code, .. } => code,
                             _ => None,
                         };
                         f.exited = Some(code);
@@ -266,7 +276,7 @@ impl Detached {
 
     pub async fn status(&self) -> Result<Status> {
         let out = self.host.exec(&self.dir.status_script(), b"").await?.ok()?;
-        Ok(Status::parse(&out.stdout_str()))
+        Ok(scripts::parse_status(&out.stdout_str()).unwrap_or(Status::Missing))
     }
 
     /// Asks the harness to exit (SIGTERM). Readers then drain the log and

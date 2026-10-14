@@ -88,8 +88,11 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
         (Some(r), Some(id)) => Some(r.find(id)?),
         _ => None,
     };
-    let replay = rejoin.as_ref().map_or(0, |l| l.log_bytes);
-    let cwd_str = match (&remote, rejoin.and_then(|l| l.spec)) {
+    let replay = rejoin.as_ref().map_or(0, |l| l.status.size());
+    let rejoined = rejoin
+        .and_then(|l| l.spec_json)
+        .and_then(|j| acc_core::session::SessionSpec::from_json(&j));
+    let cwd_str = match (&remote, rejoined) {
         (Some(_), Some(s)) => s.cwd,
         (Some(r), None) => r.resolve_cwd(&cwd)?,
         (None, _) => std::fs::canonicalize(&cwd)
@@ -146,7 +149,7 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
             if let Some(p) = program {
                 spec.program = p;
             }
-            Link::Remote(r.start(&spec, &cwd_str, attach.as_deref(), replay, tx.clone())?)
+            Link::Remote(r.start(harness, &spec, &cwd_str, attach.as_deref(), replay, tx.clone())?)
         }
         None => spawn_local(
             harness,
@@ -397,9 +400,7 @@ fn parse_line(line: &str, driver: &dyn Driver, out: &Printer) -> Option<Command>
         };
     }
     let Some(rest) = line.strip_prefix(':') else {
-        return Some(Command::Prompt {
-            text: line.to_owned(),
-        });
+        return Some(Command::prompt(line));
     };
     let mut words = rest.splitn(3, ' ');
     let cmd = match (words.next().unwrap_or(""), words.next(), words.next()) {
@@ -521,13 +522,16 @@ impl Printer {
                     RunState::Working { progress: None } => "working".to_owned(),
                     RunState::Blocked { kind } => format!("blocked ({kind:?})").to_lowercase(),
                     RunState::Done => "done".to_owned(),
+                    RunState::Waiting => "waiting for a background agent".to_owned(),
                     RunState::Error => "error".to_owned(),
                     RunState::Exited => "exited".to_owned(),
                 };
                 let msg = s.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default();
                 self.line(&format!("[state {state}{msg}]"));
             }
-            Event::ItemStarted { id, kind, extensions } => {
+            Event::ItemStarted {
+                id, kind, extensions, ..
+            } => {
                 self.kinds.insert(id.clone(), *kind);
                 if self.mid_line {
                     println!();
@@ -553,6 +557,7 @@ impl Printer {
                 request_id,
                 title,
                 options,
+                ..
             } => {
                 self.line(&format!("? permission: {title}"));
                 for o in options {
@@ -596,6 +601,18 @@ impl Printer {
             }
             Event::Notice { message } => self.line(&format!("! {message}")),
             Event::TurnCompleted => self.line("✓ turn completed"),
+            Event::Panel(panel) => {
+                self.line(&format!("▤ {}", panel.title));
+                for section in &panel.sections {
+                    if let Some(title) = &section.title {
+                        self.line(&format!("  {title}"));
+                    }
+                    for row in &section.rows {
+                        let value = row.value.as_deref().map(|v| format!(": {v}")).unwrap_or_default();
+                        self.line(&format!("    {}{value}", row.label));
+                    }
+                }
+            }
             Event::Exited { code } => self.line(&format!(
                 "● exited ({})",
                 code.map_or("signal".into(), |c| c.to_string())
@@ -662,12 +679,7 @@ mod tests {
 
     #[test]
     fn lines_become_commands() {
-        assert_eq!(
-            parse("  hi there ", None),
-            Some(Command::Prompt {
-                text: "hi there".into()
-            })
-        );
+        assert_eq!(parse("  hi there ", None), Some(Command::prompt("hi there")));
         assert_eq!(parse(":interrupt", None), Some(Command::Interrupt));
         assert_eq!(
             parse(r#"{"type":"compact","hint":null}"#, None),

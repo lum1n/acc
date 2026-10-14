@@ -439,14 +439,7 @@ fn pi_tui_in_tmux() {
         drain(&mut states);
         states.iter().any(|(_, s)| *s == RunState::Idle)
     });
-    for input in tui::inputs(
-        Harness::Pi,
-        &AccCommand::Prompt {
-            text: "list files".into(),
-        },
-    )
-    .unwrap()
-    {
+    for input in tui::inputs(Harness::Pi, &AccCommand::prompt("list files")).unwrap() {
         env.run(&b.send(&pane, &input));
     }
     eventually("pi to work, then finish", || {
@@ -605,7 +598,7 @@ fn claude_dialogs_in(m: Multiplexer) {
         "Run this shell command and nothing else: touch {}",
         file.display()
     );
-    for input in tui::inputs(Harness::Claude, &AccCommand::Prompt { text: prompt }).unwrap() {
+    for input in tui::inputs(Harness::Claude, &AccCommand::prompt(prompt)).unwrap() {
         env.run(&b.send(&pane, &input));
     }
     let mut id = None;

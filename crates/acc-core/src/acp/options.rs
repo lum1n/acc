@@ -125,7 +125,7 @@ impl ConfigOption {
 }
 
 /// A `{currentId, available:[{id, name}]}` pair from the legacy fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Legacy {
     pub current: String,
     pub available: Vec<String>,
@@ -168,7 +168,7 @@ impl Legacy {
 }
 
 /// How an [`OptionId`] reaches the agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Route {
     /// `session/set_config_option`.
     Config { config_id: String, boolean: bool },
@@ -181,7 +181,7 @@ pub(crate) enum Route {
 }
 
 /// Everything the agent has told us about session configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OptionState {
     pub config: Vec<ConfigOption>,
     pub modes: Option<Legacy>,

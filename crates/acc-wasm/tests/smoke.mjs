@@ -72,4 +72,52 @@ assert.ok(detached.launchScript(spec, "/tmp").includes("mkfifo"));
 assert.ok(detached.attachScript(10).includes("tail -c +11 -f"));
 assert.equal(acc.shellQuote("a b"), "'a b'");
 
-console.log(`ok: ${events.length} events through wasm`);
+// Detached sessions, the same objects as acc-ffi's.
+const hi = readFileSync(new URL("crates/acc-core/tests/fixtures/claude/hi-and-controls.ndjson", root));
+const id = acc.newSessionId("claude", new Uint8Array(15).fill(7));
+const launched = acc.AccSession.launch({ harness: "claude", cwd: "/w", prompt: "hi" }, id, "web", Date.now());
+assert.ok(launched.takeLaunchExec().script.includes("nohup"));
+assert.equal(launched.takeLaunchExec(), undefined);
+assert.ok(launched.takeTransmit() instanceof Uint8Array);
+
+const desk = acc.AccSession.attach(launched.spec(), "desk");
+desk.onStatus(`alive 3 ${hi.length}`, Date.now());
+const updates = desk.feed(hi, Date.now());
+assert.ok(updates.length > 0 && updates.every((u) => u.replay));
+assert.equal(desk.offset(), hi.length);
+assert.ok(desk.items().some((i) => i.kind === "agent_message" && i.text === "hi" && i.detail));
+assert.equal(desk.item("nope"), null);
+
+const out = desk.command({ type: "prompt", text: "again" });
+assert.equal(out.kind, "send");
+assert.ok(new TextDecoder().decode(out.bytes).includes("again"));
+assert.equal(desk.inputExec(out.bytes).stdin.length, out.bytes.length);
+const fork = desk.command({ type: "fork" });
+assert.equal(fork.kind, "relaunch");
+assert.equal(fork.request.fork, true);
+
+const kindOf = (fn) => {
+  try {
+    fn();
+  } catch (e) {
+    assert.equal(e.name, "AccError");
+    return e.kind;
+  }
+  assert.fail("no AccError");
+};
+assert.equal(kindOf(() => desk.command({ type: "bogus" })), "InvalidArgument");
+const huge = Buffer.alloc(5 * 1024 * 1024 + 1).toString("base64");
+assert.equal(kindOf(() => desk.command({ type: "prompt", text: "", attachments: [{ media_type: "image/png", data: huge }] })), "AttachmentRejected");
+assert.equal(kindOf(() => acc.AccSession.attach("{}", "x")), "InvalidSession");
+
+const restored = acc.AccSession.restore(desk.snapshot(), desk.spec());
+assert.deepEqual(restored.items(), desk.items());
+
+const fan = new acc.AccFanIn([{ key: "k", path: { type: "session_log", value: "abc" }, offset: 4 }]);
+const [line] = fan.feed(new TextEncoder().encode("k\t{}\n"));
+assert.ok(line.bytes instanceof Uint8Array);
+assert.equal(line.offset, 7);
+assert.equal(acc.parseProbe("H\tclaude\t/u/claude\t2.1.296 (Claude Code)\n")[0].compat, "tested");
+assert.equal(acc.parseSessionStatus("alive 3 10").size, 10);
+
+console.log(`ok: ${events.length} events through wasm, detached sessions too`);

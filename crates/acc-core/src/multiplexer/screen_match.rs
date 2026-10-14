@@ -94,6 +94,9 @@ impl Dialog {
                     label: "Cancel (Esc)".into(),
                 }])
                 .collect(),
+            kind: crate::state::BlockKind::Permission,
+            item_id: None,
+            input: serde_json::Value::Null,
         }
     }
 }
@@ -675,6 +678,7 @@ mod tests {
             request_id,
             title,
             options,
+            ..
         } = &ev[0]
         else {
             panic!("{ev:?}")

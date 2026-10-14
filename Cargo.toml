@@ -16,9 +16,11 @@ base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-wasm-bindgen = "0.6"
+similar = { version = "2", default-features = false, features = ["text"] }
 thiserror = "2"
 uniffi = "0.32"
 wasm-bindgen = "0.2"
+js-sys = { version = "0.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

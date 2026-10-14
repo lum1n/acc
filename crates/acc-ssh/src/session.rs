@@ -8,7 +8,8 @@ use tokio::sync::Mutex;
 use acc_core::Event;
 use acc_core::command::{Command, CommandEntry, OptionDef};
 use acc_core::harness::Harness;
-use acc_core::session::{Opening, Session as Core, SessionConfig};
+use acc_core::live::{Opening, Session as Core, SessionConfig};
+use acc_core::session::SessionSpec;
 use acc_core::state::SessionState;
 
 use crate::detached::{Detached, Read};
@@ -17,7 +18,7 @@ use crate::{Error, Result};
 
 /// A harness on a host, driven over SSH: commands in, events out.
 ///
-/// The protocol side is [`acc_core::session::Session`], the same sans-IO
+/// The protocol side is [`acc_core::live::Session`], the same sans-IO
 /// type the language bindings wrap; this adds the detached transport and a
 /// clock. Methods take `&self`, so one task can wait on
 /// [`Session::next_events`] while others [`Session::send`] commands.
@@ -48,8 +49,11 @@ impl Session {
             return Err(Error::Invalid("launch starts a harness; use attach to join one"));
         }
         let cwd = config.cwd.clone();
+        let model = config.model.clone();
         let mut core = Core::new(config);
-        let pipe = Detached::launch(host, id, core.launch_spec(), &cwd).await?;
+        let mut spec = SessionSpec::new(id, core.harness(), &cwd, core.launch_spec().clone(), now_ms());
+        spec.model = model;
+        let pipe = Detached::launch(host, id, core.launch_spec(), &cwd, Some(&spec.to_json())).await?;
         pipe.write(&core.start()).await?;
         Ok(Self::from_parts(pipe, core))
     }

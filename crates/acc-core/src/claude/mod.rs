@@ -20,7 +20,8 @@
 //! - Commands: the palette comes from the `initialize` reply and
 //!   `system/commands_changed`; slash commands run by sending `/name args` as
 //!   a user message. Model, effort, permission mode and rename use dedicated
-//!   control requests.
+//!   control requests. `/plan`, which Claude only runs in its TUI and never
+//!   lists headless, is `set_permission_mode` plus `get_plan`.
 //! - Usage: `result` (tokens, cost), `get_context_usage` (context fill) and
 //!   `rate_limit_event` (subscription windows).
 //!
@@ -30,13 +31,18 @@
 
 pub mod transcript;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
-use crate::command::{Apply, Command, CommandEntry, CommandSource, Exec, OptionDef, OptionId};
+use crate::command::{
+    Apply, Attachment, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec, OptionDef, OptionId,
+    offer_option, split_verb, validate_attachments,
+};
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemKind, PermissionOption, Quota, QuotaWindow, Usage};
+use crate::event::{
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+};
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -47,8 +53,43 @@ use crate::wire::{self, f64_at, owned, str_at, u64_at};
 /// when it is already the current mode.
 const PERMISSION_MODES: [&str; 5] = ["default", "acceptEdits", "plan", "auto", "dontAsk"];
 
+/// Commands only Claude's TUI runs, as 2.1.296 reports them in
+/// `system/init`. Assumed until the first `init` gives the real list.
+const TERMINAL_COMMANDS: [&str; 4] = ["doctor", "color", "focus", "reload-plugins"];
+
+/// Dialogs ACC draws itself from a control request: palette name,
+/// description (when Claude doesn't list the command) and request subtype.
+const PANELS: [(&str, &str, &str); 5] = [
+    (
+        "mcp",
+        "MCP servers: status, reconnect, enable or disable",
+        "mcp_status",
+    ),
+    (
+        "status",
+        "Version, session, account and environment",
+        "get_status",
+    ),
+    (
+        "permissions",
+        "Allow, ask and deny rules",
+        "list_permission_rules",
+    ),
+    ("memory", "Memory files and auto-memory", "get_memory_dialog"),
+    ("hooks", "Configured hooks", "get_hooks_listing"),
+];
+
+/// `/plan` as Claude's TUI describes it (2.1.280: `[open|<description>]`,
+/// `requires: { ink }`). Headless it is neither listed nor accepted as text,
+/// so ACC runs it itself: `set_permission_mode` into plan mode, the
+/// description as the first prompt, and `get_plan` to show the plan.
+const PLAN_DESCRIPTION: &str = "Enable plan mode or view the current session plan";
+
+/// Shown for a user message that is only images.
+const IMAGE_PLACEHOLDER: &str = "[image]";
+
 /// Launch-time settings. Everything else changes at runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeConfig {
     /// `--model` at spawn.
     pub model: Option<String>,
@@ -57,19 +98,35 @@ pub struct ClaudeConfig {
     /// With a resume id: start a new session id from that conversation
     /// (`--fork-session`), which is how ACC forks a Claude session.
     pub fork: bool,
+    /// Prefix for this client's control request ids. Clients sharing one
+    /// detached session see each other's responses in the shared log, so
+    /// each needs its own (`[A-Za-z0-9_-]`). Defaults to `acc`.
+    pub client_tag: Option<String>,
 }
 
 /// What a control request ACC sent was for, so its reply can be applied.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum Pending {
     Initialize,
     SetModel(String),
     SetEffort(String),
     SetPermission(String),
+    /// `/plan`: entering plan mode. Once Claude confirms, `prompt` goes out
+    /// as the first planning turn and `view` fetches the plan panel.
+    Plan {
+        prompt: Option<String>,
+        view: bool,
+    },
+    /// A dialog's data, drawn as the panel for this palette entry.
+    Panel(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
+    /// An action from a panel; the panel is fetched again afterwards.
+    PanelAction(#[serde(deserialize_with = "crate::wire::static_str")] crate::wire::StaticStr),
+    /// `reload_plugins`, which answers with the new palette.
+    Reload,
     Other,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PendingPermission {
     tool_use_id: Option<String>,
     input: Value,
@@ -80,14 +137,14 @@ struct PendingPermission {
 
 /// Content blocks of one assistant message that started streaming but whose
 /// final `assistant` frame hasn't arrived yet, in stream order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct OpenMessage {
     blocks: VecDeque<String>,
     seen: usize,
 }
 
 /// Claude Code stream-json driver. See the module docs.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeDriver {
     config: ClaudeConfig,
     framer: LineFramer,
@@ -99,14 +156,24 @@ pub struct ClaudeDriver {
     pending: HashMap<String, Pending>,
     permissions: HashMap<String, PendingPermission>,
     open: HashMap<String, OpenMessage>,
-    /// Tool-use items waiting for their result.
-    open_tools: HashSet<String>,
+    /// Tool-use items waiting for their result, with their kind.
+    open_tools: HashMap<String, ItemKind>,
+    /// Background tasks (subagents, shells, monitors) by task id: the
+    /// `task_*` frames merged, so each update carries the whole record.
+    tasks: HashMap<String, Value>,
+    /// Subagents running in the background, from `background_tasks_changed`:
+    /// each one wakes the agent for another turn when it reports back.
+    background_agents: usize,
     /// Usage of the latest top-level assistant message (context fill).
     last_context: Option<u64>,
     context_window: Option<u64>,
     models: Vec<Value>,
     hidden_commands: Vec<String>,
     skills: Vec<String>,
+    /// From the `initialize` reply, for the `/output-style` picker.
+    output_styles: Vec<String>,
+    /// The palette as Claude last listed it.
+    listed_commands: Vec<Value>,
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
     transmit: Vec<u8>,
@@ -131,18 +198,22 @@ impl ClaudeDriver {
             pending: HashMap::new(),
             permissions: HashMap::new(),
             open: HashMap::new(),
-            open_tools: HashSet::new(),
+            open_tools: HashMap::new(),
+            tasks: HashMap::new(),
+            background_agents: 0,
             last_context: None,
             context_window: None,
             models: Vec::new(),
-            hidden_commands: Vec::new(),
+            hidden_commands: TERMINAL_COMMANDS.iter().map(|c| (*c).to_owned()).collect(),
             skills: Vec::new(),
+            output_styles: Vec::new(),
+            listed_commands: Vec::new(),
             commands: Vec::new(),
             options: Vec::new(),
             transmit: Vec::new(),
         };
-        d.set_commands(&[]);
         d.rebuild_options(None, None);
+        d.set_commands(&[]);
         d
     }
 
@@ -153,15 +224,36 @@ impl ClaudeDriver {
 
     fn control(&mut self, request: Value, kind: Pending) -> Vec<u8> {
         self.next_request += 1;
-        let id = format!("acc-{}", self.next_request);
+        let tag = self.config.client_tag.as_deref().unwrap_or("acc");
+        let id = format!("{tag}-{}", self.next_request);
         self.pending.insert(id.clone(), kind);
         wire::line(&json!({"type": "control_request", "request_id": id, "request": request}))
     }
 
     fn user_text(text: &str) -> Vec<u8> {
+        Self::user_content(Value::String(text.to_owned()))
+    }
+
+    /// A user message with images: Anthropic content blocks. The API refuses
+    /// an empty text block, so an image-only prompt carries none.
+    fn user_blocks(text: &str, attachments: &[Attachment]) -> Vec<u8> {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+        for a in attachments {
+            content.push(json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": a.media_type, "data": a.data},
+            }));
+        }
+        Self::user_content(Value::Array(content))
+    }
+
+    fn user_content(content: Value) -> Vec<u8> {
         wire::line(&json!({
             "type": "user",
-            "message": {"role": "user", "content": text},
+            "message": {"role": "user", "content": content},
             "parent_tool_use_id": null,
             "session_id": "",
         }))
@@ -227,10 +319,16 @@ impl ClaudeDriver {
                 let id = owned(v, "session_id");
                 let model = owned(v, "model");
                 if let Some(names) = v.get("terminal_slash_commands").and_then(Value::as_array) {
-                    self.hidden_commands = names
+                    let hidden: Vec<String> = names
                         .iter()
                         .filter_map(|n| n.as_str().map(str::to_owned))
                         .collect();
+                    if hidden != self.hidden_commands {
+                        self.hidden_commands = hidden;
+                        let listed = std::mem::take(&mut self.listed_commands);
+                        self.set_commands(&listed);
+                        out.push(Event::CommandsChanged);
+                    }
                 }
                 if let Some(names) = v.get("skills").and_then(Value::as_array) {
                     self.skills = names
@@ -239,7 +337,7 @@ impl ClaudeDriver {
                         .collect();
                 }
                 // Without the rich `initialize` list, fall back to bare names.
-                if self.commands.iter().all(|c| c.source == CommandSource::Acc)
+                if self.listed_commands.is_empty()
                     && let Some(names) = v.get("slash_commands").and_then(Value::as_array)
                 {
                     let list: Vec<Value> = names
@@ -272,8 +370,13 @@ impl ClaudeDriver {
                         let kind = self.block_kind();
                         self.set_state(RunState::Blocked { kind }, None, out);
                     }
-                    // `done`/`error` from the result stay visible until the next turn.
-                    Some("idle") if !matches!(self.state, Some(RunState::Done | RunState::Error)) => {
+                    // `done`/`error`/`waiting` from the result stay visible until the next turn.
+                    Some("idle")
+                        if !matches!(
+                            self.state,
+                            Some(RunState::Done | RunState::Waiting | RunState::Error)
+                        ) =>
+                    {
                         self.set_state(RunState::Idle, None, out);
                     }
                     _ => {}
@@ -323,22 +426,29 @@ impl ClaudeDriver {
                     });
                 }
             }
+            Some("task_started" | "task_progress" | "task_updated" | "task_notification") => {
+                self.on_task(v, out)
+            }
+            Some("background_tasks_changed") => {
+                let tasks = v.get("tasks").cloned().unwrap_or_else(|| json!([]));
+                self.background_agents = tasks.as_array().map_or(0, |t| {
+                    t.iter()
+                        .filter(|t| str_at(t, "task_type").is_some_and(|k| k.ends_with("_agent")))
+                        .count()
+                });
+                // The last one's report is queued for the model, which takes
+                // it as a new turn without a `running` state of its own.
+                if self.background_agents == 0 && self.state == Some(RunState::Waiting) {
+                    self.set_state(RunState::Working { progress: None }, None, out);
+                }
+                out.push(Event::Native {
+                    kind: "background_tasks".into(),
+                    payload: json!({"tasks": tasks}),
+                });
+            }
             Some(
-                "post_turn_summary"
-                | "task_summary"
-                | "hook_started"
-                | "hook_progress"
-                | "hook_response"
-                | "task_started"
-                | "task_updated"
-                | "task_progress"
-                | "task_notification"
-                | "background_tasks_changed"
-                | "files_persisted"
-                | "informational"
-                | "memory_recall"
-                | "thinking_tokens"
-                | "notification",
+                "post_turn_summary" | "task_summary" | "hook_started" | "hook_progress" | "hook_response"
+                | "files_persisted" | "informational" | "memory_recall" | "thinking_tokens" | "notification",
             ) => {}
             _ => out.push(Event::Unrecognized { raw: raw.to_owned() }),
         }
@@ -349,6 +459,61 @@ impl ClaudeDriver {
             BlockKind::Question
         } else {
             BlockKind::Permission
+        }
+    }
+
+    /// A background task's lifecycle (`task_started`, `task_progress`,
+    /// `task_updated` with a patch, `task_notification` at the end). Tasks
+    /// behind a tool call (subagents) update that item under `task`; the
+    /// rest (ambient monitors, background shells) pass through as native
+    /// events. A subagent launched in the background stays running until
+    /// its notification, whatever its tool result said.
+    fn on_task(&mut self, v: &Value, out: &mut Vec<Event>) {
+        let Some(task_id) = owned(v, "task_id") else {
+            return;
+        };
+        let subtype = str_at(v, "subtype").unwrap_or_default().to_owned();
+        let patch = if subtype == "task_updated" {
+            v.get("patch").cloned().unwrap_or(Value::Null)
+        } else {
+            v.clone()
+        };
+        let task = self
+            .tasks
+            .entry(task_id.clone())
+            .or_insert_with(|| json!({"task_id": task_id}));
+        if let (Some(t), Some(p)) = (task.as_object_mut(), patch.as_object()) {
+            for (k, val) in p {
+                if matches!(k.as_str(), "type" | "subtype" | "uuid" | "session_id") || val.is_null() {
+                    continue;
+                }
+                t.insert(k.clone(), val.clone());
+            }
+            if subtype == "task_started" {
+                t.insert("status".into(), json!("running"));
+            }
+        }
+        let task = task.clone();
+        let done = subtype == "task_notification";
+        match owned(&task, "tool_use_id") {
+            Some(tool) if done && self.open_tools.remove(&tool).is_some() => {
+                let failed = matches!(str_at(&task, "status"), Some("failed" | "stopped"));
+                out.push(Event::ItemCompleted {
+                    id: tool,
+                    extensions: json!({"task": task, "is_error": failed}),
+                });
+            }
+            Some(tool) => out.push(Event::ItemUpdated {
+                id: tool,
+                extensions: json!({"task": task}),
+            }),
+            None => out.push(Event::Native {
+                kind: subtype.clone(),
+                payload: task,
+            }),
+        }
+        if done {
+            self.tasks.remove(&task_id);
         }
     }
 
@@ -383,7 +548,8 @@ impl ClaudeDriver {
                         out.push(Event::ItemStarted {
                             id: item_id,
                             kind,
-                            extensions: parent_ext(v),
+                            parent: parent_of(v),
+                            extensions: Value::Null,
                         });
                     }
                     _ => open.blocks.push_back(item_id),
@@ -449,7 +615,8 @@ impl ClaudeDriver {
                             out.push(Event::ItemStarted {
                                 id: fallback.clone(),
                                 kind,
-                                extensions: parent_ext(v),
+                                parent: parent_of(v),
+                                extensions: Value::Null,
                             });
                             if let Some(text) = text {
                                 out.push(Event::ItemDelta {
@@ -468,17 +635,27 @@ impl ClaudeDriver {
                 Some("tool_use" | "server_tool_use") => {
                     let id = owned(&block, "id").or(streamed).unwrap_or(fallback);
                     let name = str_at(&block, "name").unwrap_or_default();
-                    let mut ext =
+                    let ext =
                         json!({"name": name, "input": block.get("input").cloned().unwrap_or(Value::Null)});
-                    if let Some(parent) = v.get("parent_tool_use_id").filter(|p| !p.is_null()) {
-                        ext["parent_tool_use_id"] = parent.clone();
-                    }
-                    self.open_tools.insert(id.clone());
+                    let kind = tool_kind(name);
+                    self.open_tools.insert(id.clone(), kind);
                     out.push(Event::ItemStarted {
                         id,
-                        kind: tool_kind(name),
+                        kind,
+                        parent: parent_of(v),
                         extensions: ext,
                     });
+                }
+                // A server tool's result (`web_search_tool_result`, ...).
+                Some(kind) if kind.ends_with("_tool_result") => {
+                    if let Some(id) = owned(&block, "tool_use_id")
+                        && self.open_tools.remove(&id).is_some()
+                    {
+                        out.push(Event::ItemCompleted {
+                            id,
+                            extensions: json!({"content": block.get("content").cloned().unwrap_or(Value::Null)}),
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -492,30 +669,55 @@ impl ClaudeDriver {
         let content = v.pointer("/message/content").cloned().unwrap_or(Value::Null);
         if let Some(blocks) = content.as_array() {
             let mut text = String::new();
+            let mut images = 0;
             for block in blocks {
                 match str_at(block, "type") {
                     Some("tool_result") => {
                         let Some(id) = owned(block, "tool_use_id") else {
                             continue;
                         };
-                        if self.open_tools.remove(&id) {
-                            out.push(Event::ItemCompleted {
-                                id,
-                                extensions: json!({
-                                    "is_error": block.get("is_error").cloned().unwrap_or(Value::Bool(false)),
-                                    "content": block.get("content").cloned().unwrap_or(Value::Null),
-                                }),
-                            });
+                        self.resolve_tool(&id, out);
+                        let Some(kind) = self.open_tools.get(&id).copied() else {
+                            continue;
+                        };
+                        let mut ext = json!({
+                            "is_error": block.get("is_error").cloned().unwrap_or(Value::Bool(false)),
+                            "content": block.get("content").cloned().unwrap_or(Value::Null),
+                        });
+                        // The structured result names the agent (`agentId`,
+                        // `agentType`, usage) and whether it only launched.
+                        let result = v.get("tool_use_result").filter(|r| r.is_object());
+                        if kind == ItemKind::Subagent
+                            && let Some(result) = result
+                        {
+                            ext["result"] = result.clone();
+                        }
+                        let launched =
+                            result.is_some_and(|r| r.get("isAsync").and_then(Value::as_bool) == Some(true));
+                        if launched {
+                            // Still running: its `task_notification` completes it.
+                            out.push(Event::ItemUpdated { id, extensions: ext });
+                        } else {
+                            self.open_tools.remove(&id);
+                            out.push(Event::ItemCompleted { id, extensions: ext });
                         }
                     }
                     Some("text") => text.push_str(str_at(block, "text").unwrap_or_default()),
+                    Some("image") => images += 1,
                     _ => {}
                 }
             }
             if !text.is_empty() {
                 self.user_message(v, &text, out);
+            } else if images > 0 {
+                self.user_message(v, IMAGE_PLACEHOLDER, out);
             }
         } else if let Some(text) = content.as_str() {
+            if text.trim_start().starts_with("<task-notification>") {
+                // A background task's report, fed to the model as a user
+                // message; the `task_notification` frame already closed it.
+                return;
+            }
             if let Some(output) = local_command_output(text) {
                 out.push(Event::Notice {
                     message: output.to_owned(),
@@ -534,13 +736,16 @@ impl ClaudeDriver {
             self.next_request += 1;
             format!("user-{}", self.next_request)
         });
+        let parent = parent_of(v);
         // Older CLIs without session-state frames: a prompt starts a turn.
-        if !self.native_state_events {
+        // A subagent's prompt is the parent's tool call at work, not a turn.
+        if !self.native_state_events && parent.is_none() {
             self.set_state(RunState::Working { progress: None }, None, out);
         }
         out.push(Event::ItemStarted {
             id: id.clone(),
             kind: ItemKind::UserMessage,
+            parent,
             extensions: Value::Null,
         });
         out.push(Event::ItemDelta {
@@ -572,7 +777,14 @@ impl ClaudeDriver {
             context_used: self.last_context,
             context_window: self.context_window,
         }));
-        out.push(Event::TurnCompleted);
+        // A turn can't end while a prompt is open, so anything left was
+        // answered or withdrawn in a way the log doesn't show.
+        let mut left: Vec<String> = self.permissions.drain().map(|(id, _)| id).collect();
+        left.sort_unstable();
+        out.extend(
+            left.into_iter()
+                .map(|request_id| Event::PermissionResolved { request_id }),
+        );
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false)
             || str_at(v, "subtype").is_some_and(|s| s != "success");
         if is_error {
@@ -585,9 +797,12 @@ impl ClaudeDriver {
                 .or_else(|| str_at(v, "subtype"))
                 .map(|m| wire::one_line(m, 200));
             self.set_state(RunState::Error, message, out);
+        } else if self.background_agents > 0 {
+            self.set_state(RunState::Waiting, None, out);
         } else {
             self.set_state(RunState::Done, None, out);
         }
+        out.push(Event::TurnCompleted);
     }
 
     fn on_rate_limit(&mut self, v: &Value, out: &mut Vec<Event>) {
@@ -691,6 +906,8 @@ impl ClaudeDriver {
             (title, options, None)
         };
         let is_question = question.is_some();
+        let item_id = owned(req, "tool_use_id");
+        let preview = input.clone();
         self.permissions.insert(
             id.clone(),
             PendingPermission {
@@ -704,6 +921,13 @@ impl ClaudeDriver {
             request_id: id,
             title,
             options,
+            kind: if is_question {
+                BlockKind::Question
+            } else {
+                BlockKind::Permission
+            },
+            item_id,
+            input: preview,
         });
         if !self.native_state_events {
             let kind = if is_question {
@@ -720,6 +944,9 @@ impl ClaudeDriver {
         let id = str_at(resp, "request_id").unwrap_or_default();
         let kind = self.pending.remove(id).unwrap_or(Pending::Other);
         if str_at(resp, "subtype") == Some("error") {
+            if !self.is_ours(id) {
+                return;
+            }
             let error = str_at(resp, "error").unwrap_or("request failed");
             out.push(Event::Notice {
                 message: format!("Claude Code: {error}"),
@@ -727,8 +954,22 @@ impl ClaudeDriver {
             return;
         }
         let body = resp.get("response").cloned().unwrap_or(Value::Null);
+        // Another client's (or an earlier connection's) `initialize` reply,
+        // read from a shared log: adopt the palette and options it carries.
+        let kind = match kind {
+            Pending::Other if body.get("commands").is_some() && body.get("models").is_some() => {
+                Pending::Initialize
+            }
+            k => k,
+        };
         match kind {
             Pending::Initialize => {
+                if let Some(styles) = body.get("available_output_styles").and_then(Value::as_array) {
+                    self.output_styles = styles
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                }
                 if let Some(list) = body.get("commands").and_then(Value::as_array) {
                     self.set_commands(list);
                     out.push(Event::CommandsChanged);
@@ -764,6 +1005,34 @@ impl ClaudeDriver {
                 self.set_option_current(OptionId::Permission, mode);
                 out.push(Event::OptionsChanged);
             }
+            Pending::Plan { prompt, view } => {
+                self.set_option_current(OptionId::Permission, "plan".into());
+                out.push(Event::OptionsChanged);
+                out.push(Event::Notice {
+                    message: "Entered plan mode".into(),
+                });
+                if let Some(prompt) = prompt {
+                    self.transmit.extend(Self::user_text(&prompt));
+                }
+                if view {
+                    let bytes = self.open_panel("plan");
+                    self.transmit.extend(bytes);
+                }
+            }
+            Pending::Panel(id) => out.push(Event::Panel(panel(id, &body))),
+            Pending::PanelAction(id) => {
+                let bytes = self.open_panel(id);
+                self.transmit.extend(bytes);
+            }
+            Pending::Reload => {
+                if let Some(list) = body.get("commands").and_then(Value::as_array) {
+                    self.set_commands(list);
+                    out.push(Event::CommandsChanged);
+                }
+                out.push(Event::Notice {
+                    message: "Reloaded plugins".into(),
+                });
+            }
             Pending::Other => {
                 if let (Some(used), Some(max)) = (u64_at(&body, "totalTokens"), u64_at(&body, "maxTokens")) {
                     self.last_context = Some(used);
@@ -783,7 +1052,30 @@ impl ClaudeDriver {
         }
     }
 
+    /// Whether a control request id was minted by this client.
+    fn is_ours(&self, id: &str) -> bool {
+        let tag = self.config.client_tag.as_deref().unwrap_or("acc");
+        id.strip_prefix(tag).is_some_and(|rest| rest.starts_with('-'))
+    }
+
+    /// A permission is over once its tool reports a result (allowed and run,
+    /// or denied). Answers travel on stdin, so a shared log or a replay only
+    /// shows the outcome; this is how every client learns of it.
+    fn resolve_tool(&mut self, tool_use_id: &str, out: &mut Vec<Event>) {
+        let done: Vec<String> = self
+            .permissions
+            .iter()
+            .filter(|(_, p)| p.tool_use_id.as_deref() == Some(tool_use_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in done {
+            self.permissions.remove(&id);
+            out.push(Event::PermissionResolved { request_id: id });
+        }
+    }
+
     fn set_commands(&mut self, list: &[Value]) {
+        self.listed_commands = list.to_vec();
         let mut entries: Vec<CommandEntry> = list
             .iter()
             .filter_map(|c| {
@@ -807,20 +1099,203 @@ impl ClaudeDriver {
                     arg_hint: owned(c, "argumentHint").filter(|h| !h.is_empty()),
                     source,
                     exec: Exec::Text,
+                    input: CommandInput::None,
                     name,
                 })
             })
             .collect();
-        entries.push(CommandEntry {
-            name: "interrupt".into(),
-            description: "Stop the current turn".into(),
-            arg_hint: None,
-            source: CommandSource::Acc,
-            exec: Exec::Rpc {
-                method: "interrupt".into(),
-            },
-        });
+        // Commands whose TUI dialog has a control request behind it run
+        // that instead and answer with a panel.
+        for (name, description, subtype) in PANELS {
+            match entries.iter_mut().find(|e| e.name == *name) {
+                Some(e) => {
+                    e.exec = Exec::Rpc {
+                        method: (*subtype).into(),
+                    }
+                }
+                None => entries.push(CommandEntry::rpc(name, description, None, subtype)),
+            }
+        }
+        // `/plan` is TUI-only and unlisted headless; ACC runs it over the
+        // protocol (see `plan`). Listed in a future version, it is taken over.
+        let plan = CommandEntry::rpc(
+            "plan",
+            PLAN_DESCRIPTION,
+            Some("[<description>]"),
+            "set_permission_mode",
+        );
+        match entries.iter_mut().find(|e| e.name == "plan") {
+            Some(e) => {
+                e.exec = plan.exec;
+                e.arg_hint = plan.arg_hint;
+            }
+            None => entries.push(plan),
+        }
+        // Terminal-only commands with a control request behind them.
+        if self.hidden_commands.iter().any(|c| c == "reload-plugins") {
+            entries.push(CommandEntry::rpc(
+                "reload-plugins",
+                "Reload plugins, skills and MCP servers",
+                None,
+                "reload_plugins",
+            ));
+        }
+        // The rest need Claude's own TUI.
+        for name in &self.hidden_commands {
+            if !entries.iter().any(|e| &e.name == name) {
+                entries.push(CommandEntry {
+                    name: name.clone(),
+                    description: "Opens in Claude Code's terminal UI".into(),
+                    arg_hint: None,
+                    source: CommandSource::Builtin,
+                    exec: Exec::Terminal,
+                    input: CommandInput::None,
+                });
+            }
+        }
+        offer_option(
+            &mut entries,
+            &self.options,
+            OptionId::Model,
+            CommandEntry::rpc("model", "Switch model", Some("<model>"), "set_model"),
+        );
+        offer_option(
+            &mut entries,
+            &self.options,
+            OptionId::Effort,
+            CommandEntry::rpc(
+                "effort",
+                "Set reasoning effort",
+                Some("<level>"),
+                "apply_flag_settings",
+            ),
+        );
+        offer_option(
+            &mut entries,
+            &self.options,
+            OptionId::Permission,
+            CommandEntry::rpc(
+                "mode",
+                "Permission mode: plan, accept edits, auto, ...",
+                Some("<mode>"),
+                "set_permission_mode",
+            ),
+        );
+        if let Some(e) = entries.iter_mut().find(|e| e.name == "output-style")
+            && !self.output_styles.is_empty()
+        {
+            e.input = CommandInput::Choice {
+                choices: self.output_styles.iter().map(Choice::new).collect(),
+                required: false,
+            };
+        }
+        if let Some(e) = entries.iter_mut().find(|e| e.name == "rename") {
+            e.exec = Exec::Rpc {
+                method: "rename_session".into(),
+            };
+        }
+        entries.push(CommandEntry::rpc(
+            "interrupt",
+            "Stop the current turn",
+            None,
+            "interrupt",
+        ));
         self.commands = entries;
+    }
+
+    /// Runs a palette entry. Entries backed by a control request use it;
+    /// the rest go to Claude as `/name args`.
+    fn invoke(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let name = name.trim_start_matches('/');
+        let args = args.trim();
+        let set = |id| Command::SetOption {
+            id,
+            value: args.to_owned(),
+        };
+        let entry = self.commands.iter().find(|e| e.name == name);
+        if entry.is_some_and(|e| e.exec == Exec::Terminal) {
+            return Err(DriverError::Unsupported {
+                harness: Harness::Claude,
+                what: "this command outside its terminal UI",
+            });
+        }
+        Ok(match (name, args) {
+            ("interrupt", _) => return self.command(Command::Interrupt),
+            ("model", a) if !a.is_empty() => return self.command(set(OptionId::Model)),
+            ("effort", a) if !a.is_empty() => return self.command(set(OptionId::Effort)),
+            ("mode", "") => return Err(DriverError::MissingArgument("a permission mode")),
+            ("mode", _) => return self.command(set(OptionId::Permission)),
+            ("plan", a) => return self.plan(a),
+            ("rename", a) if !a.is_empty() => {
+                return self.command(Command::Rename { name: a.to_owned() });
+            }
+            ("reload-plugins", _) if entry.is_some_and(|e| e.exec != Exec::Text) => {
+                self.control(json!({"subtype": "reload_plugins"}), Pending::Reload)
+            }
+            ("mcp", a) if !a.is_empty() => {
+                let (verb, server) = split_verb(a);
+                if server.is_empty() {
+                    return Err(DriverError::MissingArgument("an MCP server name"));
+                }
+                let request = match verb {
+                    "reconnect" => json!({"subtype": "mcp_reconnect", "serverName": server}),
+                    "enable" | "disable" => {
+                        json!({"subtype": "mcp_toggle", "serverName": server, "enabled": verb == "enable"})
+                    }
+                    _ => return Err(DriverError::InvalidOption(verb.to_owned())),
+                };
+                self.control(request, Pending::PanelAction("mcp"))
+            }
+            (n, _) if PANELS.iter().any(|(p, ..)| *p == n) => {
+                let id = PANELS.iter().find(|(p, ..)| *p == n).map_or("", |(p, ..)| *p);
+                self.open_panel(id)
+            }
+            _ => Self::user_text(&slash(name, args)),
+        })
+    }
+
+    /// `/plan [open|<description>]`, as Claude's TUI runs it: outside plan
+    /// mode it enters plan mode, then sends the description as the first
+    /// prompt; in plan mode it shows the plan. `open` (the plan file in a
+    /// local editor) shows the plan too; `share` (Ultraplan) has no headless
+    /// equivalent.
+    fn plan(&mut self, args: &str) -> Result<Vec<u8>, DriverError> {
+        let planning = self
+            .options
+            .iter()
+            .find(|o| o.id == OptionId::Permission)
+            .and_then(|o| o.current.as_deref())
+            == Some("plan");
+        let view = args.is_empty() || args == "open";
+        Ok(match (planning, view) {
+            _ if args == "share" => {
+                return Err(DriverError::Unsupported {
+                    harness: Harness::Claude,
+                    what: "sharing a plan with Ultraplan",
+                });
+            }
+            (true, true) => self.open_panel("plan"),
+            (true, false) => Self::user_text(args),
+            (false, view) => self.control(
+                json!({"subtype": "set_permission_mode", "mode": "plan"}),
+                Pending::Plan {
+                    prompt: (!view).then(|| args.to_owned()),
+                    view: args == "open",
+                },
+            ),
+        })
+    }
+
+    /// Asks for the data behind panel `id`.
+    fn open_panel(&mut self, id: &'static str) -> Vec<u8> {
+        let subtype = match id {
+            "plan" => Some("get_plan"),
+            _ => PANELS.iter().find(|(p, ..)| *p == id).map(|(.., s)| *s),
+        };
+        match subtype {
+            Some(subtype) => self.control(json!({"subtype": subtype}), Pending::Panel(id)),
+            None => Vec::new(),
+        }
     }
 
     /// Rebuilds option definitions from the model list, keeping current values.
@@ -893,7 +1368,19 @@ impl ClaudeDriver {
             ("deny", _) => json!({"behavior": "deny", "message": "The user denied this request."}),
             (_, Some(question)) => {
                 let mut input = p.input.clone();
-                input["answers"] = json!({ question.as_str(): option_id });
+                let answers = crate::question::decode(option_id);
+                let questions = crate::question::parse(&p.input);
+                let mut map = serde_json::Map::new();
+                if questions.is_empty() {
+                    map.insert(question.clone(), json!(answers.concat().join(", ")));
+                }
+                // Several picks to one question are joined, as Claude's own UI does.
+                for (q, a) in questions.iter().zip(&answers) {
+                    if !a.is_empty() {
+                        map.insert(q.question.clone(), json!(a.join(", ")));
+                    }
+                }
+                input["answers"] = Value::Object(map);
                 json!({"behavior": "allow", "updatedInput": input})
             }
             ("allow", None) => json!({"behavior": "allow", "updatedInput": p.input}),
@@ -933,6 +1420,10 @@ impl Driver for ClaudeDriver {
         Harness::Claude
     }
 
+    fn snapshot(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+
     fn launch(&self, resume: Option<&str>) -> LaunchSpec {
         let mut spec = Harness::Claude.launch(resume);
         if let Some(model) = &self.config.model {
@@ -949,6 +1440,14 @@ impl Driver for ClaudeDriver {
 
     fn handshake(&mut self) -> Vec<u8> {
         self.control(json!({"subtype": "initialize"}), Pending::Initialize)
+    }
+
+    /// The palette and options come from the first client's `initialize`
+    /// reply in the log; only usage and the model list are asked again.
+    fn attach_handshake(&mut self) -> Vec<u8> {
+        let mut bytes = self.control(json!({"subtype": "get_context_usage"}), Pending::Other);
+        bytes.extend(self.control(json!({"subtype": "list_models"}), Pending::Other));
+        bytes
     }
 
     fn on_output(&mut self, bytes: &[u8]) -> Vec<Event> {
@@ -976,17 +1475,19 @@ impl Driver for ClaudeDriver {
             what,
         };
         Ok(match cmd {
-            Command::Prompt { text } => Self::user_text(&text),
+            Command::Prompt { text, attachments } => {
+                validate_attachments(&attachments)?;
+                if attachments.is_empty() {
+                    Self::user_text(&text)
+                } else {
+                    Self::user_blocks(&text, &attachments)
+                }
+            }
             Command::Interrupt => self.control(json!({"subtype": "interrupt"}), Pending::Other),
             Command::Compact { hint } => Self::user_text(&slash("compact", hint.as_deref().unwrap_or(""))),
             Command::New => Self::user_text("/clear"),
             Command::Review => Self::user_text("/review"),
-            Command::Invoke { name, args } => {
-                if name == "interrupt" {
-                    return self.command(Command::Interrupt);
-                }
-                Self::user_text(&slash(&name, &args))
-            }
+            Command::Invoke { name, args } => return self.invoke(&name, &args),
             Command::Rename { name } => self.control(
                 json!({"subtype": "rename_session", "title": name}),
                 Pending::Other,
@@ -1047,6 +1548,253 @@ impl Driver for ClaudeDriver {
     }
 }
 
+/// Draws a control response as panel `id`.
+fn panel(id: &str, body: &Value) -> Panel {
+    let list = |v: &Value, key: &str| -> Vec<Value> {
+        v.get(key).and_then(Value::as_array).cloned().unwrap_or_default()
+    };
+    let text = |v: &Value, key: &str| owned(v, key).filter(|s| !s.is_empty());
+    let mut panel = Panel {
+        id: id.to_owned(),
+        ..Panel::default()
+    };
+    match id {
+        "mcp" => {
+            panel.title = "MCP servers".into();
+            let rows = list(body, "mcpServers")
+                .iter()
+                .filter_map(|s| {
+                    let name = owned(s, "name")?;
+                    let status = owned(s, "status").unwrap_or_default();
+                    let kind = s.get("config").and_then(|c| owned(c, "type"));
+                    let detail = [owned(s, "scope"), kind, text(s, "error")]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    let toggle = if status == "disabled" { "enable" } else { "disable" };
+                    let mut actions = vec![PanelAction::new("Reconnect", "mcp", format!("reconnect {name}"))];
+                    actions.push(PanelAction {
+                        destructive: toggle == "disable",
+                        ..PanelAction::new(capitalize(toggle), "mcp", format!("{toggle} {name}"))
+                    });
+                    Some(PanelRow {
+                        label: name,
+                        value: Some(status),
+                        detail: Some(detail).filter(|d| !d.is_empty()),
+                        actions,
+                    })
+                })
+                .collect();
+            panel.sections.push(PanelSection {
+                rows,
+                ..PanelSection::default()
+            });
+        }
+        "status" => {
+            panel.title = "Status".into();
+            panel.sections = list(body, "sections")
+                .iter()
+                .map(|sec| PanelSection {
+                    title: text(sec, "title"),
+                    rows: list(sec, "rows")
+                        .iter()
+                        .map(|r| PanelRow {
+                            label: owned(r, "label").unwrap_or_default(),
+                            value: owned(r, "value"),
+                            ..PanelRow::default()
+                        })
+                        .collect(),
+                    ..PanelSection::default()
+                })
+                .collect();
+        }
+        "permissions" => {
+            panel.title = "Permission rules".into();
+            let state = body.get("state").unwrap_or(body);
+            let rules = list(state, "rules");
+            for (behavior, title) in [("allow", "Allow"), ("ask", "Ask"), ("deny", "Deny")] {
+                let rows: Vec<PanelRow> = rules
+                    .iter()
+                    .filter(|r| str_at(r, "behavior") == Some(behavior))
+                    .map(|r| PanelRow {
+                        label: owned(r, "rule").unwrap_or_default(),
+                        value: owned(r, "source"),
+                        detail: r.get("description").map(|d| {
+                            ["prefix", "emphasis", "suffix"]
+                                .iter()
+                                .filter_map(|k| str_at(d, k))
+                                .collect::<String>()
+                        }),
+                        actions: Vec::new(),
+                    })
+                    .collect();
+                if !rows.is_empty() {
+                    panel.sections.push(PanelSection {
+                        title: Some(title.into()),
+                        rows,
+                        ..PanelSection::default()
+                    });
+                }
+            }
+            let dirs: Vec<PanelRow> = list(state, "workspaceDirectories")
+                .iter()
+                .filter_map(|d| {
+                    Some(PanelRow {
+                        label: owned(d, "path")?,
+                        value: owned(d, "source"),
+                        ..PanelRow::default()
+                    })
+                })
+                .collect();
+            if !dirs.is_empty() {
+                panel.sections.push(PanelSection {
+                    title: Some("Additional directories".into()),
+                    rows: dirs,
+                    ..PanelSection::default()
+                });
+            }
+        }
+        "memory" => {
+            panel.title = "Memory".into();
+            let files = list(body, "files")
+                .iter()
+                .filter_map(|f| {
+                    Some(PanelRow {
+                        label: owned(f, "label")?,
+                        value: Some(if f.get("exists").and_then(Value::as_bool) == Some(true) {
+                            "present".into()
+                        } else {
+                            "not created".into()
+                        }),
+                        detail: owned(f, "path"),
+                        actions: Vec::new(),
+                    })
+                })
+                .collect();
+            panel.sections.push(PanelSection {
+                title: Some("Files".into()),
+                rows: files,
+                ..PanelSection::default()
+            });
+            let auto: Vec<PanelRow> = [("auto_memory", "Auto-memory"), ("auto_dream", "Auto-dream")]
+                .iter()
+                .filter_map(|(key, label)| {
+                    let v = body.get(*key)?;
+                    Some(PanelRow {
+                        label: (*label).into(),
+                        value: owned(v, "status"),
+                        detail: text(v, "detail"),
+                        actions: Vec::new(),
+                    })
+                })
+                .collect();
+            if !auto.is_empty() {
+                panel.sections.push(PanelSection {
+                    rows: auto,
+                    ..PanelSection::default()
+                });
+            }
+        }
+        "plan" => {
+            panel.title = "Plan".into();
+            let rows = match owned(body, "content").filter(|c| !c.trim().is_empty()) {
+                Some(content) => plan_rows(&content),
+                None => vec![PanelRow {
+                    label: "No plan written yet".into(),
+                    ..PanelRow::default()
+                }],
+            };
+            panel.sections.push(PanelSection {
+                title: text(body, "path"),
+                rows,
+                ..PanelSection::default()
+            });
+        }
+        "hooks" => {
+            panel.title = "Hooks".into();
+            let hooks = list(body, "hooks");
+            let mut events: Vec<String> = Vec::new();
+            for h in &hooks {
+                if let Some(e) = owned(h, "event")
+                    && !events.contains(&e)
+                {
+                    events.push(e);
+                }
+            }
+            panel.sections = events
+                .into_iter()
+                .map(|event| PanelSection {
+                    rows: hooks
+                        .iter()
+                        .filter(|h| str_at(h, "event") == Some(event.as_str()))
+                        .map(|h| PanelRow {
+                            label: owned(h, "displayText").unwrap_or_default(),
+                            value: text(h, "matcher"),
+                            detail: owned(h, "sourceLabel"),
+                            actions: Vec::new(),
+                        })
+                        .collect(),
+                    title: Some(event),
+                    actions: Vec::new(),
+                })
+                .collect();
+        }
+        _ => {}
+    }
+    panel
+}
+
+/// A plan's markdown as panel rows: one per heading, with the text under it
+/// as the detail. Text before the first heading is the "Plan" row.
+fn plan_rows(markdown: &str) -> Vec<PanelRow> {
+    let mut rows: Vec<PanelRow> = Vec::new();
+    let mut body = String::new();
+    let mut label = "Plan".to_owned();
+    let flush = |rows: &mut Vec<PanelRow>, label: &str, body: &mut String| {
+        let detail = body.trim();
+        if !detail.is_empty() || label != "Plan" {
+            rows.push(PanelRow {
+                label: label.to_owned(),
+                detail: Some(detail.to_owned()).filter(|d| !d.is_empty()),
+                ..PanelRow::default()
+            });
+        }
+        body.clear();
+    };
+    let mut fenced = false;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        let heading = (!fenced)
+            .then(|| line.strip_prefix('#'))
+            .flatten()
+            .map(|rest| rest.trim_start_matches('#'))
+            .filter(|rest| rest.starts_with(' '))
+            .map(str::trim);
+        match heading {
+            Some(h) => {
+                flush(&mut rows, &label, &mut body);
+                label = h.to_owned();
+            }
+            None => {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+    }
+    flush(&mut rows, &label, &mut body);
+    rows
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
 fn slash(name: &str, args: &str) -> String {
     let name = name.trim_start_matches('/');
     if args.trim().is_empty() {
@@ -1056,19 +1804,42 @@ fn slash(name: &str, args: &str) -> String {
     }
 }
 
-fn tool_kind(name: &str) -> ItemKind {
+pub(crate) fn tool_kind(name: &str) -> ItemKind {
     match name {
         "Bash" | "PowerShell" => ItemKind::CommandExecution,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ItemKind::FileChange,
+        // `Task` is what 2.0 called `Agent`.
+        "Agent" | "Task" => ItemKind::Subagent,
         _ => ItemKind::ToolCall,
     }
 }
 
-fn parent_ext(v: &Value) -> Value {
-    match v.get("parent_tool_use_id") {
-        Some(p) if !p.is_null() => json!({"parent_tool_use_id": p}),
-        _ => Value::Null,
-    }
+/// The `Agent` call a subagent's frame belongs to, when it is one.
+fn parent_of(v: &Value) -> Option<String> {
+    owned(v, "parent_tool_use_id")
+}
+
+/// A background task's report as Claude feeds it to the model (and writes
+/// it to the transcript): `<task-notification>` with the tool call, status
+/// and result. Returns the `Agent` call's id and the fields as a `task`
+/// record shaped like the stream-json `task_notification` frame.
+pub(crate) fn task_notification(text: &str) -> Option<(String, Value)> {
+    let body = text.trim_start().strip_prefix("<task-notification>")?;
+    let tag = |name: &str| {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let start = body.find(&open)? + open.len();
+        let end = body[start..].find(&close)? + start;
+        Some(body[start..end].trim().to_owned())
+    };
+    let tool = tag("tool-use-id")?;
+    let task = json!({
+        "task_id": tag("task-id"),
+        "status": tag("status"),
+        "summary": tag("result").or_else(|| tag("summary")),
+        "output_file": tag("output-file"),
+    });
+    Some((tool, task))
 }
 
 /// Output of a local slash command, which Claude echoes as a user message.

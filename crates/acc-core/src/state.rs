@@ -19,6 +19,10 @@ pub enum RunState {
         kind: BlockKind,
     },
     Done,
+    /// The turn ended, but background work the harness will report back to
+    /// the agent (a subagent launched in the background) is still running,
+    /// so another turn follows on its own (ACC-only).
+    Waiting,
     Error,
     /// The harness process is gone (ACC-only; OSC 7501 has no equivalent).
     Exited,
@@ -60,7 +64,7 @@ pub struct SessionState {
 }
 
 /// Merges observations from multiple sources into one current state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StateTracker {
     current: Option<SessionState>,
     /// After this long without an update, a lower-fidelity source may override.

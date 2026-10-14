@@ -104,7 +104,12 @@ fn harnesses() -> ExitCode {
                     .to_owned()
             });
         match version {
-            Some(v) => println!("{:<10} {:<9} {v}", h.id(), h.program()),
+            Some(v) => println!(
+                "{:<10} {:<9} {v}{}",
+                h.id(),
+                h.program(),
+                doctor::compat_note(h, &v)
+            ),
             None => println!("{:<10} {:<9} (not found)", h.id(), h.program()),
         }
     }
