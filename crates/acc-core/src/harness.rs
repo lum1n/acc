@@ -29,8 +29,6 @@ pub enum Protocol {
     Acp,
     /// pi `--mode rpc` NDJSON commands and events.
     PiRpc,
-    /// opencode `serve` HTTP + SSE.
-    OpencodeHttp,
 }
 
 /// How to start a harness headless. Paths and flags are resolved on the host.
@@ -140,9 +138,8 @@ impl Harness {
         match self {
             Harness::Claude => Protocol::ClaudeStreamJson,
             Harness::Codex => Protocol::CodexAppServer,
-            Harness::Cursor | Harness::Copilot => Protocol::Acp,
+            Harness::Cursor | Harness::Copilot | Harness::Opencode => Protocol::Acp,
             Harness::Pi => Protocol::PiRpc,
-            Harness::Opencode => Protocol::OpencodeHttp,
         }
     }
 
@@ -182,8 +179,6 @@ impl Harness {
                 )
             }
             Harness::Codex => (s(&["app-server"]), vec![]),
-            Harness::Cursor => (s(&["acp"]), vec![]),
-            Harness::Copilot => (s(&["--acp"]), vec![]),
             Harness::Pi => {
                 let mut a = s(&["--mode", "rpc"]);
                 if let Some(path) = resume {
@@ -191,7 +186,9 @@ impl Harness {
                 }
                 (a, vec![("PI_PROGRAM_STATUS".into(), "1".into())])
             }
-            Harness::Opencode => (s(&["serve", "--hostname", "127.0.0.1"]), vec![]),
+            h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode) => {
+                return crate::acp::launch_spec(h, None);
+            }
         };
         LaunchSpec {
             program: self.program().to_owned(),
@@ -336,6 +333,16 @@ mod tests {
             .unwrap_or_default();
         // Whatever is installed here, every line must parse.
         assert_eq!(parse_probe(&out).len(), out.lines().count());
+    }
+
+    #[test]
+    fn acp_harnesses_launch_over_acp() {
+        for h in Harness::ALL.into_iter().filter(|h| h.native_acp()) {
+            let spec = h.launch(None);
+            assert_eq!(spec, crate::acp::launch_spec(h, None));
+            assert_eq!(spec.protocol, h.preferred_protocol());
+        }
+        assert_eq!(Harness::Opencode.launch(None).args, ["acp"]);
     }
 
     #[test]

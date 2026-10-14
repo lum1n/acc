@@ -33,17 +33,16 @@ every protocol is tested by replaying recorded sessions.
 
 ## Driving harnesses
 
-| Harness | Primary protocol | Fallback |
-|---|---|---|
-| Claude Code | `-p --input-format stream-json --output-format stream-json` | — |
-| Codex | `app-server` JSON-RPC | `exec --json` |
-| Cursor Agent | ACP (`agent acp`) | `-p --output-format stream-json` |
-| Copilot CLI | ACP (`--acp`) | SDK protocol |
-| pi | `--mode rpc` | — |
-| opencode | `serve` HTTP + SSE | ACP (`opencode acp`) |
+| Harness | Protocol |
+|---|---|
+| Claude Code | `-p --input-format stream-json --output-format stream-json` |
+| Codex | `app-server` JSON-RPC |
+| Cursor Agent | ACP (`agent acp`) |
+| Copilot CLI | ACP (`--acp`) |
+| pi | `--mode rpc` |
+| opencode | ACP (`opencode acp`) |
 
-Drivers pin the harness versions they support and fall back to ACP or observe-only for unknown
-versions. Unknown events are kept as `Event::Unrecognized`, never fatal.
+Unknown events are kept as `Event::Unrecognized`, never fatal.
 
 **Images.** `Command::Prompt` and `LaunchRequest` carry `Attachment`s: images inline as base64, so
 nothing is copied to the host first and the bytes ride the same stdin path as text. Every
