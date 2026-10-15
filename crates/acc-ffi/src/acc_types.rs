@@ -10,13 +10,17 @@ use acc_core::command::{
 };
 use acc_core::detached::{FeedEntry, FeedPath, Listing, Status};
 use acc_core::event::{
-    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
+    Quota, QuotaWindow, Usage,
 };
 use acc_core::harness::{Availability, Compat, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag};
+use acc_core::policy::{Decision, Rule};
 use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
 use acc_core::transcript::{Item, ItemChange, ItemStatus};
+use acc_core::usage::{AccountUsage, Bucket, DayUsage, HarnessSpend, Spend, UsageRecord, UsageRollup};
+use acc_core::watch::{Hook, HostEvent, HostState};
 use acc_core::{Exec, Harness};
 use serde_json::Value;
 
@@ -54,6 +58,18 @@ mirror_enum!(AccLineTag <=> LineTag { Context, Add, Remove });
 mirror_enum!(
     /// A harness version against the range ACC was tested with.
     AccCompat <=> Compat { Tested, Newer, Older, Unknown }
+);
+mirror_enum!(
+    /// What answering with a permission option does.
+    AccPermissionOptionKind <=> PermissionOptionKind { AllowOnce, AllowAlways, RejectOnce, RejectAlways }
+);
+mirror_enum!(
+    /// What a session follower recorded.
+    AccHostState <=> HostState { Blocked, Done, Error, Exited }
+);
+mirror_enum!(
+    /// Whether a policy rule allows or denies.
+    AccDecision <=> Decision { Allow, Deny }
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -104,6 +120,8 @@ impl From<SessionState> for AccSessionState {
 pub struct AccPermissionOption {
     pub id: String,
     pub label: String,
+    /// What it does, when the harness says.
+    pub kind: Option<AccPermissionOptionKind>,
 }
 
 impl From<PermissionOption> for AccPermissionOption {
@@ -111,6 +129,7 @@ impl From<PermissionOption> for AccPermissionOption {
         Self {
             id: o.id,
             label: o.label,
+            kind: o.kind.map(Into::into),
         }
     }
 }
@@ -192,6 +211,26 @@ impl From<Quota> for AccQuota {
                 .windows
                 .into_iter()
                 .map(|w: QuotaWindow| AccQuotaWindow {
+                    id: w.id,
+                    used_percent: w.used_percent,
+                    window_minutes: w.window_minutes,
+                    resets_at: w.resets_at,
+                    status: w.status,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<AccQuota> for Quota {
+    fn from(q: AccQuota) -> Self {
+        Self {
+            account: q.account,
+            plan: q.plan,
+            windows: q
+                .windows
+                .into_iter()
+                .map(|w| QuotaWindow {
                     id: w.id,
                     used_percent: w.used_percent,
                     window_minutes: w.window_minutes,
@@ -774,6 +813,13 @@ pub enum AccCommand {
         args: String,
     },
     Refresh,
+    /// Continue the conversation in another harness on the same directory:
+    /// answered with `AccOutbound.Relaunch`, primed with the conversation so
+    /// far and `prompt` as the user's next message.
+    Handoff {
+        harness: AccHarness,
+        prompt: Option<String>,
+    },
 }
 
 impl From<AccCommand> for Command {
@@ -800,6 +846,10 @@ impl From<AccCommand> for Command {
             },
             AccCommand::Invoke { name, args } => Command::Invoke { name, args },
             AccCommand::Refresh => Command::Refresh,
+            AccCommand::Handoff { harness, prompt } => Command::Handoff {
+                harness: harness.into(),
+                prompt,
+            },
         }
     }
 }
@@ -909,6 +959,9 @@ pub struct AccLaunchRequest {
     /// Start inside a taken-over TUI's wrapper (sandbox) with its flags.
     #[uniffi(default = None)]
     pub launcher: Option<AccLauncher>,
+    /// The git worktree `cwd` is in (from `worktree_add_exec`).
+    #[uniffi(default = None)]
+    pub worktree: Option<String>,
 }
 
 impl From<AccLaunchRequest> for LaunchRequest {
@@ -927,6 +980,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),
             launcher: r.launcher.map(Into::into),
+            worktree: r.worktree,
         }
     }
 }
@@ -947,6 +1001,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),
             launcher: r.launcher.map(Into::into),
+            worktree: r.worktree,
         }
     }
 }
@@ -966,6 +1021,8 @@ pub struct AccSessionSpec {
     pub origin: AccOrigin,
     /// Set when the harness runs in a taken-over TUI's wrapper (sandbox).
     pub launcher: Option<AccLauncher>,
+    /// The session's git worktree, when it has one.
+    pub worktree: Option<String>,
     /// The full spec, to persist and pass back to `AccSession.attach`.
     pub json: String,
 }
@@ -984,6 +1041,7 @@ impl From<&SessionSpec> for AccSessionSpec {
             parent: s.parent.clone(),
             origin: s.origin.clone().into(),
             launcher: s.launcher.clone().map(Into::into),
+            worktree: s.worktree.clone(),
             json: s.to_json(),
         }
     }
@@ -1058,6 +1116,10 @@ pub enum AccFeedPath {
     SessionExit {
         id: String,
     },
+    /// The events a follower (`AccSession.watch_exec`) recorded.
+    SessionEvents {
+        id: String,
+    },
     /// Any file, such as a harness transcript (`~/` is expanded).
     File {
         path: String,
@@ -1078,6 +1140,7 @@ impl From<AccFeedEntry> for FeedEntry {
             path: match e.path {
                 AccFeedPath::SessionLog { id } => FeedPath::SessionLog(id),
                 AccFeedPath::SessionExit { id } => FeedPath::SessionExit(id),
+                AccFeedPath::SessionEvents { id } => FeedPath::SessionEvents(id),
                 AccFeedPath::File { path } => FeedPath::File(path),
             },
             offset: e.offset,
@@ -1110,6 +1173,253 @@ impl From<Availability> for AccAvailability {
             path: a.path,
             version: a.version,
             compat: a.compat.into(),
+        }
+    }
+}
+
+/// Tokens and cost spent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, uniffi::Record)]
+pub struct AccSpend {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+}
+
+impl From<Spend> for AccSpend {
+    fn from(s: Spend) -> Self {
+        Self {
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            cache_read_tokens: s.cache_read_tokens,
+            cache_write_tokens: s.cache_write_tokens,
+            cost_usd: s.cost_usd,
+        }
+    }
+}
+
+impl From<AccSpend> for Spend {
+    fn from(s: AccSpend) -> Self {
+        Self {
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            cache_read_tokens: s.cache_read_tokens,
+            cache_write_tokens: s.cache_write_tokens,
+            cost_usd: s.cost_usd,
+        }
+    }
+}
+
+/// What was spent in one quarter of an hour.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AccBucket {
+    /// Start of the window, ms since the Unix epoch.
+    pub start_ms: u64,
+    pub spend: AccSpend,
+}
+
+/// One session's usage for `roll_up_usage`. Keep these for sessions that
+/// are gone, so the day's totals still count them.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccUsageRecord {
+    pub session_id: String,
+    pub harness: AccHarness,
+    pub buckets: Vec<AccBucket>,
+    pub quota: Option<AccQuota>,
+    /// When the session reported `quota`, ms since the Unix epoch.
+    pub quota_at_ms: Option<u64>,
+}
+
+impl From<UsageRecord> for AccUsageRecord {
+    fn from(r: UsageRecord) -> Self {
+        Self {
+            session_id: r.session_id,
+            harness: r.harness.into(),
+            buckets: r
+                .buckets
+                .into_iter()
+                .map(|b| AccBucket {
+                    start_ms: b.start_ms,
+                    spend: b.spend.into(),
+                })
+                .collect(),
+            quota: r.quota.map(Into::into),
+            quota_at_ms: r.quota_at_ms,
+        }
+    }
+}
+
+impl From<AccUsageRecord> for UsageRecord {
+    fn from(r: AccUsageRecord) -> Self {
+        Self {
+            session_id: r.session_id,
+            harness: r.harness.into(),
+            buckets: r
+                .buckets
+                .into_iter()
+                .map(|b| Bucket {
+                    start_ms: b.start_ms,
+                    spend: b.spend.into(),
+                })
+                .collect(),
+            quota: r.quota.map(Into::into),
+            quota_at_ms: r.quota_at_ms,
+        }
+    }
+}
+
+/// Spending on one account (or plan, when the harness names no account).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccAccountUsage {
+    pub harness: AccHarness,
+    pub account: Option<String>,
+    pub plan: Option<String>,
+    pub sessions: u32,
+    pub spend: AccSpend,
+    /// The newest reading of each quota window its sessions reported.
+    pub quota: Option<AccQuota>,
+}
+
+impl From<AccountUsage> for AccAccountUsage {
+    fn from(a: AccountUsage) -> Self {
+        Self {
+            harness: a.harness.into(),
+            account: a.account,
+            plan: a.plan,
+            sessions: a.sessions,
+            spend: a.spend.into(),
+            quota: a.quota.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AccHarnessSpend {
+    pub harness: AccHarness,
+    pub spend: AccSpend,
+}
+
+/// Spending on one local day.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccDayUsage {
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub spend: AccSpend,
+    pub harnesses: Vec<AccHarnessSpend>,
+}
+
+impl From<DayUsage> for AccDayUsage {
+    fn from(d: DayUsage) -> Self {
+        Self {
+            date: d.date,
+            spend: d.spend.into(),
+            harnesses: d
+                .harnesses
+                .into_iter()
+                .map(|HarnessSpend { harness, spend }| AccHarnessSpend {
+                    harness: harness.into(),
+                    spend: spend.into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Spending across sessions.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccUsageRollup {
+    pub total: AccSpend,
+    pub accounts: Vec<AccAccountUsage>,
+    /// Oldest first.
+    pub days: Vec<AccDayUsage>,
+}
+
+impl From<UsageRollup> for AccUsageRollup {
+    fn from(r: UsageRollup) -> Self {
+        Self {
+            total: r.total.into(),
+            accounts: r.accounts.into_iter().map(Into::into).collect(),
+            days: r.days.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// One permission rule; every field given must match (see `AccSession.set_policy`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPolicyRule {
+    pub decision: AccDecision,
+    /// The harness's tool name or `shell`, `edit`, `read`, `fetch`, `mcp`.
+    pub tool: Option<String>,
+    /// Glob over the files the tool acts on, relative to the session's directory.
+    pub path: Option<String>,
+    /// A shell command's start, in whole words.
+    pub command: Option<String>,
+}
+
+impl From<AccPolicyRule> for Rule {
+    fn from(r: AccPolicyRule) -> Self {
+        Self {
+            decision: r.decision.into(),
+            tool: r.tool,
+            path: r.path,
+            command: r.command,
+        }
+    }
+}
+
+/// The settings file with the rules added, as a script, and the rules the
+/// harness has no way to say (their indexes).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccSettingsWrite {
+    pub exec: AccExec,
+    pub skipped: Vec<u32>,
+}
+
+/// What a session follower runs for every event, with the event's JSON
+/// line on stdin.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum AccHook {
+    /// A shell command on the host, with `ACC_SESSION` and `ACC_STATE` set.
+    Command { command: String },
+    /// Posted as JSON with `curl` (or `wget`).
+    Webhook { url: String },
+}
+
+impl From<AccHook> for Hook {
+    fn from(h: AccHook) -> Self {
+        match h {
+            AccHook::Command { command } => Hook::Command { command },
+            AccHook::Webhook { url } => Hook::Webhook { url },
+        }
+    }
+}
+
+/// One event a session follower recorded while no client was connected.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccHostEvent {
+    /// Seconds since the Unix epoch, by the host's clock.
+    pub at: u64,
+    pub session: String,
+    pub state: AccHostState,
+    pub kind: Option<AccBlockKind>,
+    /// The tool, command or dialog title, when the log says.
+    pub detail: Option<String>,
+    pub code: Option<i32>,
+    /// The session log's length at the time.
+    pub offset: u64,
+}
+
+impl From<HostEvent> for AccHostEvent {
+    fn from(e: HostEvent) -> Self {
+        Self {
+            at: e.at,
+            session: e.session,
+            state: e.state.into(),
+            kind: e.kind.map(Into::into),
+            detail: e.detail,
+            code: e.code,
+            offset: e.offset,
         }
     }
 }

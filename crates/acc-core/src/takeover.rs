@@ -176,6 +176,7 @@ impl Takeover {
                     transcript: self.agent.transcript.as_ref().map(|t| t.path.clone()),
                 },
                 launcher: self.agent.launcher.clone(),
+                worktree: None,
             },
         }
     }

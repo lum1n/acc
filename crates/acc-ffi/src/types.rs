@@ -286,6 +286,8 @@ impl From<core_ev::ItemKind> for ItemKind {
 pub struct PermissionOption {
     pub id: String,
     pub label: String,
+    /// What it does, when the harness says.
+    pub kind: Option<crate::acc_types::AccPermissionOptionKind>,
 }
 
 /// Token, cost and context usage as reported by the harness itself.
@@ -484,6 +486,7 @@ impl From<core_ev::Event> for Event {
                     .map(|o| PermissionOption {
                         id: o.id,
                         label: o.label,
+                        kind: o.kind.map(Into::into),
                     })
                     .collect(),
             },
@@ -598,6 +601,12 @@ pub enum Command {
         args: String,
     },
     Refresh,
+    /// Continue in another harness; only a detached `AccSession` can
+    /// (it answers with a relaunch).
+    Handoff {
+        harness: Harness,
+        prompt: Option<String>,
+    },
 }
 
 impl From<Command> for core_cmd::Command {
@@ -627,6 +636,10 @@ impl From<Command> for core_cmd::Command {
             },
             Command::Invoke { name, args } => Self::Invoke { name, args },
             Command::Refresh => Self::Refresh,
+            Command::Handoff { harness, prompt } => Self::Handoff {
+                harness: harness.into(),
+                prompt,
+            },
         }
     }
 }

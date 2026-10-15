@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use acc_core::detached::{self, FanInParser, FeedEntry};
 use acc_core::harness;
 use acc_core::item;
+use acc_core::policy::{self, Policy};
 use acc_core::session::{self, Session, SessionError, SessionSpec};
+use acc_core::worktree;
 
 use crate::AccError;
 use crate::acc_types::*;
@@ -115,6 +117,21 @@ impl AccSession {
         lock(&self.inner).kill_exec().into()
     }
 
+    /// Starts a follower on the host that records approvals, finished
+    /// turns, errors and the exit in the session's events while no client is
+    /// connected, running `hook` for each. Run again after a relaunch, or to
+    /// change the hook.
+    pub fn watch_exec(&self, hook: Option<AccHook>) -> AccExec {
+        let hook = hook.map(Into::into);
+        lock(&self.inner).watch_exec(hook.as_ref()).into()
+    }
+
+    /// Prints the follower's events from byte `offset` (see
+    /// `parse_session_events`).
+    pub fn events_exec(&self, offset: u64) -> AccExec {
+        lock(&self.inner).events_exec(offset).into()
+    }
+
     pub fn remove_exec(&self) -> AccExec {
         lock(&self.inner).remove_exec().into()
     }
@@ -214,6 +231,38 @@ impl AccSession {
         lock(&self.inner).quota().cloned().map(Into::into)
     }
 
+    /// Answers approvals by these rules from now on, including any waiting
+    /// (deny wins over allow; questions are left to the user). Set it on one
+    /// client per session. An empty list stops.
+    pub fn set_policy(&self, rules: Vec<AccPolicyRule>) -> Vec<AccUpdate> {
+        let policy = (!rules.is_empty()).then(|| Policy {
+            rules: rules.into_iter().map(Into::into).collect(),
+        });
+        convert(lock(&self.inner).set_policy(policy))
+    }
+
+    /// Prints what the session changed in its worktree as a `git diff`
+    /// (parse it with `parse_unified_diff`).
+    pub fn worktree_diff_exec(&self) -> Result<AccExec, AccError> {
+        Ok(lock(&self.inner).worktree_diff_exec()?.into())
+    }
+
+    /// Commits the worktree's changes and merges them into the branch
+    /// checked out in the repository; exits 7 on a conflict.
+    pub fn worktree_merge_exec(&self, message: String, squash: bool) -> Result<AccExec, AccError> {
+        Ok(lock(&self.inner).worktree_merge_exec(&message, squash)?.into())
+    }
+
+    /// Stops the harness and deletes the worktree with its branch.
+    pub fn worktree_discard_exec(&self) -> Result<AccExec, AccError> {
+        Ok(lock(&self.inner).worktree_discard_exec()?.into())
+    }
+
+    /// What the session spent over time, for `roll_up_usage`.
+    pub fn usage_record(&self) -> AccUsageRecord {
+        lock(&self.inner).usage_record().into()
+    }
+
     pub fn permissions(&self) -> Vec<AccPermission> {
         lock(&self.inner)
             .permissions()
@@ -296,6 +345,15 @@ pub fn parse_session_status(stdout: String) -> Option<AccStatus> {
     detached::parse_status(&stdout).map(Into::into)
 }
 
+/// Parses a follower's events (from `events_exec` or a `SessionEvents` feed).
+#[uniffi::export]
+pub fn parse_session_events(stdout: String) -> Vec<AccHostEvent> {
+    acc_core::watch::parse_events(&stdout)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
 /// Finds the installed harnesses (login `PATH`, with versions).
 #[uniffi::export]
 pub fn probe_exec() -> AccExec {
@@ -316,6 +374,60 @@ pub fn resolve_dir_exec(dir: String) -> AccExec {
     AccExec::script(session::resolve_dir_script(&dir))
 }
 
+/// Makes git worktree `name` (use the session id) for the repository `cwd`
+/// is in, from `base` (default `HEAD`), and prints the directory to launch
+/// in with `AccLaunchRequest.worktree = name`. Exits 6 outside a repository.
+#[uniffi::export]
+pub fn worktree_add_exec(cwd: String, name: String, base: Option<String>) -> Result<AccExec, AccError> {
+    if !worktree::valid_name(&name) {
+        return Err(SessionError::InvalidWorktree(name).into());
+    }
+    Ok(AccExec::script(worktree::add_script(
+        &cwd,
+        &name,
+        base.as_deref(),
+    )))
+}
+
+/// Prints `harness`'s permission settings for a session in `cwd`, for
+/// `permission_settings_write_exec`. `None` for Copilot and pi.
+#[uniffi::export]
+pub fn permission_settings_read_exec(harness: AccHarness, cwd: String) -> Option<AccExec> {
+    policy::settings_read_script(harness.into(), &cwd).map(AccExec::script)
+}
+
+/// Adds `rules` to the settings `existing` (from
+/// `permission_settings_read_exec`) and writes them back, so the harness
+/// stops asking: Claude, Codex, Cursor and opencode.
+#[uniffi::export]
+pub fn permission_settings_write_exec(
+    harness: AccHarness,
+    cwd: String,
+    existing: String,
+    rules: Vec<AccPolicyRule>,
+) -> Result<AccSettingsWrite, AccError> {
+    let h = harness.into();
+    let rules: Vec<_> = rules.into_iter().map(Into::into).collect();
+    let (text, skipped) = policy::merge_settings(h, &existing, &rules).map_err(|e| match e {
+        policy::SettingsError::Unsupported(_) => AccError::Unsupported {
+            reason: e.to_string(),
+        },
+        policy::SettingsError::Unreadable(_) => AccError::InvalidArgument {
+            reason: e.to_string(),
+        },
+    })?;
+    let script = policy::settings_write_script(h, &cwd).ok_or_else(|| AccError::Unsupported {
+        reason: format!("{h:?} has no permission settings"),
+    })?;
+    Ok(AccSettingsWrite {
+        exec: AccExec {
+            script,
+            stdin: text.into_bytes(),
+        },
+        skipped: skipped.into_iter().map(|i| i as u32).collect(),
+    })
+}
+
 /// A session id from at least 15 random bytes supplied by the caller.
 #[uniffi::export]
 pub fn new_session_id(harness: AccHarness, entropy: Vec<u8>) -> String {
@@ -329,6 +441,14 @@ pub fn parse_unified_diff(text: String) -> Vec<AccFileDiff> {
         .into_iter()
         .map(Into::into)
         .collect()
+}
+
+/// Adds sessions' usage up per account and per local day;
+/// `utc_offset_minutes` is the time zone days are split in (120 for UTC+2).
+#[uniffi::export]
+pub fn roll_up_usage(records: Vec<AccUsageRecord>, utc_offset_minutes: i32) -> AccUsageRollup {
+    let records: Vec<_> = records.into_iter().map(Into::into).collect();
+    acc_core::usage::roll_up(&records, utc_offset_minutes).into()
 }
 
 /// Display name of a harness.
@@ -360,6 +480,7 @@ mod tests {
             replaces_parent: false,
             origin: AccOrigin::Started,
             launcher: None,
+            worktree: None,
         };
         let id = new_session_id(AccHarness::Claude, vec![7; 15]);
         let s = AccSession::launch(req, id, "ph".into(), 1).unwrap();
@@ -399,6 +520,7 @@ mod tests {
             replaces_parent: false,
             origin: AccOrigin::Started,
             launcher: None,
+            worktree: None,
         };
         let id = new_session_id(AccHarness::Claude, vec![8; 15]);
         let s = AccSession::launch(req, id, "ph".into(), 1).unwrap();
@@ -449,6 +571,7 @@ mod tests {
             replaces_parent: false,
             origin: AccOrigin::Started,
             launcher: None,
+            worktree: None,
         };
         let s = AccSession::launch(
             req,
@@ -493,6 +616,7 @@ mod tests {
                 replaces_parent: false,
                 origin: AccOrigin::Started,
                 launcher: None,
+                worktree: None,
             },
             new_session_id(AccHarness::Claude, vec![10; 15]),
             "ph".into(),
@@ -510,6 +634,135 @@ mod tests {
             AccSession::restore("{}".into(), spec),
             Err(AccError::InvalidSession { .. })
         ));
+    }
+
+    #[test]
+    fn usage_rolls_up_through_ffi() {
+        const WAKES: &[u8] =
+            include_bytes!("../../acc-core/tests/fixtures/claude/background-agent-wakes.ndjson");
+        let s = AccSession::launch(
+            AccLaunchRequest {
+                harness: AccHarness::Claude,
+                cwd: "/w".into(),
+                model: None,
+                permission: None,
+                resume: None,
+                fork: false,
+                title: None,
+                prompt: None,
+                attachments: vec![],
+                parent: None,
+                replaces_parent: false,
+                origin: AccOrigin::Started,
+                launcher: None,
+                worktree: None,
+            },
+            new_session_id(AccHarness::Claude, vec![11; 15]),
+            "ph".into(),
+            1_792_018_800_000,
+        )
+        .unwrap();
+        let a = AccSession::attach(s.spec().json, "desk".into()).unwrap();
+        a.on_status(format!("exited 0 {}", WAKES.len()), 2);
+        a.feed(WAKES.to_vec(), 3);
+        let rollup = roll_up_usage(vec![a.usage_record()], 0);
+        assert_eq!(rollup.total.output_tokens, 335 + 75);
+        assert_eq!(rollup.days.len(), 1);
+        assert_eq!(rollup.days[0].date, "2026-10-14");
+        assert_eq!(rollup.accounts[0].harness, AccHarness::Claude);
+    }
+
+    #[test]
+    fn policy_and_settings_through_ffi() {
+        const DENY: &[u8] = include_bytes!("../../acc-core/tests/fixtures/claude/permission-deny.ndjson");
+        let open: Vec<u8> = String::from_utf8_lossy(DENY)
+            .lines()
+            .take_while(|l| !l.contains("\"tool_result\""))
+            .flat_map(|l| format!("{l}\n").into_bytes())
+            .collect();
+        let s = AccSession::launch(
+            AccLaunchRequest {
+                harness: AccHarness::Claude,
+                cwd: "/w".into(),
+                model: None,
+                permission: None,
+                resume: None,
+                fork: false,
+                title: None,
+                prompt: None,
+                attachments: vec![],
+                parent: None,
+                replaces_parent: false,
+                origin: AccOrigin::Started,
+                launcher: None,
+                worktree: None,
+            },
+            new_session_id(AccHarness::Claude, vec![12; 15]),
+            "ph".into(),
+            1,
+        )
+        .unwrap();
+        let a = AccSession::attach(s.spec().json, "desk".into()).unwrap();
+        a.on_status(format!("alive 3 {}", open.len()), 2);
+        a.feed(open, 3);
+        let waiting = a.permissions();
+        assert_eq!(waiting.len(), 1);
+        assert!(
+            waiting[0]
+                .options
+                .iter()
+                .any(|o| o.kind == Some(AccPermissionOptionKind::AllowOnce))
+        );
+        let ups = a.set_policy(vec![AccPolicyRule {
+            decision: AccDecision::Allow,
+            tool: None,
+            path: None,
+            command: None,
+        }]);
+        assert!(ups.iter().any(|u| matches!(&u.event, AccEvent::Notice { .. })));
+        assert!(a.permissions().is_empty());
+
+        let rules = vec![AccPolicyRule {
+            decision: AccDecision::Allow,
+            tool: Some("shell".into()),
+            path: None,
+            command: Some("npm test".into()),
+        }];
+        assert!(permission_settings_read_exec(AccHarness::Pi, "/w".into()).is_none());
+        let w =
+            permission_settings_write_exec(AccHarness::Claude, "/w".into(), String::new(), rules).unwrap();
+        assert!(
+            String::from_utf8(w.exec.stdin)
+                .unwrap()
+                .contains("Bash(npm test:*)")
+        );
+        assert!(w.skipped.is_empty());
+    }
+
+    #[test]
+    fn watch_and_events_through_ffi() {
+        let a = AccSession::attach(
+            acc_core::session::SessionSpec::new(
+                "w1",
+                acc_core::Harness::Codex,
+                "/w",
+                acc_core::Harness::Codex.launch(None),
+                1,
+            )
+            .to_json(),
+            "desk".into(),
+        )
+        .unwrap();
+        let w = a.watch_exec(Some(AccHook::Webhook {
+            url: "https://example.com/acc".into(),
+        }));
+        assert!(w.script.contains("h=codex") && w.script.contains("example.com/acc"));
+        assert!(a.events_exec(5).script.contains("events.ndjson"));
+        let got = parse_session_events(
+            "{\"at\":1,\"session\":\"w1\",\"state\":\"blocked\",\"kind\":\"question\",\"offset\":3}\n".into(),
+        );
+        assert_eq!(got[0].state, AccHostState::Blocked);
+        assert_eq!(got[0].kind, Some(AccBlockKind::Question));
     }
 
     #[test]

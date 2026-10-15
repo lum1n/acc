@@ -8,6 +8,7 @@ use acc_core::detached::{self, FanInParser, FeedEntry};
 use acc_core::driver::DriverError;
 use acc_core::harness;
 use acc_core::item;
+use acc_core::policy::{self, Policy, Rule};
 use acc_core::session::{self, LaunchRequest, Outbound, Session, SessionError, SessionSpec, Update};
 use serde_json::Value;
 use wasm_bindgen::prelude::*;
@@ -141,6 +142,22 @@ impl AccSession {
         self.inner.kill_exec().into()
     }
 
+    /// Starts a follower on the host that records approvals, finished
+    /// turns, errors and the exit in the session's events while no client is
+    /// connected, running `hook` (a `Hook`, or `null`) for each. Run again
+    /// after a relaunch, or to change the hook.
+    #[wasm_bindgen(js_name = watchExec)]
+    pub fn watch_exec(&self, hook: JsValue) -> Result<AccExec, JsValue> {
+        let hook: Option<acc_core::watch::Hook> = arg(hook, "hook")?;
+        Ok(self.inner.watch_exec(hook.as_ref()).into())
+    }
+
+    /// Prints the follower's events from byte `offset` (see `parseSessionEvents`).
+    #[wasm_bindgen(js_name = eventsExec)]
+    pub fn events_exec(&self, offset: f64) -> AccExec {
+        self.inner.events_exec(ms(offset)).into()
+    }
+
     #[wasm_bindgen(js_name = removeExec)]
     pub fn remove_exec(&self) -> AccExec {
         self.inner.remove_exec().into()
@@ -251,6 +268,47 @@ impl AccSession {
         js(&self.inner.quota())
     }
 
+    /// Answers approvals by these rules (a JSON array of `Rule`s) from now
+    /// on, including any waiting (deny wins over allow; questions are left
+    /// to the user). Set it on one client per session. An empty list stops.
+    /// JSON array of `Update`s.
+    #[wasm_bindgen(js_name = setPolicy)]
+    pub fn set_policy(&mut self, rules: JsValue) -> Result<JsValue, JsValue> {
+        let rules: Vec<Rule> = arg(rules, "policy rules")?;
+        let policy = (!rules.is_empty()).then_some(Policy { rules });
+        Ok(updates(self.inner.set_policy(policy)))
+    }
+
+    /// Prints what the session changed in its worktree as a `git diff`
+    /// (parse it with `parseUnifiedDiff`).
+    #[wasm_bindgen(js_name = worktreeDiffExec)]
+    pub fn worktree_diff_exec(&self) -> Result<AccExec, JsValue> {
+        Ok(self.inner.worktree_diff_exec().map_err(session_error)?.into())
+    }
+
+    /// Commits the worktree's changes and merges them into the branch
+    /// checked out in the repository; exits 7 on a conflict.
+    #[wasm_bindgen(js_name = worktreeMergeExec)]
+    pub fn worktree_merge_exec(&self, message: &str, squash: bool) -> Result<AccExec, JsValue> {
+        Ok(self
+            .inner
+            .worktree_merge_exec(message, squash)
+            .map_err(session_error)?
+            .into())
+    }
+
+    /// Stops the harness and deletes the worktree with its branch.
+    #[wasm_bindgen(js_name = worktreeDiscardExec)]
+    pub fn worktree_discard_exec(&self) -> Result<AccExec, JsValue> {
+        Ok(self.inner.worktree_discard_exec().map_err(session_error)?.into())
+    }
+
+    /// What the session spent over time (`UsageRecord`), for `rollUpUsage`.
+    #[wasm_bindgen(js_name = usageRecord)]
+    pub fn usage_record(&self) -> JsValue {
+        js(&self.inner.usage_record())
+    }
+
     pub fn permissions(&self) -> JsValue {
         js(self.inner.permissions())
     }
@@ -343,6 +401,13 @@ pub fn parse_session_status(stdout: &str) -> JsValue {
     js(&detached::parse_status(stdout))
 }
 
+/// A follower's events (from `eventsExec` or a `session_events` feed): a
+/// JSON array of `HostEvent`s.
+#[wasm_bindgen(js_name = parseSessionEvents)]
+pub fn parse_session_events(stdout: &str) -> JsValue {
+    js(&acc_core::watch::parse_events(stdout))
+}
+
 /// Finds the installed harnesses (login `PATH`, with versions).
 #[wasm_bindgen(js_name = probeExec)]
 pub fn probe_exec() -> AccExec {
@@ -361,6 +426,67 @@ pub fn resolve_dir_exec(dir: &str) -> AccExec {
     AccExec::script(session::resolve_dir_script(dir))
 }
 
+/// Makes git worktree `name` (use the session id) for the repository `cwd`
+/// is in, from `base` (default `HEAD`), and prints the directory to launch
+/// in with the request's `worktree: name`. Exits 6 outside a repository.
+#[wasm_bindgen(js_name = worktreeAddExec)]
+pub fn worktree_add_exec(cwd: &str, name: &str, base: Option<String>) -> Result<AccExec, JsValue> {
+    if !acc_core::worktree::valid_name(name) {
+        return Err(session_error(SessionError::InvalidWorktree(name.to_owned())));
+    }
+    Ok(AccExec::script(acc_core::worktree::add_script(
+        cwd,
+        name,
+        base.as_deref(),
+    )))
+}
+
+/// The settings file with the rules added, as a script, and the indexes of
+/// rules the harness has no way to say.
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Debug, Clone)]
+pub struct AccSettingsWrite {
+    pub exec: AccExec,
+    pub skipped: Vec<u32>,
+}
+
+/// Prints `harness`'s permission settings for a session in `cwd`, for
+/// `permissionSettingsWriteExec`. `undefined` for Copilot and pi.
+#[wasm_bindgen(js_name = permissionSettingsReadExec)]
+pub fn permission_settings_read_exec(harness: &str, cwd: &str) -> Result<Option<AccExec>, JsValue> {
+    Ok(policy::settings_read_script(crate::harness(harness)?, cwd).map(AccExec::script))
+}
+
+/// Adds `rules` (a JSON array of `Rule`s) to the settings `existing` (from
+/// `permissionSettingsReadExec`) and writes them back, so the harness stops
+/// asking: Claude, Codex, Cursor and opencode.
+#[wasm_bindgen(js_name = permissionSettingsWriteExec)]
+pub fn permission_settings_write_exec(
+    harness: &str,
+    cwd: &str,
+    existing: &str,
+    rules: JsValue,
+) -> Result<AccSettingsWrite, JsValue> {
+    let h = crate::harness(harness)?;
+    let rules: Vec<Rule> = arg(rules, "policy rules")?;
+    let (text, skipped) = policy::merge_settings(h, existing, &rules).map_err(|e| {
+        let kind = match e {
+            policy::SettingsError::Unsupported(_) => "Unsupported",
+            policy::SettingsError::Unreadable(_) => "InvalidArgument",
+        };
+        error(kind, &e.to_string())
+    })?;
+    let script = policy::settings_write_script(h, cwd)
+        .ok_or_else(|| error("Unsupported", &format!("{h:?} has no permission settings")))?;
+    Ok(AccSettingsWrite {
+        exec: AccExec {
+            script,
+            stdin: text.into_bytes(),
+        },
+        skipped: skipped.into_iter().map(|i| i as u32).collect(),
+    })
+}
+
 /// A session id from at least 15 random bytes supplied by the caller.
 #[wasm_bindgen(js_name = newSessionId)]
 pub fn new_session_id(harness: &str, entropy: &[u8]) -> Result<String, JsValue> {
@@ -371,6 +497,14 @@ pub fn new_session_id(harness: &str, entropy: &[u8]) -> Result<String, JsValue> 
 #[wasm_bindgen(js_name = parseUnifiedDiff)]
 pub fn parse_unified_diff(text: &str) -> JsValue {
     js(&item::parse_unified(text, ""))
+}
+
+/// Adds `UsageRecord`s up per account and per local day: a `UsageRollup`.
+/// `utc_offset_minutes` is the time zone days are split in (120 for UTC+2).
+#[wasm_bindgen(js_name = rollUpUsage)]
+pub fn roll_up_usage(records: JsValue, utc_offset_minutes: i32) -> Result<JsValue, JsValue> {
+    let records: Vec<acc_core::usage::UsageRecord> = arg(records, "usage records")?;
+    Ok(js(&acc_core::usage::roll_up(&records, utc_offset_minutes)))
 }
 
 /// Display name of a harness.

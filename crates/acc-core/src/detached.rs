@@ -10,7 +10,8 @@
 //! Layout under `$HOME/.acc/s/<session>/`:
 //! `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json` (one line, a
 //! [`crate::session::SessionSpec`]), `sent` (ids of writes already
-//! delivered) and `lock` (held while writing).
+//! delivered), `lock` (held while writing), and `events.ndjson`,
+//! `watch.pid` and `watch.tail` while a [`crate::watch`] follower runs.
 //!
 //! These functions only build scripts and parse their output; running them
 //! (locally, or over an SSH exec channel with [`crate::shell::ssh_command`])
@@ -180,6 +181,16 @@ impl SessionDir {
         format!("{}/out.ndjson", self.dir())
     }
 
+    /// Path of the session's [`crate::watch`] events, as a shell expression.
+    pub fn events_path(&self) -> String {
+        format!("{}/events.ndjson", self.dir())
+    }
+
+    /// The directory, as a shell expression.
+    pub(crate) fn dir_expr(&self) -> String {
+        self.dir()
+    }
+
     /// Path of the file the exit code is written to, as a shell expression.
     pub fn exit_path(&self) -> String {
         format!("{}/exit", self.dir())
@@ -302,7 +313,7 @@ pub fn login_path_prelude() -> &'static str {
 }
 
 /// Quotes a path, leaving a leading `~/` for the shell to expand.
-fn quote_path(path: &str) -> String {
+pub(crate) fn quote_path(path: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
         None if path == "~" => "\"$HOME\"".to_owned(),
@@ -429,6 +440,8 @@ pub enum FeedPath {
     SessionLog(String),
     /// The exit-code file of a detached session.
     SessionExit(String),
+    /// The events a [`crate::watch`] follower recorded for a detached session.
+    SessionEvents(String),
     /// Any file, such as a harness transcript (`~/` is expanded).
     File(String),
 }
@@ -458,6 +471,7 @@ pub fn fan_in_script(entries: &[FeedEntry]) -> String {
         let path = match &e.path {
             FeedPath::SessionLog(id) => SessionDir::new(id).map(|d| d.log_path()),
             FeedPath::SessionExit(id) => SessionDir::new(id).map(|d| d.exit_path()),
+            FeedPath::SessionEvents(id) => SessionDir::new(id).map(|d| d.events_path()),
             FeedPath::File(p) => Some(quote_path(p)),
         };
         if let Some(path) = path {

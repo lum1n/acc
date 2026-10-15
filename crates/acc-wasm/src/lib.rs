@@ -114,6 +114,70 @@ export interface Quota {
   windows: QuotaWindow[];
 }
 
+export type Hook = { type: "command"; command: string } | { type: "webhook"; url: string };
+
+/** One event a session follower recorded while no client was connected. */
+export interface HostEvent {
+  /** Seconds since the Unix epoch, by the host's clock. */
+  at: number;
+  session: string;
+  state: "blocked" | "done" | "error" | "exited";
+  kind?: "permission" | "question" | "auth";
+  detail?: string;
+  code?: number | null;
+  /** The session log's length at the time. */
+  offset: number;
+}
+
+export interface PermissionOption {
+  id: string;
+  label: string;
+  /** What answering with it does, when the harness says. */
+  kind?: "allow_once" | "allow_always" | "reject_once" | "reject_always";
+}
+
+export interface PolicyRule {
+  decision: "allow" | "deny";
+  /** The harness's tool name, or "shell" | "edit" | "read" | "fetch" | "mcp". */
+  tool?: string | null;
+  /** Glob over the files the tool acts on, relative to the session's directory. */
+  path?: string | null;
+  /** A shell command's start, in whole words. */
+  command?: string | null;
+}
+
+export interface Spend {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+}
+
+/** One session's spending, from `AccSession.usageRecord()`. Keep it for sessions that are gone. */
+export interface UsageRecord {
+  session_id: string;
+  harness: HarnessId;
+  /** Quarter-hour buckets, oldest first; `start_ms` is ms since the Unix epoch. */
+  buckets: { start_ms: number; spend: Spend }[];
+  quota?: Quota;
+  quota_at_ms?: number;
+}
+
+export interface UsageRollup {
+  total: Spend;
+  accounts: {
+    harness: HarnessId;
+    account: string | null;
+    plan: string | null;
+    sessions: number;
+    spend: Spend;
+    quota: Quota | null;
+  }[];
+  /** Oldest first; `date` is `YYYY-MM-DD` in the time zone given. */
+  days: { date: string; spend: Spend; harnesses: { harness: HarnessId; spend: Spend }[] }[];
+}
+
 export type Event =
   | { type: "session_started"; harness: HarnessId; native_id: string; model: string | null }
   | ({ type: "state_changed" } & SessionState)
@@ -121,7 +185,7 @@ export type Event =
   | { type: "item_delta"; id: string; text: string }
   | { type: "item_updated"; id: string; extensions?: unknown }
   | { type: "item_completed"; id: string; extensions?: unknown }
-  | { type: "permission_requested"; request_id: string; title: string; options: { id: string; label: string }[] }
+  | { type: "permission_requested"; request_id: string; title: string; options: PermissionOption[] }
   | { type: "permission_resolved"; request_id: string }
   | ({ type: "usage" } & Usage)
   | ({ type: "quota" } & Quota)
@@ -147,7 +211,8 @@ export type Command =
   | { type: "set_option"; id: OptionId; value: string }
   | { type: "answer_permission"; request_id: string; option_id: string }
   | { type: "invoke"; name: string; args: string }
-  | { type: "refresh" };
+  | { type: "refresh" }
+  | { type: "handoff"; harness: HarnessId; prompt?: string | null };
 
 export interface CommandEntry {
   name: string;

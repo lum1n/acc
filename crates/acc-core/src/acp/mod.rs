@@ -29,7 +29,7 @@ use crate::command::{
     offer_option, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemId, ItemKind, PermissionOption, Usage};
+use crate::event::{Event, ItemId, ItemKind, PermissionOption, PermissionOptionKind, Usage};
 use crate::harness::{Harness, LaunchSpec, Protocol};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -727,7 +727,14 @@ impl AcpDriver {
             .filter_map(|o| {
                 let id = o.get("optionId")?.as_str()?.to_owned();
                 let label = o.get("name").and_then(Value::as_str).unwrap_or(&id).to_owned();
-                Some(PermissionOption { id, label })
+                let kind = match o.get("kind").and_then(Value::as_str) {
+                    Some("allow_once") => Some(PermissionOptionKind::AllowOnce),
+                    Some("allow_always") => Some(PermissionOptionKind::AllowAlways),
+                    Some("reject_once") => Some(PermissionOptionKind::RejectOnce),
+                    Some("reject_always") => Some(PermissionOptionKind::RejectAlways),
+                    _ => None,
+                };
+                Some(PermissionOption { id, label, kind })
             })
             .collect();
         let title = tool
@@ -1400,6 +1407,7 @@ impl Driver for AcpDriver {
             // ACP agents push commands, options and usage as they change;
             // there is nothing to ask for.
             Command::Refresh => Ok(Vec::new()),
+            Command::Handoff { .. } => Err(self.unsupported("handoff without a relaunch")),
             Command::SetOption { id, value } => self.set_option(id, value),
             Command::AnswerPermission {
                 request_id,

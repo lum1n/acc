@@ -36,8 +36,10 @@ use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
 use crate::harness::{Harness, LaunchSpec, Launcher};
 use crate::multiplexer::Exec;
 use crate::pi::PiDriver;
+use crate::policy::{Decision, Policy, Request};
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
 use crate::transcript::{ItemChange, Transcript};
+use crate::usage::{Spending, UsageRecord};
 
 /// Version of the `spec.json` format.
 pub const SPEC_VERSION: u32 = 1;
@@ -80,6 +82,11 @@ pub struct LaunchRequest {
     /// or other wrapper, executable and flags).
     #[serde(default)]
     pub launcher: Option<Launcher>,
+    /// The git worktree `cwd` is in, made with
+    /// [`crate::worktree::add_script`], so the session can show, merge and
+    /// discard its changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 /// How a session came to be.
@@ -119,6 +126,9 @@ pub struct SessionSpec {
     /// Kept so relaunches (fork, model change) and hand-back use it too.
     #[serde(default)]
     pub launcher: Option<Launcher>,
+    /// The session's git worktree (see [`LaunchRequest::worktree`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 impl SessionSpec {
@@ -141,6 +151,7 @@ impl SessionSpec {
             parent: None,
             origin: Origin::Started,
             launcher: None,
+            worktree: None,
         }
     }
 
@@ -195,6 +206,10 @@ pub enum SessionError {
     RelativeCwd(Harness, String),
     #[error("no harness given")]
     NoHarness,
+    #[error("invalid worktree name {0:?}")]
+    InvalidWorktree(String),
+    #[error("the session has no worktree")]
+    NoWorktree,
     /// The snapshot is unreadable, from another version, or of another
     /// session. Attach afresh instead.
     #[error("unusable snapshot: {0}")]
@@ -216,8 +231,15 @@ pub struct Session {
     tracker: StateTracker,
     transcript: Transcript,
     usage: Usage,
+    /// Every [`Usage`] event added up over time, for [`crate::usage::roll_up`].
+    spending: Spending,
     quota: Option<Quota>,
+    quota_at_ms: Option<u64>,
     permissions: Vec<Permission>,
+    /// Rules this client answers approvals with (see [`Session::set_policy`]).
+    policy: Option<Policy>,
+    /// Requests the policy already answered, so a failed answer isn't retried.
+    policed: Vec<String>,
     transmit: Vec<u8>,
     /// First prompt, held until the harness has a session to take it.
     pending_prompt: Option<Command>,
@@ -240,7 +262,11 @@ struct Snapshot<'a> {
     tracker: Cow<'a, StateTracker>,
     transcript: Cow<'a, Transcript>,
     usage: Cow<'a, Usage>,
+    #[serde(default)]
+    spending: Option<Cow<'a, Spending>>,
     quota: Cow<'a, Option<Quota>>,
+    #[serde(default)]
+    quota_at_ms: Option<u64>,
     permissions: Cow<'a, [Permission]>,
     pending_prompt: Cow<'a, Option<Command>>,
     spec_dirty: bool,
@@ -326,6 +352,13 @@ impl Session {
         if harness.native_acp() && !req.cwd.starts_with('/') {
             return Err(SessionError::RelativeCwd(harness, req.cwd));
         }
+        if let Some(name) = req
+            .worktree
+            .as_deref()
+            .filter(|n| !crate::worktree::valid_name(n))
+        {
+            return Err(SessionError::InvalidWorktree(name.to_owned()));
+        }
         let mut spec = SessionSpec {
             v: SPEC_VERSION,
             id: id.to_owned(),
@@ -347,6 +380,7 @@ impl Session {
             parent: req.parent.clone(),
             origin: req.origin.clone(),
             launcher: req.launcher.clone(),
+            worktree: req.worktree.clone(),
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
@@ -387,8 +421,12 @@ impl Session {
             tracker: StateTracker::new(STALE_MS),
             transcript: Transcript::new(),
             usage: Usage::default(),
+            spending: Spending::new(harness),
             quota: None,
+            quota_at_ms: None,
             permissions: Vec::new(),
+            policy: None,
+            policed: Vec::new(),
             transmit,
             pending_prompt,
             spec_dirty: false,
@@ -415,8 +453,12 @@ impl Session {
             tracker: StateTracker::new(STALE_MS),
             transcript: Transcript::new(),
             usage: Usage::default(),
+            spending: Spending::new(spec.harness),
             quota: None,
+            quota_at_ms: None,
             permissions: Vec::new(),
+            policy: None,
+            policed: Vec::new(),
             transmit: Vec::new(),
             pending_prompt: None,
             spec_dirty: false,
@@ -438,7 +480,9 @@ impl Session {
             tracker: Cow::Borrowed(&self.tracker),
             transcript: Cow::Borrowed(&self.transcript),
             usage: Cow::Borrowed(&self.usage),
+            spending: Some(Cow::Borrowed(&self.spending)),
             quota: Cow::Borrowed(&self.quota),
+            quota_at_ms: self.quota_at_ms,
             permissions: Cow::Borrowed(&self.permissions),
             pending_prompt: Cow::Borrowed(&self.pending_prompt),
             spec_dirty: self.spec_dirty,
@@ -488,8 +532,14 @@ impl Session {
             tracker: snap.tracker.into_owned(),
             transcript: snap.transcript.into_owned(),
             usage: snap.usage.into_owned(),
+            spending: snap
+                .spending
+                .map_or_else(|| Spending::new(spec.harness), Cow::into_owned),
             quota: snap.quota.into_owned(),
+            quota_at_ms: snap.quota_at_ms,
             permissions: snap.permissions.into_owned(),
+            policy: None,
+            policed: Vec::new(),
             transmit: Vec::new(),
             pending_prompt: snap.pending_prompt.into_owned(),
             spec_dirty: snap.spec_dirty,
@@ -527,6 +577,20 @@ impl Session {
         Exec::with_stdin(self.dir.input_script(), bytes)
     }
 
+    /// Starts a follower on the host that records approvals, finished turns,
+    /// errors and the exit in `events.ndjson` while no client is connected,
+    /// and runs `hook` for each (see [`crate::watch`]). Run it again after a
+    /// relaunch; running it again replaces the hook.
+    pub fn watch_exec(&self, hook: Option<&crate::watch::Hook>) -> Exec {
+        Exec::new(crate::watch::watch_script(&self.dir, self.spec.harness, hook))
+    }
+
+    /// Prints the follower's events from byte `offset`; parse them with
+    /// [`crate::watch::parse_events`].
+    pub fn events_exec(&self, offset: u64) -> Exec {
+        Exec::new(crate::watch::events_script(&self.dir, offset))
+    }
+
     pub fn kill_exec(&self) -> Exec {
         Exec::new(self.dir.kill_script(3_000))
     }
@@ -538,6 +602,36 @@ impl Session {
             self.dir.kill_script(2_000),
             self.dir.remove_script()
         ))
+    }
+
+    /// Prints what the session changed in its worktree as a `git diff`;
+    /// parse it with [`crate::item::parse_unified`].
+    pub fn worktree_diff_exec(&self) -> Result<Exec, SessionError> {
+        Ok(Exec::new(crate::worktree::diff_script(self.worktree()?)))
+    }
+
+    /// Commits the worktree's changes and merges them into the branch
+    /// checked out in the repository (one squashed commit with `squash`).
+    /// Exits [`crate::worktree::EXIT_CONFLICT`] when they conflict.
+    pub fn worktree_merge_exec(&self, message: &str, squash: bool) -> Result<Exec, SessionError> {
+        Ok(Exec::new(crate::worktree::merge_script(
+            self.worktree()?,
+            message,
+            squash,
+        )))
+    }
+
+    /// Stops the harness, then deletes the worktree and its branch.
+    pub fn worktree_discard_exec(&self) -> Result<Exec, SessionError> {
+        Ok(Exec::new(format!(
+            "{}{}",
+            self.dir.kill_script(2_000),
+            crate::worktree::discard_script(self.worktree()?)
+        )))
+    }
+
+    fn worktree(&self) -> Result<&str, SessionError> {
+        self.spec.worktree.as_deref().ok_or(SessionError::NoWorktree)
     }
 
     /// `spec.json` needs rewriting (the native id or title became known).
@@ -585,6 +679,7 @@ impl Session {
             Status::Exited { code, .. } => self.exit(code, now_ms, &mut out),
             Status::Missing => self.exit(None, now_ms, &mut out),
         }
+        self.police(&mut out);
         out
     }
 
@@ -623,6 +718,7 @@ impl Session {
             self.transmit.extend(t);
         }
         out.extend(self.take_updates(now_ms));
+        self.police(&mut out);
         out
     }
 
@@ -642,6 +738,9 @@ impl Session {
         match &cmd {
             Command::Fork if self.spec.harness == Harness::Claude => {
                 return Ok(Outbound::Relaunch(self.relaunch(true, None)));
+            }
+            Command::Handoff { harness, prompt } => {
+                return Ok(Outbound::Relaunch(self.handoff(*harness, prompt.as_deref())?));
             }
             Command::SetOption { id, value } => {
                 let restart = self
@@ -679,7 +778,36 @@ impl Session {
             replaces_parent: !fork,
             origin: self.spec.origin.clone(),
             launcher: self.spec.launcher.clone(),
+            worktree: self.spec.worktree.clone(),
         }
+    }
+
+    /// A new session of `to` on the same directory (and worktree), whose
+    /// first prompt is this conversation so far followed by `next`. This
+    /// session keeps running; stop it if it should end.
+    fn handoff(&self, to: Harness, next: Option<&str>) -> Result<LaunchRequest, SessionError> {
+        if to == self.spec.harness {
+            return Err(SessionError::Driver(DriverError::Unsupported {
+                harness: to,
+                what: "a handoff to the same harness (fork instead)",
+            }));
+        }
+        let prompt = crate::handoff::primer(
+            &self.transcript,
+            self.spec.harness,
+            &self.spec.cwd,
+            next,
+            crate::handoff::PRIMER_CHARS,
+        );
+        Ok(LaunchRequest {
+            harness: Some(to),
+            cwd: self.spec.cwd.clone(),
+            title: self.spec.title.clone(),
+            prompt: Some(prompt),
+            parent: Some(self.spec.id.clone()),
+            worktree: self.spec.worktree.clone(),
+            ..LaunchRequest::default()
+        })
     }
 
     /// Bytes the session wants written to the harness.
@@ -730,8 +858,39 @@ impl Session {
         self.quota.as_ref()
     }
 
+    /// What the session spent over time and the quota it last reported, to
+    /// add up across sessions with [`crate::usage::roll_up`]. Usage replayed
+    /// from the log on attach is dated to the session's start, since the log
+    /// has no times; usage read live is dated by the caller's clock.
+    pub fn usage_record(&self) -> UsageRecord {
+        UsageRecord {
+            session_id: self.spec.id.clone(),
+            harness: self.spec.harness,
+            buckets: self.spending.buckets(),
+            quota: self.quota.clone(),
+            quota_at_ms: self.quota_at_ms,
+        }
+    }
+
     pub fn permissions(&self) -> &[Permission] {
         &self.permissions
+    }
+
+    /// Answers approvals by `policy` from now on, including any already
+    /// waiting: matching requests get the harness's allow-once or reject
+    /// option, sent with the next [`Session::take_transmit`], and a
+    /// [`Event::Notice`] says so. Questions are always left to the user,
+    /// and so is history replayed on attach. Set it on one client per
+    /// session, or several clients answer the same request. `None` stops.
+    pub fn set_policy(&mut self, policy: Option<Policy>) -> Vec<Update> {
+        self.policy = policy;
+        let mut out = Vec::new();
+        self.police(&mut out);
+        out
+    }
+
+    pub fn policy(&self) -> Option<&Policy> {
+        self.policy.as_ref()
     }
 
     pub fn commands(&self) -> &[CommandEntry] {
@@ -743,6 +902,51 @@ impl Session {
     }
 
     // ---- internals -----------------------------------------------------------
+
+    /// Answers waiting approvals the policy decides, once each.
+    fn police(&mut self, out: &mut Vec<Update>) {
+        let Some(policy) = &self.policy else { return };
+        if self.is_replaying() || !self.is_alive() {
+            return;
+        }
+        let mut answers = Vec::new();
+        for p in &self.permissions {
+            if p.kind != BlockKind::Permission || self.policed.contains(&p.request_id) {
+                continue;
+            }
+            let item = p.item_id.as_deref().and_then(|id| self.transcript.get(id));
+            let request = Request::new(self.spec.harness, item, &p.input);
+            let Some((decision, _)) = policy.decide(&request, &self.spec.cwd) else {
+                continue;
+            };
+            if let Some(option) = crate::policy::option_for(decision, &p.options) {
+                answers.push((p.request_id.clone(), option.id.clone(), decision, p.title.clone()));
+            }
+        }
+        for (request_id, option_id, decision, title) in answers {
+            self.policed.push(request_id.clone());
+            let cmd = Command::AnswerPermission {
+                request_id: request_id.clone(),
+                option_id,
+            };
+            let message = match self.driver.command(cmd) {
+                Ok(bytes) => {
+                    self.transmit.extend(bytes);
+                    self.permissions.retain(|p| p.request_id != request_id);
+                    match decision {
+                        Decision::Allow => format!("Allowed by policy: {title}"),
+                        Decision::Deny => format!("Denied by policy: {title}"),
+                    }
+                }
+                Err(e) => format!("Couldn't answer by policy ({title}): {e}"),
+            };
+            out.push(Update {
+                event: Event::Notice { message },
+                item: None,
+                replay: false,
+            });
+        }
+    }
 
     fn finish_replay(&mut self) {
         let Some(until) = self.replay_until else { return };
@@ -763,7 +967,9 @@ impl Session {
         self.tracker = StateTracker::new(STALE_MS);
         self.transcript = Transcript::new();
         self.usage = Usage::default();
+        self.spending = Spending::new(self.spec.harness);
         self.quota = None;
+        self.quota_at_ms = None;
         self.permissions.clear();
         self.transmit.clear();
         self.pending_prompt = None;
@@ -834,8 +1040,15 @@ impl Session {
                         }
                     }
                 }
-                Event::Usage(u) => merge_usage(&mut self.usage, u),
-                Event::Quota(q) => self.quota = Some(q.clone()),
+                Event::Usage(u) => {
+                    merge_usage(&mut self.usage, u);
+                    let at = if replay { self.spec.created_ms } else { now_ms };
+                    self.spending.record(u, at);
+                }
+                Event::Quota(q) => {
+                    self.quota = Some(q.clone());
+                    self.quota_at_ms = Some(if replay { self.spec.created_ms } else { now_ms });
+                }
                 Event::PermissionRequested {
                     request_id,
                     title,
@@ -1269,6 +1482,121 @@ mod tests {
         assert!(!b.is_alive());
         assert_eq!(b.state().map(|s| &s.state), Some(&RunState::Exited));
         assert_eq!(b.spec().title, a.spec().title);
+    }
+
+    #[test]
+    fn usage_record_adds_up_turns_and_survives_a_restore() {
+        let log = include_str!("../tests/fixtures/claude/background-agent-wakes.ndjson");
+        let (a, _) = attached(Harness::Claude, log, true);
+        let rec = a.usage_record();
+        assert_eq!(rec.session_id, "s1");
+        let spent: u64 = rec.buckets.iter().map(|b| b.spend.output_tokens).sum();
+        assert_eq!(spent, 335 + 75);
+        // Replayed history is dated to the session's start.
+        assert!(rec.buckets.iter().all(|b| b.start_ms == 0));
+        let b = Session::restore(&a.snapshot().unwrap(), a.spec().clone()).unwrap();
+        assert_eq!(b.usage_record(), rec);
+    }
+
+    #[test]
+    fn worktree_sessions_keep_it_through_relaunches() {
+        let mut r = req(Harness::Claude);
+        r.worktree = Some("../x".into());
+        assert!(matches!(
+            Session::launch(r.clone(), "s1", "t", 1),
+            Err(SessionError::InvalidWorktree(_))
+        ));
+        let (plain, _) = Session::launch(req(Harness::Claude), "s0", "t", 1).unwrap();
+        assert_eq!(plain.worktree_diff_exec(), Err(SessionError::NoWorktree));
+
+        r.worktree = Some("s1".into());
+        let (mut s, _) = Session::launch(r, "s1", "t", 1).unwrap();
+        let spec = SessionSpec::from_json(&s.spec().to_json()).unwrap();
+        assert_eq!(spec.worktree.as_deref(), Some("s1"));
+        assert!(s.worktree_diff_exec().unwrap().script.contains(".acc/w/s1"));
+        let merge = s.worktree_merge_exec("done", true).unwrap().script;
+        assert!(merge.contains("--squash"));
+        let discard = s.worktree_discard_exec().unwrap().script;
+        assert!(discard.contains("kill -TERM") && discard.contains("worktree remove"));
+        let Ok(Outbound::Relaunch(again)) = s.command(Command::Fork) else {
+            panic!("fork relaunches")
+        };
+        assert_eq!(again.worktree.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn handoff_relaunches_another_harness_primed_with_the_conversation() {
+        let (mut a, _) = attached(Harness::Claude, CLAUDE_HI, true);
+        let Ok(Outbound::Relaunch(r)) = a.command(Command::Handoff {
+            harness: Harness::Codex,
+            prompt: Some("carry on".into()),
+        }) else {
+            panic!("handoff relaunches")
+        };
+        assert_eq!(r.harness, Some(Harness::Codex));
+        assert_eq!((r.cwd.as_str(), r.parent.as_deref()), ("/w", Some("s1")));
+        assert!(r.resume.is_none() && !r.replaces_parent);
+        let prompt = r.prompt.unwrap();
+        assert!(
+            prompt.starts_with("This conversation started in Claude Code"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("[assistant]\nhi"), "{prompt}");
+        assert!(prompt.ends_with("carry on"));
+        assert!(matches!(
+            a.command(Command::Handoff {
+                harness: Harness::Claude,
+                prompt: None
+            }),
+            Err(SessionError::Driver(DriverError::Unsupported { .. }))
+        ));
+    }
+
+    #[test]
+    fn policy_answers_waiting_and_new_approvals_but_never_history() {
+        use crate::policy::{Decision, Rule};
+        let open: String = CLAUDE_PERMISSION
+            .lines()
+            .take_while(|l| !l.contains("\"tool_result\""))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let (s, _) = Session::launch(req(Harness::Claude), "s1", "a", 1).unwrap();
+        let mut b = Session::attach(s.spec().clone(), "b").unwrap();
+        b.on_status(&format!("alive 1 {}", open.len()), 0);
+        let deny_all = Policy {
+            rules: vec![Rule {
+                decision: Decision::Deny,
+                tool: None,
+                path: None,
+                command: None,
+            }],
+        };
+        // Nothing is answered while replaying, even with a policy.
+        b.set_policy(Some(deny_all.clone()));
+        let ups = b.feed(open.as_bytes(), 1);
+        assert_eq!(b.permissions().len(), 0, "answered once the replay ended");
+        let notice = ups.iter().find_map(|u| match &u.event {
+            Event::Notice { message } => Some(message.clone()),
+            _ => None,
+        });
+        assert!(notice.unwrap().starts_with("Denied by policy"));
+        let sent = String::from_utf8(b.take_transmit()).unwrap();
+        assert!(sent.contains("\"behavior\":\"deny\""), "{sent}");
+
+        // A rule that doesn't match leaves the request to the user.
+        let mut c = Session::attach(s.spec().clone(), "c").unwrap();
+        c.on_status(&format!("alive 1 {}", open.len()), 0);
+        c.feed(open.as_bytes(), 1);
+        let only_git = Policy {
+            rules: vec![Rule {
+                decision: Decision::Allow,
+                tool: Some("shell".into()),
+                path: None,
+                command: Some("git".into()),
+            }],
+        };
+        c.set_policy(Some(only_git));
+        assert_eq!(c.permissions().len(), 1);
     }
 
     #[test]

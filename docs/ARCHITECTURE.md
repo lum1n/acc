@@ -164,12 +164,29 @@ session.
 Every client reads and writes the same layout under `~/.acc/s/<id>/`, whichever layer started the
 session: `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json` (one line, a
 `session::SessionSpec`: harness, cwd, launch command, model, native id, title, origin, launcher),
-`sent` (write ids already delivered) and `lock`. The status line is `alive <pid> <log bytes>`,
+`sent` (write ids already delivered), `lock`, and `events.ndjson`, `watch.pid` and `watch.tail`
+while a follower runs (below). The status line is `alive <pid> <log bytes>`,
 `exited <code|-> <log bytes>` or `missing`; the list script prints one `S` line per session plus a
 `J` line with its `spec.json`. Launches fail fast (`EXIT_NO_CWD`) when the directory is missing and
 give up after `LAUNCH_WAIT_TICKS`; `attach_script` heartbeats on stderr and ends when the harness
 does; `write_script` delivers a write whole and at most once per id; `input_script` and
 `write_script` exit `EXIT_NOT_RUNNING` once the harness is gone.
+
+**While no client is connected.** Any client can be away (a phone in the background, a closed
+laptop, a shut browser tab). `Session::watch_exec(hook)` starts `watch::watch_script` on the host,
+detached like the harness and with nothing installed: `tail -f` on the log through an `awk` program
+that knows each protocol's markers. Claude's `can_use_tool` control requests and `result`, Codex's
+approval and user-input requests, the main thread's `turn/completed` (a subagent's turn, whose
+`rootTurnId` differs, isn't the session's) and final `error`, ACP's `session/request_permission`
+and `stopReason`, and pi's dialogs and the assistant's `message_end` with `stop` or `error`. Each
+becomes one line of `events.ndjson` (`watch::HostEvent`: host time, `blocked` with
+permission/question, `done`, `error`, `exited` with the code, a short detail such as the tool or
+command, and the log offset at that moment). A reconnecting client reads them with `events_exec` or
+a fan-in `SessionEvents` entry to catch up, then replays the log as usual. An embedder's
+`watch::Hook` runs for every event: a command (`sh -c`, the event on stdin, `ACC_SESSION` and
+`ACC_STATE` set) or a webhook posted with `curl` or `wget`. Delivering a notification from there is
+the embedder's business. Running `watch_exec` again replaces the follower; it ends once the harness
+has exited and its last lines are handled.
 
 ### SSH transport (`acc-ssh`)
 
@@ -231,6 +248,61 @@ each harness's native item JSON into one typed shape (tool call, command with ou
 file change with hunks) and `item::parse_unified` reads `git diff`. Commands a harness can only carry
 out with a new process (Claude fork, a model Cursor takes at spawn) come back as
 `Outbound::Relaunch`.
+
+**Permission policy.** Every harness asks for approvals its own way, so `policy::Policy` is one
+list of allow and deny rules for all of them: by tool (the harness's own name, or ACC's kinds
+`shell`, `edit`, `read`, `fetch`, `mcp`), by a glob over the files the tool acts on (relative to the
+session's directory), and by a command's start in whole words. Deny wins over allow, and an allow
+rule never matches a command that chains others (`;`, `&&`, `|`, `$(...)`, redirects); a deny rule
+matches any command in the chain. `Session::set_policy` checks every live approval (and those
+waiting when it is set or when a replay ends, never history) against the request's tool call in
+the transcript and its input, and answers a match with the option whose `PermissionOption::kind`
+is `AllowOnce` (or `RejectOnce` / `RejectAlways`), followed by an `Event::Notice`. Drivers set
+`kind` from each harness's decisions (ACP's option kinds, Claude's allow/deny, Codex's
+accept/decline). Questions are always left to the user. One client per session should hold the
+policy, or several answer the same request.
+
+The same rules go into the harnesses' own settings, so they stop asking: `settings_read_script`,
+then `merge_settings` (pure, reports rules a harness can't say) and `settings_write_script`. Claude
+gets `permissions.allow`/`deny` in `.claude/settings.local.json` (`Bash(npm test:*)`,
+`Edit(src/**)`), Codex `prefix_rule(...)` lines in `~/.codex/rules/default.rules` (commands only),
+Cursor `Shell(...)`/`Read(...)`/`Write(...)` in `.cursor/cli.json`, and opencode `permission.bash`
+patterns and `edit`/`webfetch` in `opencode.json` (left alone when it has comments). Copilot and pi
+have no rules file.
+
+**Worktrees.** Several agents can work on one repository at once, each in a git worktree of its
+own. `worktree::add_script(cwd, name, base)` (`worktree_add_exec` in the bindings; use the session
+id as the name) makes `~/.acc/w/<name>` on branch `acc/<name>` from `base` (default `HEAD`) and
+prints the directory matching `cwd` inside it, absolute, as ACP harnesses need. Launch there with
+`LaunchRequest::worktree = name`; relaunches (fork, a restart-only model change) keep it, and adding
+an existing worktree reuses it. The session then hands out `worktree_diff_exec` (commits, edits and
+new files since the base, as `git diff` for `item::parse_unified`), `worktree_merge_exec(message,
+squash)` (commits the worktree and merges or squashes it into the branch checked out in the
+repository; on a conflict nothing is merged and it exits `EXIT_CONFLICT`; later diffs count from
+the merge) and `worktree_discard_exec` (stops the harness, removes the worktree and its branch).
+`~/.acc/w/<name>.meta` records the base, the repository and the branch. Only `git` is needed on
+the host.
+
+**Usage across sessions.** Harnesses count differently: Claude and the ACP agents report each
+turn's tokens, Codex and pi running totals (pi's start over with a new session), and all of them a
+running total for cost. `usage::Spending` turns a session's `Usage` events into what was spent, in
+quarter-hour buckets (every UTC offset in use is a multiple of 15 minutes), and
+`Session::usage_record` hands it out with the newest quota the session reported. `usage::roll_up`
+adds records up per account (or plan, when the harness names no account), keeping each quota
+window's newest reading, and per local day in the time zone the client gives. Clients keep records
+of removed sessions to count them. The log has no times, so usage replayed on attach is dated to the
+session's start; usage read live is dated by the client's clock, and snapshots keep the dates.
+
+**Handoff.** `Command::Handoff { harness, prompt }` continues a conversation in another harness
+(Claude is out of quota: go on in Codex). The detached session answers with `Outbound::Relaunch`: a
+session of the other harness on the same directory and worktree, whose first prompt is
+`handoff::primer`, the conversation so far (messages, commands with their output and exit code,
+changed files, tools, subagent reports; reasoning left out) followed by `prompt` as the user's next
+message, or a request to sum up and wait. The primer keeps the newest entries within
+`PRIMER_CHARS` and clips any one entry to its start and end. A prompt works from every harness to
+every other; writing a native session file instead (pi's or Claude's JSONL) would depend on
+undocumented formats and their versions, so ACC doesn't. Drivers alone refuse the command
+(`Unsupported`); the original session keeps running until the client stops it.
 
 `detached::fan_in_script` follows any number of logs and transcripts on one SSH channel, tagged per
 file, with byte offsets so a restarted follower resumes without loss; closing the channel takes all

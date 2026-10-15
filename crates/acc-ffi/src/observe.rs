@@ -283,6 +283,7 @@ fn feed_entry(e: acc_core::detached::FeedEntry) -> AccFeedEntry {
             acc_core::detached::FeedPath::File(path) => AccFeedPath::File { path },
             acc_core::detached::FeedPath::SessionLog(id) => AccFeedPath::SessionLog { id },
             acc_core::detached::FeedPath::SessionExit(id) => AccFeedPath::SessionExit { id },
+            acc_core::detached::FeedPath::SessionEvents(id) => AccFeedPath::SessionEvents { id },
         },
         offset: e.offset,
     }

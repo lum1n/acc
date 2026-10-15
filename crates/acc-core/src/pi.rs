@@ -25,7 +25,10 @@ use crate::command::{
     split_verb, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Usage};
+use crate::event::{
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
+    Usage,
+};
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -626,24 +629,15 @@ impl PiDriver {
                 let options = labels
                     .iter()
                     .enumerate()
-                    .map(|(i, l)| PermissionOption {
-                        id: i.to_string(),
-                        label: l.clone(),
-                    })
+                    .map(|(i, l)| PermissionOption::new(i.to_string(), l.clone()))
                     .collect();
                 (Dialog::Select(labels), options, BlockKind::Permission)
             }
             Some("confirm") => (
                 Dialog::Confirm,
                 vec![
-                    PermissionOption {
-                        id: "yes".into(),
-                        label: "Yes".into(),
-                    },
-                    PermissionOption {
-                        id: "no".into(),
-                        label: "No".into(),
-                    },
+                    PermissionOption::new("yes", "Yes").with_kind(PermissionOptionKind::AllowOnce),
+                    PermissionOption::new("no", "No").with_kind(PermissionOptionKind::RejectOnce),
                 ],
                 BlockKind::Permission,
             ),
@@ -656,10 +650,7 @@ impl PiDriver {
             _ => title,
         };
         let mut options: Vec<PermissionOption> = options;
-        options.push(PermissionOption {
-            id: CANCEL.into(),
-            label: "Cancel".into(),
-        });
+        options.push(PermissionOption::new(CANCEL, "Cancel"));
         self.dialogs.insert(id.clone(), dialog);
         self.blocked = true;
         out.push(self.state(RunState::Blocked { kind }, Some(title.clone())));
@@ -919,6 +910,12 @@ impl Driver for PiDriver {
             } => self.answer(&request_id, &option_id)?,
             Command::Invoke { name, args } => self.invoke(name.trim_start_matches('/'), args.trim())?,
             Command::Refresh => self.handshake(),
+            Command::Handoff { .. } => {
+                return Err(DriverError::Unsupported {
+                    harness: Harness::Pi,
+                    what: "handoff without a relaunch",
+                });
+            }
         })
     }
 
