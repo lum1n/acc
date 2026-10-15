@@ -458,6 +458,11 @@ fn valid_key(key: &str) -> bool {
 /// for every session on a host instead of one per session, which keeps it
 /// under sshd's per-connection session limit.
 ///
+/// Every file's printer writes to the same pipe, and only writes of up to
+/// `PIPE_BUF` bytes land whole; a longer line could be cut by another
+/// file's. So a long line goes out in pieces that fit, each but the last as
+/// `<key>+\t<piece>`, and [`FanInParser`] joins them.
+///
 /// Closing the channel signals the script, which takes every process it
 /// started (its descendants, found with `ps`) down with it. Entries with
 /// invalid keys or session ids are skipped.
@@ -465,7 +470,9 @@ pub fn fan_in_script(entries: &[FeedEntry]) -> String {
     let mut script = String::from(
         "k() { for c in $(ps -eo pid=,ppid= | awk -v p=\"$1\" '$2 == p { print $1 }'); do echo \"$c\"; k \"$c\"; done; }\n\
          trap 'trap - TERM INT HUP; kill $(k $$) 2>/dev/null' TERM INT HUP\n\
-         f() { tail -c +\"$3\" -F \"$2\" 2>/dev/null | awk -v k=\"$1\" '{ print k \"\\t\" $0; fflush() }'; }\n",
+         P=$(getconf PIPE_BUF / 2>/dev/null); case $P in ''|*[!0-9]*) P=512 ;; esac\n\
+         f() { tail -c +\"$3\" -F \"$2\" 2>/dev/null | LC_ALL=C awk -v k=\"$1\" -v n=$((P - ${#1} - 3)) \
+         '{ s = $0; while (length(s) > n) { print k \"+\\t\" substr(s, 1, n); fflush(); s = substr(s, n + 1) } print k \"\\t\" s; fflush() }'; }\n",
     );
     for e in entries.iter().filter(|e| valid_key(&e.key)) {
         let path = match &e.path {
@@ -488,6 +495,8 @@ pub fn fan_in_script(entries: &[FeedEntry]) -> String {
 pub struct FanInParser {
     buf: Vec<u8>,
     offsets: std::collections::HashMap<String, u64>,
+    /// Pieces of each file's line still being printed.
+    partial: std::collections::HashMap<String, Vec<u8>>,
 }
 
 /// One line of one followed file.
@@ -506,6 +515,7 @@ impl FanInParser {
         Self {
             buf: Vec::new(),
             offsets: entries.iter().map(|e| (e.key.clone(), e.offset)).collect(),
+            partial: std::collections::HashMap::new(),
         }
     }
 
@@ -526,7 +536,16 @@ impl FanInParser {
             let Ok(key) = std::str::from_utf8(&line[..tab]) else {
                 continue;
             };
-            let mut body = line[tab + 1..].to_vec();
+            if let Some(key) = key.strip_suffix('+') {
+                let piece = &line[tab + 1..];
+                self.partial
+                    .entry(key.to_owned())
+                    .or_default()
+                    .extend_from_slice(piece);
+                continue;
+            }
+            let mut body = self.partial.remove(key).unwrap_or_default();
+            body.extend_from_slice(&line[tab + 1..]);
             body.push(b'\n');
             let offset = self.offsets.entry(key.to_owned()).or_insert(0);
             *offset += body.len() as u64;
@@ -635,6 +654,22 @@ mod tests {
         assert_eq!(lines[0].bytes, b"{\"x\":1}\n");
         assert_eq!(lines[0].offset, 18);
         assert_eq!((lines[1].key.as_str(), lines[1].offset), ("b", 3));
+    }
+
+    #[test]
+    fn fan_in_parser_joins_the_pieces_of_a_long_line() {
+        let mut p = FanInParser::default();
+        let lines = p.feed(b"a+\t{\"x\"\nb\tother\na+\t:12\na\t3}\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            (lines[0].key.as_str(), &lines[0].bytes[..]),
+            ("b", &b"other\n"[..])
+        );
+        assert_eq!(
+            (lines[1].key.as_str(), &lines[1].bytes[..]),
+            ("a", &b"{\"x\":123}\n"[..])
+        );
+        assert_eq!(lines[1].offset, 10);
     }
 
     #[test]
@@ -946,5 +981,74 @@ mod sh_tests {
             "tail left running"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fan_in_keeps_long_lines_whole_while_other_files_write() {
+        let home = std::env::temp_dir().join(format!("acc-test-fan-long-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let long: String = (0..200)
+            .map(|i| format!("{{\"i\":{i},\"pad\":\"{}é\"}}\n", "a".repeat(20_000 + i)))
+            .collect();
+        let short: String = (0..20_000).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+        let (a, b) = (home.join("a.jsonl"), home.join("b.jsonl"));
+        std::fs::write(&a, &long).expect("write");
+        std::fs::write(&b, &short).expect("write");
+        let entries = [
+            FeedEntry {
+                key: "ka".into(),
+                path: FeedPath::File(a.display().to_string()),
+                offset: 0,
+            },
+            FeedEntry {
+                key: "kb".into(),
+                path: FeedPath::File(b.display().to_string()),
+                offset: 0,
+            },
+        ];
+        let mut child = Command::new("sh");
+        std::os::unix::process::CommandExt::process_group(&mut child, 0);
+        let mut child = child
+            .arg("-c")
+            .arg(fan_in_script(&entries))
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let want = (long.len(), short.len());
+        let reader = std::thread::spawn(move || {
+            let mut parser = FanInParser::new(&entries);
+            let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+            let mut buf = [0u8; 65536];
+            while got_a.len() < want.0 || got_b.len() < want.1 {
+                let n = std::io::Read::read(&mut stdout, &mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                for l in parser.feed(&buf[..n]) {
+                    match l.key.as_str() {
+                        "ka" => got_a.extend(l.bytes),
+                        _ => got_b.extend(l.bytes),
+                    }
+                }
+            }
+            (got_a, got_b, parser.offset("ka"), parser.offset("kb"))
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Ends the reader too if lines went missing and it is still waiting.
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status();
+        let _ = child.wait();
+        let (got_a, got_b, ka, kb) = reader.join().expect("join");
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(got_a == long.as_bytes(), "the long lines came apart");
+        assert!(got_b == short.as_bytes(), "the short lines came apart");
+        assert_eq!(ka, Some(long.len() as u64));
+        assert_eq!(kb, Some(short.len() as u64));
     }
 }
