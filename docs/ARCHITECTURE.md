@@ -255,6 +255,17 @@ window's newest reading, and per local day in the time zone the client gives. Cl
 of removed sessions to count them. The log has no times, so usage replayed on attach is dated to the
 session's start; usage read live is dated by the client's clock, and snapshots keep the dates.
 
+**Handoff.** `Command::Handoff { harness, prompt }` continues a conversation in another harness
+(Claude is out of quota: go on in Codex). The detached session answers with `Outbound::Relaunch`: a
+session of the other harness on the same directory and worktree, whose first prompt is
+`handoff::primer`, the conversation so far (messages, commands with their output and exit code,
+changed files, tools, subagent reports; reasoning left out) followed by `prompt` as the user's next
+message, or a request to sum up and wait. The primer keeps the newest entries within
+`PRIMER_CHARS` and clips any one entry to its start and end. A prompt works from every harness to
+every other; writing a native session file instead (pi's or Claude's JSONL) would depend on
+undocumented formats and their versions, so ACC doesn't. Drivers alone refuse the command
+(`Unsupported`); the original session keeps running until the client stops it.
+
 `detached::fan_in_script` follows any number of logs and transcripts on one SSH channel, tagged per
 file, with byte offsets so a restarted follower resumes without loss; closing the channel takes all
 its processes down. One long-lived channel per host keeps a client inside sshd's per-connection

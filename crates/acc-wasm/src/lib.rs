@@ -179,7 +179,8 @@ export type Command =
   | { type: "set_option"; id: OptionId; value: string }
   | { type: "answer_permission"; request_id: string; option_id: string }
   | { type: "invoke"; name: string; args: string }
-  | { type: "refresh" };
+  | { type: "refresh" }
+  | { type: "handoff"; harness: HarnessId; prompt?: string | null };
 
 export interface CommandEntry {
   name: string;

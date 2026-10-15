@@ -712,6 +712,9 @@ impl Session {
             Command::Fork if self.spec.harness == Harness::Claude => {
                 return Ok(Outbound::Relaunch(self.relaunch(true, None)));
             }
+            Command::Handoff { harness, prompt } => {
+                return Ok(Outbound::Relaunch(self.handoff(*harness, prompt.as_deref())?));
+            }
             Command::SetOption { id, value } => {
                 let restart = self
                     .driver
@@ -750,6 +753,34 @@ impl Session {
             launcher: self.spec.launcher.clone(),
             worktree: self.spec.worktree.clone(),
         }
+    }
+
+    /// A new session of `to` on the same directory (and worktree), whose
+    /// first prompt is this conversation so far followed by `next`. This
+    /// session keeps running; stop it if it should end.
+    fn handoff(&self, to: Harness, next: Option<&str>) -> Result<LaunchRequest, SessionError> {
+        if to == self.spec.harness {
+            return Err(SessionError::Driver(DriverError::Unsupported {
+                harness: to,
+                what: "a handoff to the same harness (fork instead)",
+            }));
+        }
+        let prompt = crate::handoff::primer(
+            &self.transcript,
+            self.spec.harness,
+            &self.spec.cwd,
+            next,
+            crate::handoff::PRIMER_CHARS,
+        );
+        Ok(LaunchRequest {
+            harness: Some(to),
+            cwd: self.spec.cwd.clone(),
+            title: self.spec.title.clone(),
+            prompt: Some(prompt),
+            parent: Some(self.spec.id.clone()),
+            worktree: self.spec.worktree.clone(),
+            ..LaunchRequest::default()
+        })
     }
 
     /// Bytes the session wants written to the harness.
@@ -1402,6 +1433,34 @@ mod tests {
             panic!("fork relaunches")
         };
         assert_eq!(again.worktree.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn handoff_relaunches_another_harness_primed_with_the_conversation() {
+        let (mut a, _) = attached(Harness::Claude, CLAUDE_HI, true);
+        let Ok(Outbound::Relaunch(r)) = a.command(Command::Handoff {
+            harness: Harness::Codex,
+            prompt: Some("carry on".into()),
+        }) else {
+            panic!("handoff relaunches")
+        };
+        assert_eq!(r.harness, Some(Harness::Codex));
+        assert_eq!((r.cwd.as_str(), r.parent.as_deref()), ("/w", Some("s1")));
+        assert!(r.resume.is_none() && !r.replaces_parent);
+        let prompt = r.prompt.unwrap();
+        assert!(
+            prompt.starts_with("This conversation started in Claude Code"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("[assistant]\nhi"), "{prompt}");
+        assert!(prompt.ends_with("carry on"));
+        assert!(matches!(
+            a.command(Command::Handoff {
+                harness: Harness::Claude,
+                prompt: None
+            }),
+            Err(SessionError::Driver(DriverError::Unsupported { .. }))
+        ));
     }
 
     #[test]

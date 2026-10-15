@@ -795,6 +795,13 @@ pub enum AccCommand {
         args: String,
     },
     Refresh,
+    /// Continue the conversation in another harness on the same directory:
+    /// answered with `AccOutbound.Relaunch`, primed with the conversation so
+    /// far and `prompt` as the user's next message.
+    Handoff {
+        harness: AccHarness,
+        prompt: Option<String>,
+    },
 }
 
 impl From<AccCommand> for Command {
@@ -821,6 +828,10 @@ impl From<AccCommand> for Command {
             },
             AccCommand::Invoke { name, args } => Command::Invoke { name, args },
             AccCommand::Refresh => Command::Refresh,
+            AccCommand::Handoff { harness, prompt } => Command::Handoff {
+                harness: harness.into(),
+                prompt,
+            },
         }
     }
 }

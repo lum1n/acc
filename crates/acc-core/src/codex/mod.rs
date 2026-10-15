@@ -1454,6 +1454,7 @@ impl Driver for CodexDriver {
                     }
                 }
             }
+            Command::Handoff { .. } => Err(unsupported("handoff without a relaunch")),
             Command::Refresh => {
                 let mut out = self.request("account/rateLimits/read", Value::Null, Req::RateLimits);
                 self.models.clear();

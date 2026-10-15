@@ -26,6 +26,7 @@
 //! - [`live`]: a driver picked by harness, with timestamps and merged state,
 //!   for embedders that own a live byte stream (what `acc-ssh` builds on).
 //! - [`question`]: multi-part questions and how to answer all of them.
+//! - [`handoff`]: priming another harness with a conversation so far.
 //! - [`usage`]: what sessions spent, added up per account and per day.
 //! - [`worktree`]: a git worktree per session, its diff, merge and discard.
 
@@ -36,6 +37,7 @@ pub mod detached;
 pub mod discover;
 pub mod driver;
 pub mod event;
+pub mod handoff;
 pub mod harness;
 pub mod item;
 pub mod live;

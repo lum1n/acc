@@ -1400,6 +1400,7 @@ impl Driver for AcpDriver {
             // ACP agents push commands, options and usage as they change;
             // there is nothing to ask for.
             Command::Refresh => Ok(Vec::new()),
+            Command::Handoff { .. } => Err(self.unsupported("handoff without a relaunch")),
             Command::SetOption { id, value } => self.set_option(id, value),
             Command::AnswerPermission {
                 request_id,

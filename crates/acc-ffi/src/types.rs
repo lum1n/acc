@@ -598,6 +598,12 @@ pub enum Command {
         args: String,
     },
     Refresh,
+    /// Continue in another harness; only a detached `AccSession` can
+    /// (it answers with a relaunch).
+    Handoff {
+        harness: Harness,
+        prompt: Option<String>,
+    },
 }
 
 impl From<Command> for core_cmd::Command {
@@ -627,6 +633,10 @@ impl From<Command> for core_cmd::Command {
             },
             Command::Invoke { name, args } => Self::Invoke { name, args },
             Command::Refresh => Self::Refresh,
+            Command::Handoff { harness, prompt } => Self::Handoff {
+                harness: harness.into(),
+                prompt,
+            },
         }
     }
 }

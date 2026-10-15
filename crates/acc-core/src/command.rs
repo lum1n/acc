@@ -49,6 +49,15 @@ pub enum Command {
         args: String,
     },
     Refresh,
+    /// Continue the conversation in another harness, on the same directory:
+    /// a detached session answers with [`crate::session::Outbound::Relaunch`],
+    /// primed with the conversation so far (see [`crate::handoff`]), with
+    /// `prompt` as the user's next message. Drivers alone can't.
+    Handoff {
+        harness: crate::harness::Harness,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
 }
 
 impl Command {

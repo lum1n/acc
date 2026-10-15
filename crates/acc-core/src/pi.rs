@@ -919,6 +919,12 @@ impl Driver for PiDriver {
             } => self.answer(&request_id, &option_id)?,
             Command::Invoke { name, args } => self.invoke(name.trim_start_matches('/'), args.trim())?,
             Command::Refresh => self.handshake(),
+            Command::Handoff { .. } => {
+                return Err(DriverError::Unsupported {
+                    harness: Harness::Pi,
+                    what: "handoff without a relaunch",
+                });
+            }
         })
     }
 

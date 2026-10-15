@@ -1527,6 +1527,7 @@ impl Driver for ClaudeDriver {
                 request_id,
                 option_id,
             } => self.answer(&request_id, &option_id)?,
+            Command::Handoff { .. } => return Err(unsupported("handoff without a relaunch")),
             Command::Refresh => {
                 let mut bytes = self.control(json!({"subtype": "get_context_usage"}), Pending::Other);
                 bytes.extend(self.control(json!({"subtype": "list_models"}), Pending::Other));
