@@ -22,7 +22,7 @@ into ordinary ACC sessions.
 
 | Crate | What it is |
 |---|---|
-| `crates/acc-core` | Sans-IO core: harness catalogue, drivers, event stream, commands/options, live sessions (`live`) and detached sessions (`session`: launch, attach with replay, transcript, permissions, snapshots), typed items and diffs, detached-session and fan-in scripts, and across harnesses: one permission policy, a git worktree per session, handoff to another harness, usage added up per account and day, and host-side events while no client is connected |
+| `crates/acc-core` | Sans-IO core: harness catalogue, drivers, event stream, commands/options, live sessions (`live`) and detached sessions (`session`: launch, attach with replay, transcript, permissions, snapshots), typed items and diffs, detached-session and fan-in scripts, and across harnesses: one permission policy, a git worktree per session, handoff to another harness, usage added up per account and day, skills and MCP servers in every harness's own places, and host-side events while no client is connected |
 | `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections |
 | `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`): the live `Session`, SSH sessions, and the detached-session byte pump (`AccSession`, `AccFanIn` and the host scripts) |
 | `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node: the same objects and functions as `acc-ffi` except the SSH transport (a test keeps them in step), records as plain JS objects in the core's serde shapes, bytes as `Uint8Array` |
