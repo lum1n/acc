@@ -24,12 +24,6 @@
 //!   lists headless, is `set_permission_mode` plus `get_plan`.
 //! - Usage: `result` (tokens, cost), `get_context_usage` (context fill) and
 //!   `rate_limit_event` (subscription windows).
-//!
-//! Takeover of a session ACC didn't start: wait for a safe point with
-//! [`transcript::Observer`], stop the TUI, then launch with
-//! `Driver::launch(Some(session_id))`.
-
-pub mod transcript;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -1812,7 +1806,8 @@ fn slash(name: &str, args: &str) -> String {
     }
 }
 
-pub(crate) fn tool_kind(name: &str) -> ItemKind {
+/// The item kind of a call to Claude tool `name`.
+pub fn tool_kind(name: &str) -> ItemKind {
     match name {
         "Bash" | "PowerShell" => ItemKind::CommandExecution,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ItemKind::FileChange,
@@ -1831,7 +1826,7 @@ fn parent_of(v: &Value) -> Option<String> {
 /// it to the transcript): `<task-notification>` with the tool call, status
 /// and result. Returns the `Agent` call's id and the fields as a `task`
 /// record shaped like the stream-json `task_notification` frame.
-pub(crate) fn task_notification(text: &str) -> Option<(String, Value)> {
+pub fn task_notification(text: &str) -> Option<(String, Value)> {
     let body = text.trim_start().strip_prefix("<task-notification>")?;
     let tag = |name: &str| {
         let open = format!("<{name}>");

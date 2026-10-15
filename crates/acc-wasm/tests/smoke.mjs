@@ -63,10 +63,6 @@ assert.throws(() => new acc.Session({ harness: "nope", cwd: "/" }), /invalid ses
 assert.equal(session.observe({ state: { state: "blocked", kind: "question" }, message: null, source: "native", observed_at_ms: now + 1 }), true);
 assert.deepEqual(session.state().state, { state: "blocked", kind: "question" });
 
-const scanner = new acc.Osc7501Scanner();
-const [status] = scanner.feed(new TextEncoder().encode("\x1b]7501;state=working:progress=40\x07"));
-assert.deepEqual(status.state, { state: "working", progress: 40 });
-
 const detached = new acc.DetachedSession("s1");
 assert.ok(detached.launchScript(spec, "/tmp").includes("mkfifo"));
 assert.ok(detached.attachScript(10).includes("tail -c +11 -f"));

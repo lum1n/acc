@@ -64,7 +64,7 @@ fn exports(crate_dir: &str, attr: &str) -> BTreeSet<String> {
 /// acc-ffi objects that open SSH connections themselves (through acc-ssh).
 /// A browser has no raw sockets, so JS embedders run the same sessions over
 /// their own transport with `Session` or `AccSession` instead.
-const SSH_TRANSPORT: [&str; 3] = ["SshHost::", "RemoteSession::", "PaneSession::"];
+const SSH_TRANSPORT: [&str; 2] = ["SshHost::", "RemoteSession::"];
 
 #[test]
 fn ffi_and_wasm_export_the_same_api() {

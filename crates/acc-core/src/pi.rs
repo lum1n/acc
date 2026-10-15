@@ -1,4 +1,4 @@
-//! pi driver (`pi --mode rpc`) and pi transcript reader.
+//! pi driver (`pi --mode rpc`).
 //!
 //! The RPC protocol is strict JSONL on stdio: commands carry an optional `id`
 //! that their `response` echoes; session events carry none. Built-in TUI
@@ -12,9 +12,9 @@
 //! in `tests/fixtures/pi/` are recorded from that version. See
 //! `research/commands-and-options/pi-opencode.md`.
 //!
-//! [`Transcript`] reads pi's session JSONL files, which is how ACC observes a
-//! pi session it didn't start (an interactive TUI, possibly inside a
-//! multiplexer) without touching the process.
+//! pi's session files hold the same message objects as its RPC events, so
+//! the helpers that read a message ([`content_text`], [`tool_kind`], ...) are
+//! public for readers of those files.
 
 use std::collections::HashMap;
 
@@ -35,7 +35,7 @@ use crate::state::{BlockKind, RunState, SessionState, StateSource};
 
 /// Longest RPC record accepted. `agent_end` repeats the run's messages, so
 /// records with large tool outputs can be several megabytes.
-const MAX_LINE: usize = 64 * 1024 * 1024;
+pub const MAX_LINE: usize = 64 * 1024 * 1024;
 
 /// Option id that cancels a pi dialog in [`Command::AnswerPermission`].
 pub const CANCEL: &str = "cancel";
@@ -1117,7 +1117,8 @@ fn model_ref(m: &Value) -> Option<String> {
     Some(format!("{provider}/{id}"))
 }
 
-fn tool_kind(tool: &str) -> ItemKind {
+/// The item kind of a call to pi tool `tool`.
+pub fn tool_kind(tool: &str) -> ItemKind {
     match tool {
         "bash" | "powershell" => ItemKind::CommandExecution,
         "edit" | "write" => ItemKind::FileChange,
@@ -1128,7 +1129,7 @@ fn tool_kind(tool: &str) -> ItemKind {
 }
 
 /// Text of a pi message `content`: a string, or blocks of which only `text` counts.
-fn content_text(content: Option<&Value>) -> String {
+pub fn content_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => blocks
@@ -1141,10 +1142,9 @@ fn content_text(content: Option<&Value>) -> String {
     }
 }
 
-/// What to show for a user message: its text, or `[image]` when it is only images.
 /// An async `subagent` launch's run id (pi-subagents `async: true`): its
 /// result only acknowledges it, and its `subagent-notify` completes it.
-fn async_run<'a>(tool: &str, details: Option<&'a Value>, is_error: bool) -> Option<&'a str> {
+pub fn async_run<'a>(tool: &str, details: Option<&'a Value>, is_error: bool) -> Option<&'a str> {
     details
         .and_then(|d| d.get("asyncId"))
         .and_then(Value::as_str)
@@ -1154,7 +1154,7 @@ fn async_run<'a>(tool: &str, details: Option<&'a Value>, is_error: bool) -> Opti
 /// pi-subagents' report of finished async runs (a `subagent-notify` custom
 /// message): completes the calls that launched them, with the report as
 /// their output.
-fn subagent_notify(background: &mut HashMap<String, String>, msg: &Value, out: &mut Vec<Event>) {
+pub fn subagent_notify(background: &mut HashMap<String, String>, msg: &Value, out: &mut Vec<Event>) {
     if msg.get("customType").and_then(Value::as_str) != Some("subagent-notify") {
         return;
     }
@@ -1182,7 +1182,8 @@ fn subagent_notify(background: &mut HashMap<String, String>, msg: &Value, out: &
     }
 }
 
-fn user_text(content: Option<&Value>) -> String {
+/// What to show for a user message: its text, or `[image]` when it is only images.
+pub fn user_text(content: Option<&Value>) -> String {
     let text = content_text(content);
     let images = content.and_then(Value::as_array).is_some_and(|blocks| {
         blocks
@@ -1198,7 +1199,7 @@ fn user_text(content: Option<&Value>) -> String {
 
 /// Adds one assistant message's usage to the running totals. pi's context
 /// fill is the last response's total tokens.
-fn add_usage(total: &mut Usage, u: &Value) {
+pub fn add_usage(total: &mut Usage, u: &Value) {
     let get = |k: &str| u.get(k).and_then(Value::as_u64);
     let add = |slot: &mut Option<u64>, v: Option<u64>| {
         if let Some(v) = v {
@@ -1217,186 +1218,6 @@ fn add_usage(total: &mut Usage, u: &Value) {
     }
 }
 
-/// Default directory pi stores sessions for `cwd` in, relative to `$HOME`:
-/// `.pi/agent/sessions/--<cwd with separators as dashes>--`.
-pub fn session_dir(cwd: &str) -> String {
-    let trimmed = cwd.trim_start_matches(['/', '\\']);
-    let encoded: String = trimmed
-        .chars()
-        .map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c })
-        .collect();
-    format!(".pi/agent/sessions/--{encoded}--")
-}
-
-/// Reads a pi session file (JSONL) incrementally, as appended by a running pi.
-///
-/// State comes from the transcript ([`StateSource::Transcript`]): a user
-/// message means working, an assistant message that stops for tool use means
-/// still working, a final one means done, an error stop means error and an
-/// aborted one means idle, and a final one with async pi-subagents runs still
-/// out means waiting. pi never shows "blocked" in its transcript.
-#[derive(Debug)]
-pub struct Transcript {
-    framer: LineFramer,
-    open_tools: Vec<String>,
-    /// Async pi-subagents runs not yet reported back, as in [`PiDriver`].
-    background: HashMap<String, String>,
-    usage: Usage,
-}
-
-impl Default for Transcript {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Transcript {
-    pub fn new() -> Self {
-        Self {
-            framer: LineFramer::new(MAX_LINE),
-            open_tools: Vec::new(),
-            background: HashMap::new(),
-            usage: Usage::default(),
-        }
-    }
-
-    /// Tool calls with no result yet.
-    pub fn pending_tools(&self) -> usize {
-        self.open_tools.len()
-    }
-
-    /// Feeds bytes from the session file (from a `tail -c +N -f`).
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
-        let mut out = Vec::new();
-        for frame in self.framer.feed(bytes) {
-            if let Frame::Line(line) = frame
-                && let Ok(v) = serde_json::from_str::<Value>(&line)
-            {
-                self.entry(&v, &mut out);
-            }
-        }
-        out
-    }
-
-    fn state(state: RunState, message: Option<String>, at: u64) -> Event {
-        Event::StateChanged(SessionState {
-            state,
-            message,
-            source: StateSource::Transcript,
-            observed_at_ms: at,
-        })
-    }
-
-    fn entry(&mut self, v: &Value, out: &mut Vec<Event>) {
-        match v.get("type").and_then(Value::as_str) {
-            Some("session") => out.push(Event::SessionStarted {
-                harness: Harness::Pi,
-                native_id: str_field(v, "id"),
-                model: None,
-            }),
-            Some("message") => {
-                let id = str_field(v, "id");
-                let Some(msg) = v.get("message") else { return };
-                let at = msg.get("timestamp").and_then(Value::as_u64).unwrap_or(0);
-                match msg.get("role").and_then(Value::as_str) {
-                    Some("user") => {
-                        out.push(Event::ItemStarted {
-                            id: id.clone(),
-                            kind: ItemKind::UserMessage,
-                            parent: None,
-                            extensions: Value::Null,
-                        });
-                        out.push(Event::ItemDelta {
-                            id: id.clone(),
-                            text: user_text(msg.get("content")),
-                        });
-                        out.push(Event::ItemCompleted {
-                            id,
-                            extensions: Value::Null,
-                        });
-                        out.push(Self::state(RunState::Working { progress: None }, None, at));
-                    }
-                    Some("assistant") => self.assistant(id, msg, at, out),
-                    Some("toolResult") => {
-                        let call = str_field(msg, "toolCallId");
-                        self.open_tools.retain(|t| *t != call);
-                        let is_error = msg.get("isError").and_then(Value::as_bool).unwrap_or(false);
-                        let details = msg.get("details");
-                        let extensions = json!({
-                            "result": { "content": msg.get("content"), "details": details },
-                            "is_error": is_error,
-                        });
-                        if let Some(run) = async_run(&str_field(msg, "toolName"), details, is_error) {
-                            self.background.insert(run.to_owned(), call.clone());
-                            out.push(Event::ItemUpdated { id: call, extensions });
-                        } else {
-                            out.push(Event::ItemCompleted { id: call, extensions });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("custom_message") => subagent_notify(&mut self.background, v, out),
-            _ => {}
-        }
-    }
-
-    fn assistant(&mut self, id: String, msg: &Value, at: u64, out: &mut Vec<Event>) {
-        out.push(Event::ItemStarted {
-            id: id.clone(),
-            kind: ItemKind::AgentMessage,
-            parent: None,
-            extensions: Value::Null,
-        });
-        let text = content_text(msg.get("content"));
-        if !text.is_empty() {
-            out.push(Event::ItemDelta { id: id.clone(), text });
-        }
-        let stop = msg.get("stopReason").and_then(Value::as_str).unwrap_or_default();
-        out.push(Event::ItemCompleted {
-            id,
-            extensions: json!({
-                "provider": msg.get("provider"),
-                "model": msg.get("model"),
-                "stop_reason": stop,
-            }),
-        });
-        for block in msg.get("content").and_then(Value::as_array).into_iter().flatten() {
-            if block.get("type").and_then(Value::as_str) == Some("toolCall") {
-                let call = str_field(block, "id");
-                let tool = str_field(block, "name");
-                self.open_tools.push(call.clone());
-                out.push(Event::ItemStarted {
-                    id: call,
-                    kind: tool_kind(&tool),
-                    parent: None,
-                    extensions: json!({ "tool": tool, "args": block.get("arguments") }),
-                });
-            }
-        }
-        if let Some(u) = msg.get("usage") {
-            add_usage(&mut self.usage, u);
-            out.push(Event::Usage(self.usage.clone()));
-        }
-        let state = match stop {
-            "toolUse" => RunState::Working { progress: None },
-            "error" => RunState::Error,
-            "aborted" => RunState::Idle,
-            _ if !self.background.is_empty() => RunState::Waiting,
-            _ => RunState::Done,
-        };
-        let message = (stop == "error")
-            .then(|| msg.get("errorMessage").and_then(Value::as_str))
-            .flatten()
-            .and_then(|m| m.lines().next())
-            .map(str::to_owned);
-        out.push(Self::state(state, message, at));
-        if stop == "stop" {
-            out.push(Event::TurnCompleted);
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -1405,7 +1226,6 @@ mod tests {
     const TURN: &str = include_str!("../tests/fixtures/pi/rpc-turn-with-dialog.jsonl");
     const COMMANDS: &str = include_str!("../tests/fixtures/pi/rpc-commands.jsonl");
     const HANDSHAKE: &str = include_str!("../tests/fixtures/pi/rpc-handshake.jsonl");
-    const SESSION: &str = include_str!("../tests/fixtures/pi/session.jsonl");
 
     /// pi's stdout from a recorded fixture (lines starting `>> ` are what the
     /// recorder wrote to stdin).
@@ -1790,69 +1610,6 @@ mod tests {
         };
         assert_eq!(status.as_deref(), Some("completed"));
         assert_eq!(output.as_deref(), Some("scout completed: 12 files"));
-    }
-
-    #[test]
-    fn transcript_waits_on_an_async_subagent() {
-        let session = r#"{"type":"message","id":"u1","message":{"role":"user","content":"map it","timestamp":1}}
-{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_1","name":"subagent","arguments":{"agent":"scout","async":true}}],"stopReason":"toolUse","timestamp":2}}
-{"type":"message","id":"r1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"subagent","content":[{"type":"text","text":"Async: scout [run-7]"}],"details":{"asyncId":"run-7","runId":"run-7"},"isError":false,"timestamp":3}}
-{"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"text","text":"Launched."}],"stopReason":"stop","timestamp":4}}
-{"type":"custom_message","id":"c1","customType":"subagent-notify","content":"scout completed","display":false,"details":{"runs":[{"agent":"scout","status":"completed","runId":"run-7"}]}}
-{"type":"message","id":"u2","message":{"role":"user","content":"Inspect subagent updates above.","timestamp":5}}
-{"type":"message","id":"a3","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"stopReason":"stop","timestamp":6}}
-"#;
-        let events = Transcript::new().feed(session.as_bytes());
-        assert_eq!(
-            states(&events),
-            [
-                RunState::Working { progress: None },
-                RunState::Working { progress: None },
-                RunState::Waiting,
-                RunState::Working { progress: None },
-                RunState::Done,
-            ]
-        );
-        let call = |completed: bool| {
-            events.iter().position(|e| match e {
-                Event::ItemCompleted { id, .. } => completed && id == "call_1",
-                Event::ItemUpdated { id, .. } => !completed && id == "call_1",
-                _ => false,
-            })
-        };
-        assert!(call(false) < call(true), "launched, then reported back");
-    }
-
-    #[test]
-    fn transcript_replays_recorded_session() {
-        let mut t = Transcript::new();
-        let events = t.feed(SESSION.as_bytes());
-        assert!(
-            matches!(&events[0], Event::SessionStarted { native_id, .. } if native_id.starts_with("01a1"))
-        );
-        assert_eq!(
-            states(&events),
-            [
-                RunState::Working { progress: None },
-                RunState::Working { progress: None },
-                RunState::Done,
-            ]
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, Event::ItemCompleted { id, .. } if id == "call_1"))
-        );
-        assert!(matches!(events.last(), Some(Event::TurnCompleted)));
-    }
-
-    #[test]
-    fn session_dir_encoding() {
-        assert_eq!(
-            session_dir("/home/u/my proj"),
-            ".pi/agent/sessions/--home-u-my proj--"
-        );
-        assert_eq!(session_dir("C:\\src\\x"), ".pi/agent/sessions/--C--src-x--");
     }
 
     fn invoke(d: &mut PiDriver, name: &str, args: &str) -> Result<Vec<Value>, DriverError> {

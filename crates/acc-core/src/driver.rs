@@ -2,9 +2,9 @@
 //!
 //! A driver is a pure state machine: bytes from the harness go in, [`Event`]s
 //! come out; [`Command`]s go in, bytes for the harness come out. The transport
-//! that carries the bytes (local pipe, SSH channel, detached FIFO, multiplexer
-//! pane) is not the driver's concern, so the same driver runs on every platform
-//! and is tested by replaying recorded sessions.
+//! that carries the bytes (local pipe, SSH channel, detached FIFO) is not the
+//! driver's concern, so the same driver runs on every platform and is tested
+//! by replaying recorded sessions.
 
 use serde_json::Value;
 

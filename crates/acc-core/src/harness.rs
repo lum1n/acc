@@ -41,9 +41,8 @@ pub struct LaunchSpec {
     pub protocol: Protocol,
 }
 
-/// How a TUI the user started was launched, so ACC can start the harness
-/// the same way: inside the same wrapper (a `bwrap` sandbox, `env`, `nice`,
-/// ...), from the same executable, with the user's own flags.
+/// How to start a harness other than plainly: inside a wrapper (a `bwrap`
+/// sandbox, `env`, `nice`, ...), from another executable, with extra flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launcher {
     /// The wrapper's argv up to the harness, e.g. `bwrap ... --`.
@@ -53,14 +52,14 @@ pub struct Launcher {
     /// path can differ from the host's).
     #[serde(default)]
     pub program: Option<String>,
-    /// The user's flags to keep (resume flags removed).
+    /// Flags added after the harness's own (never resume flags).
     #[serde(default)]
     pub args: Vec<String>,
 }
 
 impl Launcher {
     /// Runs `spec` through this launcher: prefix, then the program, the
-    /// harness arguments and the user's flags.
+    /// harness arguments and the extra flags.
     pub fn wrap(&self, mut spec: LaunchSpec) -> LaunchSpec {
         if let Some(program) = &self.program {
             spec.program = program.clone();

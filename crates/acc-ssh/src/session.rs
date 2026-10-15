@@ -104,13 +104,13 @@ impl Session {
         self.with_core(|c| c.state().cloned())
     }
 
-    /// Merges a state seen elsewhere (a transcript, a pane's OSC 7501).
+    /// Merges a state the embedder saw outside the harness's output.
     /// Returns `true` if the visible state changed.
     pub fn observe(&self, state: SessionState) -> bool {
         self.with_core(|c| c.observe(state))
     }
 
-    /// The harness's own session id, for resume and takeover, once known.
+    /// The harness's own session id, for resume, once known.
     pub fn native_id(&self) -> Option<String> {
         self.with_core(|c| c.native_id().map(str::to_owned))
     }

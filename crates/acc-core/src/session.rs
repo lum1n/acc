@@ -22,6 +22,7 @@
 //! it later (after a relaunch) and read only what the log gained since.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,8 +34,8 @@ use crate::command::{Apply, Attachment, Command, CommandEntry, OptionDef, Option
 use crate::detached::{SessionDir, Status, parse_status};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
+use crate::exec::Exec;
 use crate::harness::{Harness, LaunchSpec, Launcher};
-use crate::multiplexer::Exec;
 use crate::pi::PiDriver;
 use crate::policy::{Decision, Policy, Request};
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
@@ -77,9 +78,12 @@ pub struct LaunchRequest {
     pub parent: Option<String>,
     /// Set when the new session replaces `parent`, which should be stopped.
     pub replaces_parent: bool,
-    pub origin: Origin,
-    /// Start the harness the way a taken-over TUI was started (its sandbox
-    /// or other wrapper, executable and flags).
+    /// Notes the embedder keeps with the session (where it came from, say).
+    /// Stored in `spec.json` and carried over to relaunches.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Start the harness inside a wrapper, from another executable or with
+    /// extra flags.
     #[serde(default)]
     pub launcher: Option<Launcher>,
     /// The git worktree `cwd` is in, made with
@@ -87,20 +91,6 @@ pub struct LaunchRequest {
     /// discard its changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
-}
-
-/// How a session came to be.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Origin {
-    #[default]
-    Started,
-    /// Resumed headless from a TUI session ACC took over.
-    TakenOver {
-        /// Multiplexer pane the TUI ran in, as `<kind>:<target>`.
-        pane: Option<String>,
-        transcript: Option<String>,
-    },
 }
 
 /// Everything another client needs to attach; stored as `spec.json`.
@@ -121,9 +111,10 @@ pub struct SessionSpec {
     pub title: Option<String>,
     pub created_ms: u64,
     pub parent: Option<String>,
-    #[serde(default)]
-    pub origin: Origin,
-    /// Kept so relaunches (fork, model change) and hand-back use it too.
+    /// See [`LaunchRequest::labels`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Kept so relaunches (fork, model change) use it too.
     #[serde(default)]
     pub launcher: Option<Launcher>,
     /// The session's git worktree (see [`LaunchRequest::worktree`]).
@@ -149,7 +140,7 @@ impl SessionSpec {
             title: None,
             created_ms,
             parent: None,
-            origin: Origin::Started,
+            labels: BTreeMap::new(),
             launcher: None,
             worktree: None,
         }
@@ -378,7 +369,7 @@ impl Session {
             title: req.title.clone(),
             created_ms: now_ms,
             parent: req.parent.clone(),
-            origin: req.origin.clone(),
+            labels: req.labels.clone(),
             launcher: req.launcher.clone(),
             worktree: req.worktree.clone(),
         };
@@ -776,7 +767,7 @@ impl Session {
             attachments: Vec::new(),
             parent: Some(self.spec.id.clone()),
             replaces_parent: !fork,
-            origin: self.spec.origin.clone(),
+            labels: self.spec.labels.clone(),
             launcher: self.spec.launcher.clone(),
             worktree: self.spec.worktree.clone(),
         }
@@ -1090,7 +1081,7 @@ impl Session {
 
 /// Updates for items [`Transcript`] closed itself, as if the harness had
 /// completed them.
-pub(crate) fn completions(changes: Vec<ItemChange>, replay: bool) -> impl Iterator<Item = Update> {
+pub fn completions(changes: Vec<ItemChange>, replay: bool) -> impl Iterator<Item = Update> {
     changes.into_iter().map(move |change| Update {
         event: Event::ItemCompleted {
             id: change.id().to_owned(),

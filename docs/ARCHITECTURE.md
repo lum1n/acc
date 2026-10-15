@@ -7,7 +7,10 @@
 - Embed natively on iOS and Android, and run on web and desktop. **Performance and stability** are
   the top criteria.
 - **Install nothing on hosts.** A phone (for example an iOS SSH app embedding ACC) must be able to
-  start, observe, control and take over sessions over plain SSH.
+  start, observe and control sessions over plain SSH.
+- **Only sessions ACC starts.** Harness TUIs a user started themselves are the separate observer
+  library's job (its own repository, built on ACC): it finds them, follows them, co-drives their
+  panes and takes them over into ordinary ACC sessions. Nothing here knows about them.
 - Usage data comes only from what each harness reports itself (tokens, cost, context, quota where
   available). ACC makes no calls to provider usage endpoints.
 
@@ -17,12 +20,12 @@
             acc-core (Rust, sans-IO, no async runtime)
  ┌──────────────────────────────────────────────────────────────────┐
  │ harness   state (OSC 7501 vocabulary, ranked sources)   event     │
- │ command/options   driver trait   ndjson   osc7501   multiplexer   │
+ │ command/options   driver trait   ndjson   exec                    │
  │ detached (FIFO + log scripts)    shell (quoting)                  │
  └──────────────┬──────────────────────────────┬────────────────────┘
                 │ bytes                        │ bytes
    transports (outside the core): local process · acc-ssh (SSH exec channel
-   to a detached FIFO/log) · multiplexer pane (tmux control mode, zellij, screen, Rex)
+   to a detached FIFO/log)
                 │
    bindings: acc-ffi (Swift, Kotlin) · acc-wasm (JS) · acc-cli
 ```
@@ -63,7 +66,7 @@ resize first. Transcripts show a prompt's text, or `[image]` when it had none.
 
 `acc_core::acp::AcpDriver` speaks ACP protocol version 1 (`@agentclientprotocol/sdk` 1.8.0). It
 sends `initialize`, then opens the session itself (`session/new`, or `session/load` / `session/resume`
-for takeover), so transports write `Driver::poll_transmit()` after every `on_output`. Options come from
+to resume), so transports write `Driver::poll_transmit()` after every `on_output`. Options come from
 the agent's `configOptions` (categories `model`, `mode`, `thought_level`, Copilot's `allow_all`), with the
 legacy `modes`/`models` fields and `session/set_mode`/`session/set_model` as fallback. Cursor's model is a
 spawn flag (`agent --model X acp`), reported as `Apply::Restart`. Slash commands are prompt text, taken
@@ -108,8 +111,8 @@ describe what a client has to draw:
 The bindings carry two session layers. `acc_core::live::Session` is for an app that owns a live byte
 stream to the harness (a pipe, an SSH channel, `acc-ssh`): it picks the driver for a harness
 (`SessionConfig { harness, cwd, opening: New | Resume | Attach, model, client_tag }`), stamps state
-changes with the caller's clock, merges state from other sources (`observe`, e.g. OSC 7501 from a
-pane) and remembers the harness's session id. It stays sans-IO, so the app owns the transport:
+changes with the caller's clock, merges state the app saw elsewhere (`observe`) and remembers the
+harness's session id. It stays sans-IO, so the app owns the transport:
 
 ```
 spawn launch_spec() on the host  →  write start()
@@ -123,14 +126,13 @@ on EOF:               exited(code, now_ms)
 | Swift, Kotlin | `acc-ffi` (UniFFI 0.32) | Typed records and enums mirroring the core; harness-native payloads as JSON strings (`extensions_json`, `payload_json`). `Event.UsageUpdated` / `QuotaUpdated` are the core's `Usage` / `Quota` events. |
 | JS (browser, Node) | `acc-wasm` (wasm-bindgen) | Plain objects in the core's serde shape (snake_case, `type`-tagged), so they match `acc run --json`; bytes are `Uint8Array`; TypeScript declarations ship in the generated `.d.ts`. |
 
-Both also expose `TranscriptObserver` (follow a Claude, Codex or pi transcript), `DetachedSession`
-(the daemonless scripts below), `Osc7501Scanner` and `shell_quote`. CI replays a recorded Claude
+Both also expose `DetachedSession` (the daemonless scripts below), `tui_command` (opening a
+harness's own TUI for `Exec::Terminal` entries) and `shell_quote`. CI replays a recorded Claude
 session through the real library from Swift (macOS), Kotlin (JVM), Python and Node.
 
 The second layer is the detached-session byte pump over `acc_core::session::Session` (see
 [Sessions](#sessions)): `AccSession` (launch, attach with replay, snapshot and restore, transcript,
-permissions), `AccFanIn` (many logs on one channel), `AccObserved` and `AccTakeover` (foreign TUIs)
-and the host scripts, where the app runs the scripts ACC hands it over its own channels. Both
+permissions), `AccFanIn` (many logs on one channel) and the host scripts, where the app runs the scripts ACC hands it over its own channels. Both
 bindings expose the same objects and functions under the same names; `acc-wasm/tests/parity.rs`
 fails when they differ, except for the SSH transport objects below, which a browser can't use (no
 raw sockets). In JS, records are plain objects and errors from this layer are `Error`s named
@@ -145,12 +147,10 @@ tokio runtime the library starts on first use (UniFFI's `tokio` support).
   `reconnect` (on returning to the foreground), `disconnect`, `exec`.
 - `launchSession` / `attachSession` → `RemoteSession`: the core `Session` on a detached session
   (`nextEvents`, `send`, `stop`, `state`, `commands`, `options`). `listSessions`, `removeSession`.
-- `listPanes`, `locatePane(pid)`, `spawnPane`, `paneSession` → `PaneSession`: a harness TUI in a
-  tmux, zellij, screen or Rex pane (`nextEvents`, `send`, `sendInput`, `capture`, `exit`, `kill`).
 
 Errors are typed (`Timeout` and `Disconnected` mean calling again retries; `HostKeyRejected` carries
 the fingerprint to show). Kotlin needs `kotlinx-coroutines-core` for the suspend calls. A Rust test
-drives this surface against a real sshd and tmux; the Swift, Kotlin and Python smoke tests call it
+drives this surface against a real sshd; the Swift, Kotlin and Python smoke tests call it
 through the generated bindings.
 
 ## Daemonless sessions
@@ -163,7 +163,7 @@ session.
 
 Every client reads and writes the same layout under `~/.acc/s/<id>/`, whichever layer started the
 session: `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json` (one line, a
-`session::SessionSpec`: harness, cwd, launch command, model, native id, title, origin, launcher),
+`session::SessionSpec`: harness, cwd, launch command, model, native id, title, labels, launcher),
 `sent` (write ids already delivered), `lock`, and `events.ndjson`, `watch.pid` and `watch.tail`
 while a follower runs (below). The status line is `alive <pid> <log bytes>`,
 `exited <code|-> <log bytes>` or `missing`; the list script prints one `S` line per session plus a
@@ -211,21 +211,7 @@ it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). 
   itself and stamping state with the clock. A second client attaches from offset 0 and replays the
   session into a fresh core.
 
-`acc_ssh::pane` runs the multiplexer commands below over the same `Host`: list, locate (from a
-harness PID's environment), spawn and kill panes, and `Pane`, which co-drives a harness TUI. `Pane`
-turns commands into keystrokes (permission answers keyed from the dialog on screen at that moment),
-and its `next_events` streams the multiplexer's watch output for OSC 7501 states, reads the screen
-when the pane draws (at most every `Pacing::min_gap`, at least every `Pacing::idle`), reopens the
-watch after a dropped connection, and reports `Exited` once the pane is gone. A channel that fails
-to open on a connection that died unnoticed is retried once on a fresh one, since the script never
-started; anything that may have run (a keystroke) is never repeated.
-
-CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session, with
-tmux behind it for `Pane`.
-
-**Takeover** of a session ACC didn't start: find the process, map it to the harness's session id,
-wait for the turn to end (or force), close the TUI, resume headless detached, auto-continue if a turn
-was interrupted. Inside a multiplexer ACC can also co-drive the TUI via the multiplexer's CLI.
+CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session.
 
 ## Sessions
 
@@ -332,55 +318,23 @@ back and the follow-up is answered, so they stay `Working`.
 | Harness | How a subagent shows up | Child conversation |
 |---|---|---|
 | Claude | `Agent`/`Task` tool call; `system/task_started`, `task_progress`, `task_updated`, `task_notification` merge onto it; a background launch's tool result only acknowledges (`isAsync`), the notification finishes it | `~/.claude/projects/<proj>/<session>/subagents/agent-<id>.jsonl`, named by `agent-<id>.meta.json`'s `toolUseId`; `Driver::launch` adds `--forward-subagent-text` so a driven session streams it live too |
-| Codex | 0.162: a `subAgentActivity` item (`kind: started`) names the child thread (`agentThreadId`) and the agent (`agentPath`); its immediate completion only updates it, and a later `subAgentActivity` with another `kind` finishes it with the child's last message as the report. Older: `collabAgentToolCall` (`spawnAgent`, ...) and `thread/started` with `source.subAgent.thread_spawn.parent_thread_id`. `wait` and the other collab tools stay `collabAgentToolCall` | the child's own thread: its `item/*` notifications carry its `threadId`, mapped back to the spawning item. Rollouts: `SubAgentActivity` records name the thread, the spawn's task is encrypted (shown as no prompt), and the child's `FINAL_ANSWER` inter-agent message is the report |
+| Codex | 0.162: a `subAgentActivity` item (`kind: started`) names the child thread (`agentThreadId`) and the agent (`agentPath`); its immediate completion only updates it, and a later `subAgentActivity` with another `kind` finishes it with the child's last message as the report. Older: `collabAgentToolCall` (`spawnAgent`, ...) and `thread/started` with `source.subAgent.thread_spawn.parent_thread_id`. `wait` and the other collab tools stay `collabAgentToolCall` | the child's own thread: its `item/*` notifications carry its `threadId`, mapped back to the spawning item |
 | Cursor, Copilot, opencode (ACP) | a `task`/`subagent`-shaped tool call (name, or `rawInput.subagent_type`/`agent` with a prompt); the report is opencode's `task_id: …`/`<task_result>` (1.x) or `<subagent sessionID="…">` (2.0) wrapper, unwrapped by `item::detail` | opencode forwards the child session's updates under the parent's session id, tagged `_meta["opencode/child-session"]`; other agents report only the final text |
 | pi | the pi-subagents extension's `subagent` tool; an `async: true` launch's result only acknowledges (`details.asyncId`), its `subagent-notify` custom message finishes it | none (no child transcript) |
 
-**Observing** (a TUI ACC didn't start): `Observed::children_exec` finds subagent transcripts not
-followed yet — Claude's `subagents_script` next to the session, Codex's rollout `locate_script` for a
-spawned thread id — and `Observed::on_children` matches what it finds to the spawning item.
-`Observed::child_feed_entries` joins the session's own entry in the client's fan-in; `Observed::feed_child`
-routes each child's bytes through its own reader (`claude::transcript::Observer::for_subagent`,
-`codex::rollout::Observer::for_child`), whose items carry the spawning item as `parent` and whose state
-and usage are the parent's, not reported again.
-
-## Foreign sessions
-
-`discover` lists harness TUIs ACC didn't start: process, working directory, multiplexer pane (from
-its environment), and its transcript (an open file, else the newest in the harness's directory).
-`observe::Observed` follows that transcript (Claude, Codex and pi observers emit full conversation
-items, not just state), infers a waiting approval from a quiet outstanding tool call, and can type
-prompts into the pane. `takeover::Takeover` is the state machine for moving it into a detached
-session: wait for a safe point (or interrupt when forced), close the TUI the way a user would,
-confirm the process is gone, resume headless with the harness's session id. `hand_back_exec` types
-the resume command back into the original pane.
-
-## Multiplexers
-
-`acc_core::multiplexer` drives harnesses running inside tmux, zellij, screen and Rex with the host's
-own binary over SSH exec channels. A `Backend` per multiplexer builds the commands (list panes,
-capture, send text/paste/keys, spawn, kill, watch) and parses their output; nothing is installed.
-
-| | Watch stream | OSC 7501 |
-|---|---|---|
-| tmux 3.2+ | control mode (`tmux -C attach -f ignore-size`), raw `%output` bytes | reports sent without the probe (pi with `PI_PROGRAM_STATUS=1`) |
-| zellij 0.44+ | `zellij subscribe -f json`, rendered lines | no |
-| screen 4.01+ | window log tailed with `tail -F` (best effort) | as tmux |
-| Rex | `rex events --json`, native program-status records | yes, for every harness that emits it |
-
-`multiplexer::tui` turns ACC commands into keystrokes for co-driving a harness TUI in its pane (pi
-fully; prompts, interrupt and common slash commands for Claude and Codex; never images, which only
-the headless protocols carry). Approval dialogs in a pane still need per-harness screen matching. The Rex backend follows Rex's docs and is unverified
-until Rex ships a server outside the macOS app. Tests drive real tmux, zellij and screen in CI.
-
+## State
 
 `RunState` uses OSC 7501's vocabulary (idle, working, blocked{permission,question,auth}, done,
 error) plus `exited` and `waiting` (a turn ended with a background subagent still running, whose
-report will start another turn on its own). Observations are ranked by source (`Native` > `Osc7501` > `Transcript` >
-`ScreenMatch` > `Heuristic`); a lower source only overrides a higher one once it is stale.
+report will start another turn on its own). Observations are ranked by source (`Native` >
+`Osc7501` > `Transcript` > `ScreenMatch` > `Heuristic`); a lower source only overrides a higher one
+once it is stale. ACC's drivers report `Native`; the other sources are for states an embedder sees
+outside the harness's output and merges with `observe`.
+
+**Labels.** `LaunchRequest::labels` are the embedder's notes on a session (where it came from,
+say). ACC stores them in `spec.json`, carries them over to relaunches, and never reads them.
 
 ## Research
 
 The design decisions come from the project's research notes: core language and harness survey,
-daemonless SSH control and takeover, state and usage monitoring, commands and options, and
-multiplexer control.
+daemonless SSH control, state and usage monitoring, and commands and options.

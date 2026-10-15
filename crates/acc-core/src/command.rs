@@ -163,8 +163,7 @@ pub enum Exec {
     /// Codex typed skill input item.
     SkillItem,
     /// Only the harness's own TUI can run it (a full-screen dialog with no
-    /// headless equivalent). Clients open the TUI, e.g. with
-    /// `multiplexer::tui::launch`, instead of invoking it.
+    /// headless equivalent). Clients open the TUI instead of invoking it.
     Terminal,
 }
 

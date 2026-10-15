@@ -22,7 +22,7 @@ pub type ItemId = String;
 pub enum Event {
     SessionStarted {
         harness: Harness,
-        /// The harness's own session/thread id, used for resume and takeover.
+        /// The harness's own session/thread id, used for resume.
         native_id: String,
         model: Option<String>,
     },
