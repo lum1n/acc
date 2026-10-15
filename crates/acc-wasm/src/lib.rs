@@ -114,6 +114,38 @@ export interface Quota {
   windows: QuotaWindow[];
 }
 
+export interface Spend {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+}
+
+/** One session's spending, from `AccSession.usageRecord()`. Keep it for sessions that are gone. */
+export interface UsageRecord {
+  session_id: string;
+  harness: HarnessId;
+  /** Quarter-hour buckets, oldest first; `start_ms` is ms since the Unix epoch. */
+  buckets: { start_ms: number; spend: Spend }[];
+  quota?: Quota;
+  quota_at_ms?: number;
+}
+
+export interface UsageRollup {
+  total: Spend;
+  accounts: {
+    harness: HarnessId;
+    account: string | null;
+    plan: string | null;
+    sessions: number;
+    spend: Spend;
+    quota: Quota | null;
+  }[];
+  /** Oldest first; `date` is `YYYY-MM-DD` in the time zone given. */
+  days: { date: string; spend: Spend; harnesses: { harness: HarnessId; spend: Spend }[] }[];
+}
+
 export type Event =
   | { type: "session_started"; harness: HarnessId; native_id: string; model: string | null }
   | ({ type: "state_changed" } & SessionState)

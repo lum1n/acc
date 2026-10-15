@@ -214,6 +214,11 @@ impl AccSession {
         lock(&self.inner).quota().cloned().map(Into::into)
     }
 
+    /// What the session spent over time, for `roll_up_usage`.
+    pub fn usage_record(&self) -> AccUsageRecord {
+        lock(&self.inner).usage_record().into()
+    }
+
     pub fn permissions(&self) -> Vec<AccPermission> {
         lock(&self.inner)
             .permissions()
@@ -329,6 +334,14 @@ pub fn parse_unified_diff(text: String) -> Vec<AccFileDiff> {
         .into_iter()
         .map(Into::into)
         .collect()
+}
+
+/// Adds sessions' usage up per account and per local day;
+/// `utc_offset_minutes` is the time zone days are split in (120 for UTC+2).
+#[uniffi::export]
+pub fn roll_up_usage(records: Vec<AccUsageRecord>, utc_offset_minutes: i32) -> AccUsageRollup {
+    let records: Vec<_> = records.into_iter().map(Into::into).collect();
+    acc_core::usage::roll_up(&records, utc_offset_minutes).into()
 }
 
 /// Display name of a harness.
@@ -510,6 +523,41 @@ mod tests {
             AccSession::restore("{}".into(), spec),
             Err(AccError::InvalidSession { .. })
         ));
+    }
+
+    #[test]
+    fn usage_rolls_up_through_ffi() {
+        const WAKES: &[u8] =
+            include_bytes!("../../acc-core/tests/fixtures/claude/background-agent-wakes.ndjson");
+        let s = AccSession::launch(
+            AccLaunchRequest {
+                harness: AccHarness::Claude,
+                cwd: "/w".into(),
+                model: None,
+                permission: None,
+                resume: None,
+                fork: false,
+                title: None,
+                prompt: None,
+                attachments: vec![],
+                parent: None,
+                replaces_parent: false,
+                origin: AccOrigin::Started,
+                launcher: None,
+            },
+            new_session_id(AccHarness::Claude, vec![11; 15]),
+            "ph".into(),
+            1_792_018_800_000,
+        )
+        .unwrap();
+        let a = AccSession::attach(s.spec().json, "desk".into()).unwrap();
+        a.on_status(format!("exited 0 {}", WAKES.len()), 2);
+        a.feed(WAKES.to_vec(), 3);
+        let rollup = roll_up_usage(vec![a.usage_record()], 0);
+        assert_eq!(rollup.total.output_tokens, 335 + 75);
+        assert_eq!(rollup.days.len(), 1);
+        assert_eq!(rollup.days[0].date, "2026-10-14");
+        assert_eq!(rollup.accounts[0].harness, AccHarness::Claude);
     }
 
     #[test]

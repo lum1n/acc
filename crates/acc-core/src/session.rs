@@ -38,6 +38,7 @@ use crate::multiplexer::Exec;
 use crate::pi::PiDriver;
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
 use crate::transcript::{ItemChange, Transcript};
+use crate::usage::{Spending, UsageRecord};
 
 /// Version of the `spec.json` format.
 pub const SPEC_VERSION: u32 = 1;
@@ -216,7 +217,10 @@ pub struct Session {
     tracker: StateTracker,
     transcript: Transcript,
     usage: Usage,
+    /// Every [`Usage`] event added up over time, for [`crate::usage::roll_up`].
+    spending: Spending,
     quota: Option<Quota>,
+    quota_at_ms: Option<u64>,
     permissions: Vec<Permission>,
     transmit: Vec<u8>,
     /// First prompt, held until the harness has a session to take it.
@@ -240,7 +244,11 @@ struct Snapshot<'a> {
     tracker: Cow<'a, StateTracker>,
     transcript: Cow<'a, Transcript>,
     usage: Cow<'a, Usage>,
+    #[serde(default)]
+    spending: Option<Cow<'a, Spending>>,
     quota: Cow<'a, Option<Quota>>,
+    #[serde(default)]
+    quota_at_ms: Option<u64>,
     permissions: Cow<'a, [Permission]>,
     pending_prompt: Cow<'a, Option<Command>>,
     spec_dirty: bool,
@@ -387,7 +395,9 @@ impl Session {
             tracker: StateTracker::new(STALE_MS),
             transcript: Transcript::new(),
             usage: Usage::default(),
+            spending: Spending::new(harness),
             quota: None,
+            quota_at_ms: None,
             permissions: Vec::new(),
             transmit,
             pending_prompt,
@@ -415,7 +425,9 @@ impl Session {
             tracker: StateTracker::new(STALE_MS),
             transcript: Transcript::new(),
             usage: Usage::default(),
+            spending: Spending::new(spec.harness),
             quota: None,
+            quota_at_ms: None,
             permissions: Vec::new(),
             transmit: Vec::new(),
             pending_prompt: None,
@@ -438,7 +450,9 @@ impl Session {
             tracker: Cow::Borrowed(&self.tracker),
             transcript: Cow::Borrowed(&self.transcript),
             usage: Cow::Borrowed(&self.usage),
+            spending: Some(Cow::Borrowed(&self.spending)),
             quota: Cow::Borrowed(&self.quota),
+            quota_at_ms: self.quota_at_ms,
             permissions: Cow::Borrowed(&self.permissions),
             pending_prompt: Cow::Borrowed(&self.pending_prompt),
             spec_dirty: self.spec_dirty,
@@ -488,7 +502,11 @@ impl Session {
             tracker: snap.tracker.into_owned(),
             transcript: snap.transcript.into_owned(),
             usage: snap.usage.into_owned(),
+            spending: snap
+                .spending
+                .map_or_else(|| Spending::new(spec.harness), Cow::into_owned),
             quota: snap.quota.into_owned(),
+            quota_at_ms: snap.quota_at_ms,
             permissions: snap.permissions.into_owned(),
             transmit: Vec::new(),
             pending_prompt: snap.pending_prompt.into_owned(),
@@ -730,6 +748,20 @@ impl Session {
         self.quota.as_ref()
     }
 
+    /// What the session spent over time and the quota it last reported, to
+    /// add up across sessions with [`crate::usage::roll_up`]. Usage replayed
+    /// from the log on attach is dated to the session's start, since the log
+    /// has no times; usage read live is dated by the caller's clock.
+    pub fn usage_record(&self) -> UsageRecord {
+        UsageRecord {
+            session_id: self.spec.id.clone(),
+            harness: self.spec.harness,
+            buckets: self.spending.buckets(),
+            quota: self.quota.clone(),
+            quota_at_ms: self.quota_at_ms,
+        }
+    }
+
     pub fn permissions(&self) -> &[Permission] {
         &self.permissions
     }
@@ -763,7 +795,9 @@ impl Session {
         self.tracker = StateTracker::new(STALE_MS);
         self.transcript = Transcript::new();
         self.usage = Usage::default();
+        self.spending = Spending::new(self.spec.harness);
         self.quota = None;
+        self.quota_at_ms = None;
         self.permissions.clear();
         self.transmit.clear();
         self.pending_prompt = None;
@@ -834,8 +868,15 @@ impl Session {
                         }
                     }
                 }
-                Event::Usage(u) => merge_usage(&mut self.usage, u),
-                Event::Quota(q) => self.quota = Some(q.clone()),
+                Event::Usage(u) => {
+                    merge_usage(&mut self.usage, u);
+                    let at = if replay { self.spec.created_ms } else { now_ms };
+                    self.spending.record(u, at);
+                }
+                Event::Quota(q) => {
+                    self.quota = Some(q.clone());
+                    self.quota_at_ms = Some(if replay { self.spec.created_ms } else { now_ms });
+                }
                 Event::PermissionRequested {
                     request_id,
                     title,
@@ -1269,6 +1310,20 @@ mod tests {
         assert!(!b.is_alive());
         assert_eq!(b.state().map(|s| &s.state), Some(&RunState::Exited));
         assert_eq!(b.spec().title, a.spec().title);
+    }
+
+    #[test]
+    fn usage_record_adds_up_turns_and_survives_a_restore() {
+        let log = include_str!("../tests/fixtures/claude/background-agent-wakes.ndjson");
+        let (a, _) = attached(Harness::Claude, log, true);
+        let rec = a.usage_record();
+        assert_eq!(rec.session_id, "s1");
+        let spent: u64 = rec.buckets.iter().map(|b| b.spend.output_tokens).sum();
+        assert_eq!(spent, 335 + 75);
+        // Replayed history is dated to the session's start.
+        assert!(rec.buckets.iter().all(|b| b.start_ms == 0));
+        let b = Session::restore(&a.snapshot().unwrap(), a.spec().clone()).unwrap();
+        assert_eq!(b.usage_record(), rec);
     }
 
     #[test]

@@ -26,6 +26,7 @@
 //! - [`live`]: a driver picked by harness, with timestamps and merged state,
 //!   for embedders that own a live byte stream (what `acc-ssh` builds on).
 //! - [`question`]: multi-part questions and how to answer all of them.
+//! - [`usage`]: what sessions spent, added up per account and per day.
 
 pub mod claude;
 pub mod codex;
@@ -50,6 +51,7 @@ pub mod shell;
 pub mod state;
 pub mod takeover;
 pub mod transcript;
+pub mod usage;
 mod wire;
 
 pub use event::Event;

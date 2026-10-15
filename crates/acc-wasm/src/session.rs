@@ -251,6 +251,12 @@ impl AccSession {
         js(&self.inner.quota())
     }
 
+    /// What the session spent over time (`UsageRecord`), for `rollUpUsage`.
+    #[wasm_bindgen(js_name = usageRecord)]
+    pub fn usage_record(&self) -> JsValue {
+        js(&self.inner.usage_record())
+    }
+
     pub fn permissions(&self) -> JsValue {
         js(self.inner.permissions())
     }
@@ -371,6 +377,14 @@ pub fn new_session_id(harness: &str, entropy: &[u8]) -> Result<String, JsValue> 
 #[wasm_bindgen(js_name = parseUnifiedDiff)]
 pub fn parse_unified_diff(text: &str) -> JsValue {
     js(&item::parse_unified(text, ""))
+}
+
+/// Adds `UsageRecord`s up per account and per local day: a `UsageRollup`.
+/// `utc_offset_minutes` is the time zone days are split in (120 for UTC+2).
+#[wasm_bindgen(js_name = rollUpUsage)]
+pub fn roll_up_usage(records: JsValue, utc_offset_minutes: i32) -> Result<JsValue, JsValue> {
+    let records: Vec<acc_core::usage::UsageRecord> = arg(records, "usage records")?;
+    Ok(js(&acc_core::usage::roll_up(&records, utc_offset_minutes)))
 }
 
 /// Display name of a harness.

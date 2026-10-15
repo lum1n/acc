@@ -232,6 +232,16 @@ file change with hunks) and `item::parse_unified` reads `git diff`. Commands a h
 out with a new process (Claude fork, a model Cursor takes at spawn) come back as
 `Outbound::Relaunch`.
 
+**Usage across sessions.** Harnesses count differently: Claude and the ACP agents report each
+turn's tokens, Codex and pi running totals (pi's start over with a new session), and all of them a
+running total for cost. `usage::Spending` turns a session's `Usage` events into what was spent, in
+quarter-hour buckets (every UTC offset in use is a multiple of 15 minutes), and
+`Session::usage_record` hands it out with the newest quota the session reported. `usage::roll_up`
+adds records up per account (or plan, when the harness names no account), keeping each quota
+window's newest reading, and per local day in the time zone the client gives. Clients keep records
+of removed sessions to count them. The log has no times, so usage replayed on attach is dated to the
+session's start; usage read live is dated by the client's clock, and snapshots keep the dates.
+
 `detached::fan_in_script` follows any number of logs and transcripts on one SSH channel, tagged per
 file, with byte offsets so a restarted follower resumes without loss; closing the channel takes all
 its processes down. One long-lived channel per host keeps a client inside sshd's per-connection

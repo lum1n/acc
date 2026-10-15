@@ -17,6 +17,7 @@ use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineT
 use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
 use acc_core::transcript::{Item, ItemChange, ItemStatus};
+use acc_core::usage::{AccountUsage, Bucket, DayUsage, HarnessSpend, Spend, UsageRecord, UsageRollup};
 use acc_core::{Exec, Harness};
 use serde_json::Value;
 
@@ -192,6 +193,26 @@ impl From<Quota> for AccQuota {
                 .windows
                 .into_iter()
                 .map(|w: QuotaWindow| AccQuotaWindow {
+                    id: w.id,
+                    used_percent: w.used_percent,
+                    window_minutes: w.window_minutes,
+                    resets_at: w.resets_at,
+                    status: w.status,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<AccQuota> for Quota {
+    fn from(q: AccQuota) -> Self {
+        Self {
+            account: q.account,
+            plan: q.plan,
+            windows: q
+                .windows
+                .into_iter()
+                .map(|w| QuotaWindow {
                     id: w.id,
                     used_percent: w.used_percent,
                     window_minutes: w.window_minutes,
@@ -1110,6 +1131,174 @@ impl From<Availability> for AccAvailability {
             path: a.path,
             version: a.version,
             compat: a.compat.into(),
+        }
+    }
+}
+
+/// Tokens and cost spent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, uniffi::Record)]
+pub struct AccSpend {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+}
+
+impl From<Spend> for AccSpend {
+    fn from(s: Spend) -> Self {
+        Self {
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            cache_read_tokens: s.cache_read_tokens,
+            cache_write_tokens: s.cache_write_tokens,
+            cost_usd: s.cost_usd,
+        }
+    }
+}
+
+impl From<AccSpend> for Spend {
+    fn from(s: AccSpend) -> Self {
+        Self {
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            cache_read_tokens: s.cache_read_tokens,
+            cache_write_tokens: s.cache_write_tokens,
+            cost_usd: s.cost_usd,
+        }
+    }
+}
+
+/// What was spent in one quarter of an hour.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AccBucket {
+    /// Start of the window, ms since the Unix epoch.
+    pub start_ms: u64,
+    pub spend: AccSpend,
+}
+
+/// One session's usage for `roll_up_usage`. Keep these for sessions that
+/// are gone, so the day's totals still count them.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccUsageRecord {
+    pub session_id: String,
+    pub harness: AccHarness,
+    pub buckets: Vec<AccBucket>,
+    pub quota: Option<AccQuota>,
+    /// When the session reported `quota`, ms since the Unix epoch.
+    pub quota_at_ms: Option<u64>,
+}
+
+impl From<UsageRecord> for AccUsageRecord {
+    fn from(r: UsageRecord) -> Self {
+        Self {
+            session_id: r.session_id,
+            harness: r.harness.into(),
+            buckets: r
+                .buckets
+                .into_iter()
+                .map(|b| AccBucket {
+                    start_ms: b.start_ms,
+                    spend: b.spend.into(),
+                })
+                .collect(),
+            quota: r.quota.map(Into::into),
+            quota_at_ms: r.quota_at_ms,
+        }
+    }
+}
+
+impl From<AccUsageRecord> for UsageRecord {
+    fn from(r: AccUsageRecord) -> Self {
+        Self {
+            session_id: r.session_id,
+            harness: r.harness.into(),
+            buckets: r
+                .buckets
+                .into_iter()
+                .map(|b| Bucket {
+                    start_ms: b.start_ms,
+                    spend: b.spend.into(),
+                })
+                .collect(),
+            quota: r.quota.map(Into::into),
+            quota_at_ms: r.quota_at_ms,
+        }
+    }
+}
+
+/// Spending on one account (or plan, when the harness names no account).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccAccountUsage {
+    pub harness: AccHarness,
+    pub account: Option<String>,
+    pub plan: Option<String>,
+    pub sessions: u32,
+    pub spend: AccSpend,
+    /// The newest reading of each quota window its sessions reported.
+    pub quota: Option<AccQuota>,
+}
+
+impl From<AccountUsage> for AccAccountUsage {
+    fn from(a: AccountUsage) -> Self {
+        Self {
+            harness: a.harness.into(),
+            account: a.account,
+            plan: a.plan,
+            sessions: a.sessions,
+            spend: a.spend.into(),
+            quota: a.quota.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AccHarnessSpend {
+    pub harness: AccHarness,
+    pub spend: AccSpend,
+}
+
+/// Spending on one local day.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccDayUsage {
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub spend: AccSpend,
+    pub harnesses: Vec<AccHarnessSpend>,
+}
+
+impl From<DayUsage> for AccDayUsage {
+    fn from(d: DayUsage) -> Self {
+        Self {
+            date: d.date,
+            spend: d.spend.into(),
+            harnesses: d
+                .harnesses
+                .into_iter()
+                .map(|HarnessSpend { harness, spend }| AccHarnessSpend {
+                    harness: harness.into(),
+                    spend: spend.into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Spending across sessions.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AccUsageRollup {
+    pub total: AccSpend,
+    pub accounts: Vec<AccAccountUsage>,
+    /// Oldest first.
+    pub days: Vec<AccDayUsage>,
+}
+
+impl From<UsageRollup> for AccUsageRollup {
+    fn from(r: UsageRollup) -> Self {
+        Self {
+            total: r.total.into(),
+            accounts: r.accounts.into_iter().map(Into::into).collect(),
+            days: r.days.into_iter().map(Into::into).collect(),
         }
     }
 }
