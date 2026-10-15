@@ -930,6 +930,9 @@ pub struct AccLaunchRequest {
     /// Start inside a taken-over TUI's wrapper (sandbox) with its flags.
     #[uniffi(default = None)]
     pub launcher: Option<AccLauncher>,
+    /// The git worktree `cwd` is in (from `worktree_add_exec`).
+    #[uniffi(default = None)]
+    pub worktree: Option<String>,
 }
 
 impl From<AccLaunchRequest> for LaunchRequest {
@@ -948,6 +951,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),
             launcher: r.launcher.map(Into::into),
+            worktree: r.worktree,
         }
     }
 }
@@ -968,6 +972,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             replaces_parent: r.replaces_parent,
             origin: r.origin.into(),
             launcher: r.launcher.map(Into::into),
+            worktree: r.worktree,
         }
     }
 }
@@ -987,6 +992,8 @@ pub struct AccSessionSpec {
     pub origin: AccOrigin,
     /// Set when the harness runs in a taken-over TUI's wrapper (sandbox).
     pub launcher: Option<AccLauncher>,
+    /// The session's git worktree, when it has one.
+    pub worktree: Option<String>,
     /// The full spec, to persist and pass back to `AccSession.attach`.
     pub json: String,
 }
@@ -1005,6 +1012,7 @@ impl From<&SessionSpec> for AccSessionSpec {
             parent: s.parent.clone(),
             origin: s.origin.clone().into(),
             launcher: s.launcher.clone().map(Into::into),
+            worktree: s.worktree.clone(),
             json: s.to_json(),
         }
     }

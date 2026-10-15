@@ -27,6 +27,7 @@
 //!   for embedders that own a live byte stream (what `acc-ssh` builds on).
 //! - [`question`]: multi-part questions and how to answer all of them.
 //! - [`usage`]: what sessions spent, added up per account and per day.
+//! - [`worktree`]: a git worktree per session, its diff, merge and discard.
 
 pub mod claude;
 pub mod codex;
@@ -53,6 +54,7 @@ pub mod takeover;
 pub mod transcript;
 pub mod usage;
 mod wire;
+pub mod worktree;
 
 pub use event::Event;
 pub use harness::Harness;

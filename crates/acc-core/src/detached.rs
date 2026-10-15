@@ -302,7 +302,7 @@ pub fn login_path_prelude() -> &'static str {
 }
 
 /// Quotes a path, leaving a leading `~/` for the shell to expand.
-fn quote_path(path: &str) -> String {
+pub(crate) fn quote_path(path: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
         None if path == "~" => "\"$HOME\"".to_owned(),

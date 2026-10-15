@@ -12,6 +12,7 @@ use acc_core::detached::{self, FanInParser, FeedEntry};
 use acc_core::harness;
 use acc_core::item;
 use acc_core::session::{self, Session, SessionError, SessionSpec};
+use acc_core::worktree;
 
 use crate::AccError;
 use crate::acc_types::*;
@@ -214,6 +215,23 @@ impl AccSession {
         lock(&self.inner).quota().cloned().map(Into::into)
     }
 
+    /// Prints what the session changed in its worktree as a `git diff`
+    /// (parse it with `parse_unified_diff`).
+    pub fn worktree_diff_exec(&self) -> Result<AccExec, AccError> {
+        Ok(lock(&self.inner).worktree_diff_exec()?.into())
+    }
+
+    /// Commits the worktree's changes and merges them into the branch
+    /// checked out in the repository; exits 7 on a conflict.
+    pub fn worktree_merge_exec(&self, message: String, squash: bool) -> Result<AccExec, AccError> {
+        Ok(lock(&self.inner).worktree_merge_exec(&message, squash)?.into())
+    }
+
+    /// Stops the harness and deletes the worktree with its branch.
+    pub fn worktree_discard_exec(&self) -> Result<AccExec, AccError> {
+        Ok(lock(&self.inner).worktree_discard_exec()?.into())
+    }
+
     /// What the session spent over time, for `roll_up_usage`.
     pub fn usage_record(&self) -> AccUsageRecord {
         lock(&self.inner).usage_record().into()
@@ -321,6 +339,21 @@ pub fn resolve_dir_exec(dir: String) -> AccExec {
     AccExec::script(session::resolve_dir_script(&dir))
 }
 
+/// Makes git worktree `name` (use the session id) for the repository `cwd`
+/// is in, from `base` (default `HEAD`), and prints the directory to launch
+/// in with `AccLaunchRequest.worktree = name`. Exits 6 outside a repository.
+#[uniffi::export]
+pub fn worktree_add_exec(cwd: String, name: String, base: Option<String>) -> Result<AccExec, AccError> {
+    if !worktree::valid_name(&name) {
+        return Err(SessionError::InvalidWorktree(name).into());
+    }
+    Ok(AccExec::script(worktree::add_script(
+        &cwd,
+        &name,
+        base.as_deref(),
+    )))
+}
+
 /// A session id from at least 15 random bytes supplied by the caller.
 #[uniffi::export]
 pub fn new_session_id(harness: AccHarness, entropy: Vec<u8>) -> String {
@@ -373,6 +406,7 @@ mod tests {
             replaces_parent: false,
             origin: AccOrigin::Started,
             launcher: None,
+            worktree: None,
         };
         let id = new_session_id(AccHarness::Claude, vec![7; 15]);
         let s = AccSession::launch(req, id, "ph".into(), 1).unwrap();
@@ -412,6 +446,7 @@ mod tests {
             replaces_parent: false,
             origin: AccOrigin::Started,
             launcher: None,
+            worktree: None,
         };
         let id = new_session_id(AccHarness::Claude, vec![8; 15]);
         let s = AccSession::launch(req, id, "ph".into(), 1).unwrap();
@@ -462,6 +497,7 @@ mod tests {
             replaces_parent: false,
             origin: AccOrigin::Started,
             launcher: None,
+            worktree: None,
         };
         let s = AccSession::launch(
             req,
@@ -506,6 +542,7 @@ mod tests {
                 replaces_parent: false,
                 origin: AccOrigin::Started,
                 launcher: None,
+                worktree: None,
             },
             new_session_id(AccHarness::Claude, vec![10; 15]),
             "ph".into(),
@@ -544,6 +581,7 @@ mod tests {
                 replaces_parent: false,
                 origin: AccOrigin::Started,
                 launcher: None,
+                worktree: None,
             },
             new_session_id(AccHarness::Claude, vec![11; 15]),
             "ph".into(),

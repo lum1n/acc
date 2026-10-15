@@ -81,6 +81,11 @@ pub struct LaunchRequest {
     /// or other wrapper, executable and flags).
     #[serde(default)]
     pub launcher: Option<Launcher>,
+    /// The git worktree `cwd` is in, made with
+    /// [`crate::worktree::add_script`], so the session can show, merge and
+    /// discard its changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 /// How a session came to be.
@@ -120,6 +125,9 @@ pub struct SessionSpec {
     /// Kept so relaunches (fork, model change) and hand-back use it too.
     #[serde(default)]
     pub launcher: Option<Launcher>,
+    /// The session's git worktree (see [`LaunchRequest::worktree`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 impl SessionSpec {
@@ -142,6 +150,7 @@ impl SessionSpec {
             parent: None,
             origin: Origin::Started,
             launcher: None,
+            worktree: None,
         }
     }
 
@@ -196,6 +205,10 @@ pub enum SessionError {
     RelativeCwd(Harness, String),
     #[error("no harness given")]
     NoHarness,
+    #[error("invalid worktree name {0:?}")]
+    InvalidWorktree(String),
+    #[error("the session has no worktree")]
+    NoWorktree,
     /// The snapshot is unreadable, from another version, or of another
     /// session. Attach afresh instead.
     #[error("unusable snapshot: {0}")]
@@ -334,6 +347,13 @@ impl Session {
         if harness.native_acp() && !req.cwd.starts_with('/') {
             return Err(SessionError::RelativeCwd(harness, req.cwd));
         }
+        if let Some(name) = req
+            .worktree
+            .as_deref()
+            .filter(|n| !crate::worktree::valid_name(n))
+        {
+            return Err(SessionError::InvalidWorktree(name.to_owned()));
+        }
         let mut spec = SessionSpec {
             v: SPEC_VERSION,
             id: id.to_owned(),
@@ -355,6 +375,7 @@ impl Session {
             parent: req.parent.clone(),
             origin: req.origin.clone(),
             launcher: req.launcher.clone(),
+            worktree: req.worktree.clone(),
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
@@ -558,6 +579,36 @@ impl Session {
         ))
     }
 
+    /// Prints what the session changed in its worktree as a `git diff`;
+    /// parse it with [`crate::item::parse_unified`].
+    pub fn worktree_diff_exec(&self) -> Result<Exec, SessionError> {
+        Ok(Exec::new(crate::worktree::diff_script(self.worktree()?)))
+    }
+
+    /// Commits the worktree's changes and merges them into the branch
+    /// checked out in the repository (one squashed commit with `squash`).
+    /// Exits [`crate::worktree::EXIT_CONFLICT`] when they conflict.
+    pub fn worktree_merge_exec(&self, message: &str, squash: bool) -> Result<Exec, SessionError> {
+        Ok(Exec::new(crate::worktree::merge_script(
+            self.worktree()?,
+            message,
+            squash,
+        )))
+    }
+
+    /// Stops the harness, then deletes the worktree and its branch.
+    pub fn worktree_discard_exec(&self) -> Result<Exec, SessionError> {
+        Ok(Exec::new(format!(
+            "{}{}",
+            self.dir.kill_script(2_000),
+            crate::worktree::discard_script(self.worktree()?)
+        )))
+    }
+
+    fn worktree(&self) -> Result<&str, SessionError> {
+        self.spec.worktree.as_deref().ok_or(SessionError::NoWorktree)
+    }
+
     /// `spec.json` needs rewriting (the native id or title became known).
     /// Returns the exec once; run it when convenient.
     pub fn take_spec_write(&mut self) -> Option<Exec> {
@@ -697,6 +748,7 @@ impl Session {
             replaces_parent: !fork,
             origin: self.spec.origin.clone(),
             launcher: self.spec.launcher.clone(),
+            worktree: self.spec.worktree.clone(),
         }
     }
 
@@ -1324,6 +1376,32 @@ mod tests {
         assert!(rec.buckets.iter().all(|b| b.start_ms == 0));
         let b = Session::restore(&a.snapshot().unwrap(), a.spec().clone()).unwrap();
         assert_eq!(b.usage_record(), rec);
+    }
+
+    #[test]
+    fn worktree_sessions_keep_it_through_relaunches() {
+        let mut r = req(Harness::Claude);
+        r.worktree = Some("../x".into());
+        assert!(matches!(
+            Session::launch(r.clone(), "s1", "t", 1),
+            Err(SessionError::InvalidWorktree(_))
+        ));
+        let (plain, _) = Session::launch(req(Harness::Claude), "s0", "t", 1).unwrap();
+        assert_eq!(plain.worktree_diff_exec(), Err(SessionError::NoWorktree));
+
+        r.worktree = Some("s1".into());
+        let (mut s, _) = Session::launch(r, "s1", "t", 1).unwrap();
+        let spec = SessionSpec::from_json(&s.spec().to_json()).unwrap();
+        assert_eq!(spec.worktree.as_deref(), Some("s1"));
+        assert!(s.worktree_diff_exec().unwrap().script.contains(".acc/w/s1"));
+        let merge = s.worktree_merge_exec("done", true).unwrap().script;
+        assert!(merge.contains("--squash"));
+        let discard = s.worktree_discard_exec().unwrap().script;
+        assert!(discard.contains("kill -TERM") && discard.contains("worktree remove"));
+        let Ok(Outbound::Relaunch(again)) = s.command(Command::Fork) else {
+            panic!("fork relaunches")
+        };
+        assert_eq!(again.worktree.as_deref(), Some("s1"));
     }
 
     #[test]

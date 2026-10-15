@@ -232,6 +232,19 @@ file change with hunks) and `item::parse_unified` reads `git diff`. Commands a h
 out with a new process (Claude fork, a model Cursor takes at spawn) come back as
 `Outbound::Relaunch`.
 
+**Worktrees.** Several agents can work on one repository at once, each in a git worktree of its
+own. `worktree::add_script(cwd, name, base)` (`worktree_add_exec` in the bindings; use the session
+id as the name) makes `~/.acc/w/<name>` on branch `acc/<name>` from `base` (default `HEAD`) and
+prints the directory matching `cwd` inside it, absolute, as ACP harnesses need. Launch there with
+`LaunchRequest::worktree = name`; relaunches (fork, a restart-only model change) keep it, and adding
+an existing worktree reuses it. The session then hands out `worktree_diff_exec` (commits, edits and
+new files since the base, as `git diff` for `item::parse_unified`), `worktree_merge_exec(message,
+squash)` (commits the worktree and merges or squashes it into the branch checked out in the
+repository; on a conflict nothing is merged and it exits `EXIT_CONFLICT`; later diffs count from
+the merge) and `worktree_discard_exec` (stops the harness, removes the worktree and its branch).
+`~/.acc/w/<name>.meta` records the base, the repository and the branch. Only `git` is needed on
+the host.
+
 **Usage across sessions.** Harnesses count differently: Claude and the ACP agents report each
 turn's tokens, Codex and pi running totals (pi's start over with a new session), and all of them a
 running total for cost. `usage::Spending` turns a session's `Usage` events into what was spent, in

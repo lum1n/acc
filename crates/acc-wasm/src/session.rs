@@ -251,6 +251,30 @@ impl AccSession {
         js(&self.inner.quota())
     }
 
+    /// Prints what the session changed in its worktree as a `git diff`
+    /// (parse it with `parseUnifiedDiff`).
+    #[wasm_bindgen(js_name = worktreeDiffExec)]
+    pub fn worktree_diff_exec(&self) -> Result<AccExec, JsValue> {
+        Ok(self.inner.worktree_diff_exec().map_err(session_error)?.into())
+    }
+
+    /// Commits the worktree's changes and merges them into the branch
+    /// checked out in the repository; exits 7 on a conflict.
+    #[wasm_bindgen(js_name = worktreeMergeExec)]
+    pub fn worktree_merge_exec(&self, message: &str, squash: bool) -> Result<AccExec, JsValue> {
+        Ok(self
+            .inner
+            .worktree_merge_exec(message, squash)
+            .map_err(session_error)?
+            .into())
+    }
+
+    /// Stops the harness and deletes the worktree with its branch.
+    #[wasm_bindgen(js_name = worktreeDiscardExec)]
+    pub fn worktree_discard_exec(&self) -> Result<AccExec, JsValue> {
+        Ok(self.inner.worktree_discard_exec().map_err(session_error)?.into())
+    }
+
     /// What the session spent over time (`UsageRecord`), for `rollUpUsage`.
     #[wasm_bindgen(js_name = usageRecord)]
     pub fn usage_record(&self) -> JsValue {
@@ -365,6 +389,21 @@ pub fn parse_probe(stdout: &str) -> JsValue {
 #[wasm_bindgen(js_name = resolveDirExec)]
 pub fn resolve_dir_exec(dir: &str) -> AccExec {
     AccExec::script(session::resolve_dir_script(dir))
+}
+
+/// Makes git worktree `name` (use the session id) for the repository `cwd`
+/// is in, from `base` (default `HEAD`), and prints the directory to launch
+/// in with the request's `worktree: name`. Exits 6 outside a repository.
+#[wasm_bindgen(js_name = worktreeAddExec)]
+pub fn worktree_add_exec(cwd: &str, name: &str, base: Option<String>) -> Result<AccExec, JsValue> {
+    if !acc_core::worktree::valid_name(name) {
+        return Err(session_error(SessionError::InvalidWorktree(name.to_owned())));
+    }
+    Ok(AccExec::script(acc_core::worktree::add_script(
+        cwd,
+        name,
+        base.as_deref(),
+    )))
 }
 
 /// A session id from at least 15 random bytes supplied by the caller.
