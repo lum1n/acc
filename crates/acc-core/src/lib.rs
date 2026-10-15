@@ -3,9 +3,9 @@
 //! `acc-core` is **sans-IO**: it never opens sockets, spawns processes or starts
 //! an async runtime. Drivers turn bytes from a harness into [`Event`]s and turn
 //! commands into bytes for the harness. Transports (local process, SSH exec
-//! channel, detached FIFO, multiplexer pane) live outside the core and only move
-//! bytes. This keeps the core identical on iOS, Android, wasm32 and desktop, and
-//! makes every protocol testable from recorded fixtures.
+//! channel, detached FIFO) live outside the core and only move bytes. This
+//! keeps the core identical on iOS, Android, wasm32 and desktop, and makes
+//! every protocol testable from recorded fixtures.
 //!
 //! Layout:
 //! - [`harness`]: the six supported CLI harnesses and how to launch them headless.
@@ -13,15 +13,15 @@
 //! - [`event`]: the normalized event stream every driver produces.
 //! - [`command`]: canonical commands and harness options.
 //! - [`driver`]: the sans-IO driver trait.
-//! - [`pi`]: the pi driver (`--mode rpc`) and pi transcript reader.
+//! - [`pi`]: the pi driver (`--mode rpc`).
 //! - [`claude`], [`codex`]: drivers for Claude Code stream-json and Codex app-server.
-//! - [`ndjson`], [`osc7501`]: incremental parsers used by drivers and terminals.
+//! - [`ndjson`]: the incremental line parser drivers use.
+//! - [`exec`]: a command for the embedder to run on the host.
 //! - [`detached`]: shell scripts for daemonless, disconnect-proof sessions.
 //! - [`session`]: a driver bound to a detached session: launch, attach with
 //!   replay, and the folded transcript, state, usage and permissions.
 //! - [`item`], [`transcript`]: typed item details (commands, tools, diffs) and
 //!   the per-session item list.
-//! - [`multiplexer`]: locating harnesses inside tmux, zellij, screen and Rex.
 //! - [`acp`]: the Agent Client Protocol driver (Cursor, Copilot, opencode).
 //! - [`live`]: a driver picked by harness, with timestamps and merged state,
 //!   for embedders that own a live byte stream (what `acc-ssh` builds on).
@@ -36,26 +36,22 @@ pub mod claude;
 pub mod codex;
 pub mod command;
 pub mod detached;
-pub mod discover;
 pub mod driver;
 pub mod event;
+pub mod exec;
 pub mod handoff;
 pub mod harness;
 pub mod item;
 pub mod live;
 // Harness drivers.
 pub mod acp;
-pub mod multiplexer;
 pub mod ndjson;
-pub mod observe;
-pub mod osc7501;
 pub mod pi;
 pub mod policy;
 pub mod question;
 pub mod session;
 pub mod shell;
 pub mod state;
-pub mod takeover;
 pub mod transcript;
 pub mod usage;
 pub mod watch;
@@ -63,8 +59,8 @@ mod wire;
 pub mod worktree;
 
 pub use event::Event;
+pub use exec::Exec;
 pub use harness::Harness;
-pub use multiplexer::Exec;
 pub use state::{BlockKind, RunState, SessionState, StateSource};
 
 /// Version of this crate, for clients to show and compare across host and client.

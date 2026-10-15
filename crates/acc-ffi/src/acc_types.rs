@@ -4,6 +4,8 @@
 //! UIs can light up harness-specific features without the bindings knowing
 //! every shape.
 
+use std::collections::HashMap;
+
 use acc_core::command::{
     Apply, Attachment, Choice, Command, CommandEntry, CommandInput, CommandSource, Exec as CmdExec,
     OptionDef, OptionId,
@@ -16,7 +18,7 @@ use acc_core::event::{
 use acc_core::harness::{Availability, Compat, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag};
 use acc_core::policy::{Decision, Rule};
-use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec, Update};
+use acc_core::session::{LaunchRequest, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
 use acc_core::transcript::{Item, ItemChange, ItemStatus};
 use acc_core::usage::{AccountUsage, Bucket, DayUsage, HarnessSpend, Spend, UsageRecord, UsageRollup};
@@ -880,36 +882,9 @@ impl AccExec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
-pub enum AccOrigin {
-    Started,
-    TakenOver {
-        pane: Option<String>,
-        transcript: Option<String>,
-    },
-}
-
-impl From<Origin> for AccOrigin {
-    fn from(o: Origin) -> Self {
-        match o {
-            Origin::Started => Self::Started,
-            Origin::TakenOver { pane, transcript } => Self::TakenOver { pane, transcript },
-        }
-    }
-}
-
-impl From<AccOrigin> for Origin {
-    fn from(o: AccOrigin) -> Self {
-        match o {
-            AccOrigin::Started => Self::Started,
-            AccOrigin::TakenOver { pane, transcript } => Self::TakenOver { pane, transcript },
-        }
-    }
-}
-
-/// How a TUI the user started was launched: the wrapper's argv up to the
+/// How to start a harness other than plainly: the wrapper's argv up to the
 /// harness (a `bwrap` sandbox, `env`, ...), the harness executable as the
-/// wrapper ran it, and the user's flags to keep.
+/// wrapper runs it, and flags to add.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AccLauncher {
     pub prefix: Vec<String>,
@@ -955,8 +930,12 @@ pub struct AccLaunchRequest {
     pub attachments: Vec<AccAttachment>,
     pub parent: Option<String>,
     pub replaces_parent: bool,
-    pub origin: AccOrigin,
-    /// Start inside a taken-over TUI's wrapper (sandbox) with its flags.
+    /// Notes kept with the session in `spec.json` and carried over to
+    /// relaunches (where it came from, say).
+    #[uniffi(default)]
+    pub labels: HashMap<String, String>,
+    /// Start inside a wrapper (sandbox), from another executable or with
+    /// extra flags.
     #[uniffi(default = None)]
     pub launcher: Option<AccLauncher>,
     /// The git worktree `cwd` is in (from `worktree_add_exec`).
@@ -978,7 +957,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             attachments: r.attachments.into_iter().map(Into::into).collect(),
             parent: r.parent,
             replaces_parent: r.replaces_parent,
-            origin: r.origin.into(),
+            labels: r.labels.into_iter().collect(),
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
         }
@@ -999,7 +978,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             attachments: r.attachments.into_iter().map(Into::into).collect(),
             parent: r.parent,
             replaces_parent: r.replaces_parent,
-            origin: r.origin.into(),
+            labels: r.labels.into_iter().collect(),
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
         }
@@ -1018,8 +997,9 @@ pub struct AccSessionSpec {
     pub title: Option<String>,
     pub created_ms: u64,
     pub parent: Option<String>,
-    pub origin: AccOrigin,
-    /// Set when the harness runs in a taken-over TUI's wrapper (sandbox).
+    /// See `AccLaunchRequest::labels`.
+    pub labels: HashMap<String, String>,
+    /// Set when the harness runs in a wrapper (sandbox).
     pub launcher: Option<AccLauncher>,
     /// The session's git worktree, when it has one.
     pub worktree: Option<String>,
@@ -1039,7 +1019,7 @@ impl From<&SessionSpec> for AccSessionSpec {
             title: s.title.clone(),
             created_ms: s.created_ms,
             parent: s.parent.clone(),
-            origin: s.origin.clone().into(),
+            labels: s.labels.clone().into_iter().collect(),
             launcher: s.launcher.clone().map(Into::into),
             worktree: s.worktree.clone(),
             json: s.to_json(),

@@ -2,19 +2,18 @@
 //! with timestamps and merged state, still sans-IO.
 //!
 //! This is the surface the language bindings wrap. The embedder owns the
-//! transport (local pipe, SSH exec channel, detached FIFO/log, multiplexer
-//! pane): it starts the process described by [`Session::launch_spec`], writes
+//! transport (local pipe, SSH exec channel, detached FIFO/log): it starts the process described by [`Session::launch_spec`], writes
 //! [`Session::start`], and then shuttles bytes through [`Session::receive`]
 //! and [`Session::send`]. Nothing here knows how the bytes travel.
 
 use crate::acp::{AcpConfig, AcpDriver, Start};
-use crate::claude::{self, ClaudeConfig, ClaudeDriver};
-use crate::codex::{self, CodexConfig, CodexDriver};
+use crate::claude::{ClaudeConfig, ClaudeDriver};
+use crate::codex::{CodexConfig, CodexDriver};
 use crate::command::{Command, CommandEntry, OptionDef, OptionId};
 use crate::driver::{Driver, DriverError};
 use crate::event::Event;
 use crate::harness::{Harness, LaunchSpec};
-use crate::pi::{self, PiDriver};
+use crate::pi::PiDriver;
 use crate::state::{SessionState, StateTracker};
 
 /// How long a higher-fidelity state wins before a lower one may replace it.
@@ -211,8 +210,8 @@ impl Session {
         vec![state, Event::Exited { code }]
     }
 
-    /// Merges a state seen elsewhere (OSC 7501 in a pane, a transcript, a
-    /// screen match). Returns `true` if the visible state changed.
+    /// Merges a state the embedder saw outside the harness's output.
+    /// Returns `true` if the visible state changed.
     pub fn observe(&mut self, state: SessionState) -> bool {
         self.tracker.observe(state)
     }
@@ -222,7 +221,7 @@ impl Session {
         self.tracker.current()
     }
 
-    /// The harness's own session id, for resume and takeover, once known.
+    /// The harness's own session id, for resume, once known.
     pub fn native_id(&self) -> Option<&str> {
         self.native_id.as_deref()
     }
@@ -277,44 +276,6 @@ impl AnyDriver {
             AnyDriver::Pi(d) => d,
             AnyDriver::Acp(d) => d,
         }
-    }
-}
-
-/// Reads a harness's own transcript file to follow a session ACC didn't
-/// start (state, usage), before or instead of taking it over.
-#[derive(Debug)]
-pub enum TranscriptObserver {
-    Claude(claude::transcript::Observer),
-    Codex(codex::rollout::Observer),
-    Pi(pi::Transcript),
-}
-
-impl TranscriptObserver {
-    /// `None` for harnesses whose transcripts ACC doesn't read yet.
-    pub fn new(harness: Harness) -> Option<Self> {
-        match harness {
-            Harness::Claude => Some(Self::Claude(claude::transcript::Observer::new())),
-            Harness::Codex => Some(Self::Codex(codex::rollout::Observer::new())),
-            Harness::Pi => Some(Self::Pi(pi::Transcript::new())),
-            Harness::Cursor | Harness::Copilot | Harness::Opencode => None,
-        }
-    }
-
-    /// Feeds bytes appended to the transcript; stamps state changes with `now_ms`.
-    pub fn feed(&mut self, bytes: &[u8], now_ms: u64) -> Vec<Event> {
-        let mut events = match self {
-            Self::Claude(o) => o.feed(bytes),
-            Self::Codex(o) => o.feed(bytes),
-            Self::Pi(o) => o.feed(bytes),
-        };
-        for event in &mut events {
-            if let Event::StateChanged(s) = event
-                && s.observed_at_ms == 0
-            {
-                s.observed_at_ms = now_ms;
-            }
-        }
-        events
     }
 }
 
@@ -388,11 +349,5 @@ mod tests {
         let start = String::from_utf8(Session::new(cfg).start()).expect("utf8");
         assert!(start.contains(r#""type":"set_model""#), "{start}");
         assert!(start.contains(r#""modelId":"claude-x""#), "{start}");
-    }
-
-    #[test]
-    fn transcript_observer_exists_for_file_backed_harnesses() {
-        assert!(TranscriptObserver::new(Harness::Claude).is_some());
-        assert!(TranscriptObserver::new(Harness::Copilot).is_none());
     }
 }

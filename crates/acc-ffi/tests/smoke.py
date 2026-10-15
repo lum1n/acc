@@ -73,10 +73,6 @@ def main() -> None:
     except acc.AccError.UnknownRequest:
         pass
 
-    scanner = acc.Osc7501Scanner()
-    (status,) = scanner.feed(b"\x1b]7501;state=working:progress=40\x07")
-    assert status.state == acc.ProgramState.WORKING and status.progress == 40
-
     detached = acc.DetachedSession("s1")
     assert "mkfifo" in detached.launch_script(spec, "/tmp")
     asyncio.run(ssh_calls())
@@ -84,8 +80,8 @@ def main() -> None:
 
 
 async def ssh_calls() -> None:
-    """The async SSH surface: a refused connection and a rejected input
-    both come back as typed errors through the foreign future."""
+    """The async SSH surface: a refused connection comes back as a typed
+    error through the foreign future."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         closed_port = s.getsockname()[1]
@@ -108,17 +104,6 @@ async def ssh_calls() -> None:
         pass
     assert host.connections() == 0 and host.host_key_fingerprint() is None
 
-    pane = host.pane_session(
-        acc.PaneRef(multiplexer=acc.Multiplexer.TMUX, server="", session=None, pane="%0"),
-        acc.Harness.CLAUDE,
-    )
-    assert pane.pane().pane == "%0" and pane.state() is None
-    try:
-        await pane.send_input([acc.PaneInput.KEYS(keys=[acc.PaneKey.CTRL(letter="12")])])
-        raise AssertionError("expected an invalid argument")
-    except acc.AccError.InvalidArgument:
-        pass
-    await pane.stop_watching()
     await host.disconnect()
 
 

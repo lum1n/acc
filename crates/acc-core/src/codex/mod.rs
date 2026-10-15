@@ -8,7 +8,7 @@
 //! `tests/fixtures/codex` are recorded from that version.
 //!
 //! What maps where:
-//! - Session: `thread/start` (new) or `thread/resume` (takeover and
+//! - Session: `thread/start` (new) or `thread/resume` (resume and
 //!   reconnect after the process died) in the handshake. The thread id is the
 //!   native id; `thread/fork` and `thread/start` switch to a new one.
 //! - State: `thread/status/changed` (idle / active with waiting flags /
@@ -27,8 +27,6 @@
 //!   `collaborationMode/list` (experimental), permissions from
 //!   `permissionProfile/list`. Changes ride on the next `turn/start`, where
 //!   Codex makes them sticky.
-
-pub mod rollout;
 
 use std::collections::HashMap;
 

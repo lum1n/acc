@@ -10,28 +10,26 @@
 //! `acc run --json` prints. The TypeScript declarations below spell them out.
 //!
 //! Beside that live [`Session`], the detached-session objects acc-ffi has
-//! ([`AccSession`], [`AccFanIn`], [`AccObserved`], [`AccTakeover`] and the
-//! host scripts) are here under the same names, so every embedder gets the
+//! ([`AccSession`], [`AccFanIn`] and the host scripts) are here under the
+//! same names, so every embedder gets the
 //! same API (`tests/parity.rs` keeps the two in step). Their records are JS
 //! objects too; the ones that carry bytes ([`AccExec`], [`AccOutbound`],
 //! [`AccFeedLine`]) are classes with `Uint8Array` fields. They throw `Error`s
 //! named `AccError` with a `kind` (acc-ffi's `AccError` variant names).
 
 use acc_core::Exec;
+use acc_core::Harness;
 use acc_core::command::Command;
 use acc_core::detached::SessionDir;
 use acc_core::harness::LaunchSpec;
 use acc_core::live::{self as core_session, Opening};
 use acc_core::state::SessionState;
 use acc_core::transcript::Item;
-use acc_core::{Harness, osc7501};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
-pub mod observe;
 pub mod session;
 
-pub use observe::*;
 pub use session::*;
 
 #[wasm_bindgen(typescript_custom_section)]
@@ -238,10 +236,6 @@ export interface Received {
   /** Bytes to write back to the harness now. Often empty. */
   transmit: Uint8Array;
 }
-
-export type ProgramStatus =
-  | { type: "probe" }
-  | { type: "report"; state: RunState | null; id: string | null; app: string | null; title: string | null; message: string | null };
 "#;
 
 /// Converts a Rust value to a plain JS value: objects rather than `Map`s,
@@ -438,7 +432,7 @@ impl Session {
         to_js(&self.inner.state())
     }
 
-    /// The harness's own session id, for resume and takeover, once known.
+    /// The harness's own session id, for resume, once known.
     #[wasm_bindgen(getter, js_name = nativeId)]
     pub fn native_id(&self) -> Option<String> {
         self.inner.native_id().map(str::to_owned)
@@ -454,32 +448,6 @@ impl Session {
     #[wasm_bindgen(unchecked_return_type = "OptionDef[]")]
     pub fn options(&self) -> Result<JsValue, JsError> {
         to_js(self.inner.options())
-    }
-}
-
-/// Follows a harness's own transcript file (Claude, Codex, pi).
-#[wasm_bindgen]
-#[derive(Debug)]
-pub struct TranscriptObserver {
-    inner: core_session::TranscriptObserver,
-}
-
-#[wasm_bindgen]
-impl TranscriptObserver {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        #[wasm_bindgen(unchecked_param_type = "HarnessId")] harness: JsValue,
-    ) -> Result<TranscriptObserver, JsError> {
-        let h: Harness = from_js(harness, "harness")?;
-        let inner = core_session::TranscriptObserver::new(h)
-            .ok_or_else(|| JsError::new(&format!("ACC doesn't read {} transcripts", h.display_name())))?;
-        Ok(Self { inner })
-    }
-
-    /// Feeds bytes appended to the transcript.
-    #[wasm_bindgen(unchecked_return_type = "Event[]")]
-    pub fn feed(&mut self, bytes: &[u8], now_ms: f64) -> Result<JsValue, JsError> {
-        to_js(&self.inner.feed(bytes, ms(now_ms)))
     }
 }
 
@@ -536,31 +504,17 @@ impl DetachedSession {
     }
 }
 
-/// Bytes a terminal writes back to answer an OSC 7501 probe.
-#[wasm_bindgen(js_name = osc7501ProbeReply)]
-pub fn osc7501_probe_reply() -> Vec<u8> {
-    osc7501::PROBE_REPLY.to_vec()
-}
-
-/// Incremental OSC 7501 extractor for a terminal byte stream (e.g. xterm.js output).
-#[wasm_bindgen]
-#[derive(Debug, Default)]
-pub struct Osc7501Scanner {
-    inner: osc7501::Scanner,
-}
-
-#[wasm_bindgen]
-impl Osc7501Scanner {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Messages completed by these bytes.
-    #[wasm_bindgen(unchecked_return_type = "ProgramStatus[]")]
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<JsValue, JsError> {
-        to_js(&self.inner.feed(bytes))
-    }
+/// A shell command line that opens `harness`'s own TUI in `cwd`, for
+/// palette entries whose `exec` is `terminal`. It starts a fresh session
+/// rather than resuming the headless one, so the two never share a session.
+#[wasm_bindgen(js_name = tuiCommand)]
+pub fn tui_command(harness: &str, cwd: &str) -> Result<String, JsValue> {
+    let h = crate::harness(harness)?;
+    Ok(format!(
+        "cd {} && exec {}",
+        acc_core::shell::quote(cwd),
+        acc_core::shell::quote(h.program())
+    ))
 }
 
 /// A command to run on the host, for example over an SSH exec channel:

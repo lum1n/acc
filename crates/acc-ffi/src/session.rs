@@ -460,6 +460,8 @@ pub fn harness_display_name(harness: AccHarness) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     const HI: &[u8] = include_bytes!("../../acc-core/tests/fixtures/claude/hi-and-controls.ndjson");
@@ -478,7 +480,7 @@ mod tests {
             attachments: vec![],
             parent: None,
             replaces_parent: false,
-            origin: AccOrigin::Started,
+            labels: HashMap::new(),
             launcher: None,
             worktree: None,
         };
@@ -518,7 +520,7 @@ mod tests {
             attachments: vec![],
             parent: None,
             replaces_parent: false,
-            origin: AccOrigin::Started,
+            labels: HashMap::new(),
             launcher: None,
             worktree: None,
         };
@@ -569,7 +571,7 @@ mod tests {
             attachments: vec![],
             parent: None,
             replaces_parent: false,
-            origin: AccOrigin::Started,
+            labels: HashMap::new(),
             launcher: None,
             worktree: None,
         };
@@ -614,7 +616,7 @@ mod tests {
                 attachments: vec![],
                 parent: None,
                 replaces_parent: false,
-                origin: AccOrigin::Started,
+                labels: HashMap::new(),
                 launcher: None,
                 worktree: None,
             },
@@ -653,7 +655,7 @@ mod tests {
                 attachments: vec![],
                 parent: None,
                 replaces_parent: false,
-                origin: AccOrigin::Started,
+                labels: HashMap::new(),
                 launcher: None,
                 worktree: None,
             },
@@ -693,7 +695,7 @@ mod tests {
                 attachments: vec![],
                 parent: None,
                 replaces_parent: false,
-                origin: AccOrigin::Started,
+                labels: HashMap::new(),
                 launcher: None,
                 worktree: None,
             },

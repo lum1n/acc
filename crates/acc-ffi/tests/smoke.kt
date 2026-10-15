@@ -65,16 +65,13 @@ fun main(args: Array<String>) {
         check(e.requestId == "nope", "error carries request id")
     }
 
-    val status = Osc7501Scanner().feed("\u001b]7501;state=working:progress=40\u0007".toByteArray())
-    check(status.firstOrNull()?.state == ProgramState.WORKING && status.firstOrNull()?.progress == 40.toUByte(), "OSC 7501")
-
     session.close()
     runBlocking { sshCalls() }
     println("ok: Kotlin drove a recorded Claude session through acc-ffi")
 }
 
-// The suspend SSH surface: a refused connection and a rejected input both
-// come back as typed exceptions.
+// The suspend SSH surface: a refused connection comes back as a typed
+// exception.
 suspend fun sshCalls() {
     val closedPort = ServerSocket(0).use { it.localPort }
     val host = SshHost(SshConfig("127.0.0.1", closedPort.toUShort(), "nobody", SshAuth.Password("x"), HostKeyCheck.AcceptAny, 2_000UL))
@@ -86,14 +83,5 @@ suspend fun sshCalls() {
     } catch (e: AccException.Timeout) {
     }
     check(host.connections() == 0UL && host.hostKeyFingerprint() == null, "no connection")
-
-    val pane = host.paneSession(PaneRef(Multiplexer.TMUX, "", null, "%0"), Harness.CLAUDE)
-    check(pane.pane().pane == "%0" && pane.state() == null, "pane session")
-    try {
-        pane.sendInput(listOf(PaneInput.Keys(listOf(PaneKey.Ctrl("12")))))
-        check(false, "expected an invalid argument")
-    } catch (e: AccException.InvalidArgument) {
-    }
-    pane.stopWatching()
     host.disconnect()
 }

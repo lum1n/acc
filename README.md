@@ -9,17 +9,22 @@ everything runs over an SSH exec channel using the harnesses' own headless proto
 POSIX tools.
 
 > Status: drivers for all six harnesses (Claude Code stream-json, Codex app-server, ACP for Cursor,
-> Copilot and opencode, pi RPC), detached sessions with replay and multi-client attach, discovery
-> and takeover of TUIs ACC didn't start, and the Swift/Kotlin surface for all of it. Used by
-> [Sessh](https://github.com/lum1n/sessh-swift) to drive agents natively from iOS.
+> Copilot and opencode, pi RPC), detached sessions with replay and multi-client attach, and the
+> Swift/Kotlin surface for all of it. Used by [Sessh](https://github.com/lum1n/sessh-swift) to
+> drive agents natively from iOS.
+
+ACC only knows the sessions it starts. Harness TUIs a user started themselves (in a terminal, or a
+tmux, zellij, screen or Rex pane) are the job of observer, a separate library in its own
+repository, built on ACC: it finds them, follows them, co-drives their panes and takes them over
+into ordinary ACC sessions.
 
 ## Workspace
 
 | Crate | What it is |
 |---|---|
-| `crates/acc-core` | Sans-IO core: harness catalogue, drivers, event stream, commands/options, live sessions (`live`) and detached sessions (`session`: launch, attach with replay, transcript, permissions, snapshots), typed items and diffs, discovery, observation and takeover of foreign TUIs, detached-session and fan-in scripts, multiplexers and screen matching, and across harnesses: one permission policy, a git worktree per session, handoff to another harness, usage added up per account and day, and host-side events while no client is connected |
+| `crates/acc-core` | Sans-IO core: harness catalogue, drivers, event stream, commands/options, live sessions (`live`) and detached sessions (`session`: launch, attach with replay, transcript, permissions, snapshots), typed items and diffs, detached-session and fan-in scripts, and across harnesses: one permission policy, a git worktree per session, handoff to another harness, usage added up per account and day, and host-side events while no client is connected |
 | `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections |
-| `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`): the live `Session`, SSH sessions and multiplexer panes, and the detached-session byte pump (`AccSession`, `AccObserved`, `AccTakeover`, `AccFanIn` and the host scripts) |
+| `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`): the live `Session`, SSH sessions, and the detached-session byte pump (`AccSession`, `AccFanIn` and the host scripts) |
 | `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node: the same objects and functions as `acc-ffi` except the SSH transport (a test keeps them in step), records as plain JS objects in the core's serde shapes, bytes as `Uint8Array` |
 | `crates/acc-cli` | `acc` command-line tool for hosts and spikes |
 
@@ -53,7 +58,7 @@ From Swift, a session is a few calls; the app moves the bytes (see `docs/ARCHITE
 
 ```swift
 let session = try Session(config: SessionConfig(harness: .claude, cwd: "/home/me/project", opening: .new))
-channel.exec(session.launchSpec())            // your SSH channel, pipe or pane
+channel.exec(session.launchSpec())            // your SSH channel or pipe
 channel.write(session.start())
 channel.onData { bytes in
     let got = session.receive(bytes: bytes, nowMs: nowMs())
@@ -73,10 +78,6 @@ let session = try await host.launchSession(id: "s1", config: SessionConfig(
     harness: .claude, cwd: "/home/me/project", opening: .new))
 try await session.send(command: .prompt(text: "hi"))
 while true { for event in try await session.nextEvents() { ui.apply(event) } }
-
-// A Claude Code the user started in tmux: read its dialogs, answer them.
-let pane = host.paneSession(pane: info.pane, harness: .claude)   // from listPanes / locatePane
-try await pane.send(command: .answerPermission(requestId: id, optionId: "1"))
 ```
 
 ## Try it by hand
@@ -85,7 +86,7 @@ Everything below runs in a plain terminal. Install the CLI once:
 
 ```sh
 cargo install --path crates/acc-cli    # puts `acc` in ~/.cargo/bin
-acc doctor                             # harnesses, multiplexers and session stores found here
+acc doctor                             # harnesses found here and their versions
 ```
 
 **Drive a harness.** `acc run <harness> [dir]` starts it headlessly through its ACC driver
@@ -113,35 +114,13 @@ acc run claude --ssh me@devbox --attach <id>        # rejoin, from the laptop or
 acc ssh-sessions me@devbox --stop <id> --prune      # stop one, clean up ended ones
 ```
 
-**Resume or take over a session.** `acc sessions <claude|codex|pi>` lists recent sessions with
-the command that resumes each one. Quit the harness's own TUI first, then resume it headlessly
-(Claude resumes per project, so run it from the session's directory):
+**Resume a session.** `--resume <id>` continues a harness's own session headlessly (Claude
+resumes per project, so run it from the session's directory). Quit the harness's TUI first if it
+has the session open; observer lists the sessions on a machine and takes over a
+running TUI for you.
 
 ```sh
-acc sessions claude
 acc run claude . --resume <session-id>
-```
-
-**Inside tmux, zellij or screen.** Leave the harness running in its pane and drive it from any
-other terminal; each `acc script mux` command prints a shell script, so pipe it to `sh` (or to
-`ssh host sh` for a remote machine):
-
-```sh
-acc script mux tmux - - list | sh                      # find the harness's pane, e.g. %3
-acc script mux tmux - - capture %3 | sh                # what the pane shows now
-acc script mux tmux - - type %3 "fix the tests" | sh   # type a prompt and press Enter
-acc script mux zellij - - list | sh                    # zellij: panes of every session
-acc script mux zellij <session> - type terminal_1 "fix the tests" | sh
-```
-
-**Read the screen and answer dialogs.** For sessions ACC didn't start, some state only shows on
-screen: Claude Code's permission and question dialogs, and pi's busy spinner before pi 1.x.
-`acc decode screen <claude|pi>` reads a captured pane and prints its state and any open dialog
-with its numbered options; `keys` presses the one you pick (or `escape` to deny):
-
-```sh
-acc script mux tmux - - capture %3 | sh | acc decode screen claude
-acc script mux tmux - - keys %3 1 | sh                  # "1. Yes"
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and the decisions behind it.
@@ -172,9 +151,8 @@ Any client can join later with `AccSession.attach(specJson:clientTag:)` (specs c
 `listSessionsExec()`): the log is replayed through a fresh driver without re-answering anything,
 then the session is live. Persist `session.snapshot()` and pass it to
 `AccSession.restore(snapshot:specJson:)` after a relaunch to replay only what the log gained since.
-`discoverExec()` finds harness TUIs a user started themselves;
-`AccObserved` follows them from their transcripts and `AccTakeover` closes one safely and resumes it
-headless.
+`LaunchRequest.labels` keeps notes of the app's own with the session (where it came from, say);
+they are stored in `spec.json` and carried over to relaunches.
 
 Apps that already ship a Rust static library should link `acc-ffi` into it (one `staticlib` crate
 depending on both) rather than adding a second Rust library to the binary.

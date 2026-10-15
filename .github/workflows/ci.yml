@@ -37,39 +37,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  # Drives real multiplexers with the commands acc-core builds.
-  multiplexers:
-    runs-on: ubuntu-latest
-    env:
-      ACC_REQUIRE_MUX: "1"
-      ZELLIJ_VERSION: 0.45.1
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Install tmux, screen and zellij
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux screen
-          curl -fsSL "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-x86_64-unknown-linux-musl.tar.gz" \
-            | sudo tar xz -C /usr/local/bin zellij
-          tmux -V; screen -v || true; zellij --version
-      - run: cargo test -p acc-core --test multiplexers
-
-  # Drives a real OpenSSH server (and tmux behind it) through a proxy that drops connections.
+  # Drives a real OpenSSH server through a proxy that drops connections.
   ssh:
     runs-on: ubuntu-latest
     env:
       ACC_REQUIRE_SSHD: "1"
-      ACC_REQUIRE_MUX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
-      - name: Install OpenSSH server and tmux
+      - name: Install OpenSSH server
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-server tmux
+          sudo apt-get install -y openssh-server
       - run: cargo test -p acc-ssh -p acc-ffi
 
   ios:

@@ -5,15 +5,12 @@
 //!   bytes, and the app moves those bytes over whatever it has. These calls
 //!   are short and never block on I/O.
 //! - With the SSH transport built in ([`remote`]): an [`SshHost`] launches and
-//!   rejoins detached sessions ([`RemoteSession`]) and co-drives harness TUIs
-//!   in tmux, zellij, screen or Rex panes ([`PaneSession`]). These calls are
+//!   rejoins detached sessions ([`RemoteSession`]). These calls are
 //!   `async`/`suspend` and survive dropped connections.
-//!
-//! - Detached sessions as a byte pump ([`AccSession`], [`AccFanIn`],
-//!   [`AccObserved`], [`AccTakeover`]): the app runs the scripts ACC hands it
-//!   over its own SSH channels and feeds back their output. Sessions are
-//!   launched, listed and attached by any client, replayed from their log,
-//!   and foreign TUIs are observed and taken over.
+//! - Detached sessions as a byte pump ([`AccSession`], [`AccFanIn`]): the app
+//!   runs the scripts ACC hands it over its own SSH channels and feeds back
+//!   their output. Sessions are launched, listed and attached by any client,
+//!   and replayed from their log.
 //!
 //! Objects can be shared across threads. Panics are caught by UniFFI and
 //! surfaced as errors instead of crashing the app.
@@ -23,16 +20,13 @@ use std::sync::{Mutex, MutexGuard};
 use acc_core::detached::SessionDir;
 use acc_core::driver::DriverError;
 use acc_core::live as core_session;
-use acc_core::osc7501::{self, Osc7501};
 
 pub mod acc_types;
-pub mod observe;
 mod remote;
 pub mod session;
 mod types;
 
 pub use acc_types::*;
-pub use observe::*;
 pub use remote::*;
 pub use session::*;
 pub use types::*;
@@ -111,8 +105,6 @@ pub enum AccError {
     NotRunning { session_id: String },
     #[error("remote script failed (exit {exit_code:?}): {stderr}")]
     Remote { exit_code: Option<u32>, stderr: String },
-    #[error("multiplexer: {reason}")]
-    Multiplexer { reason: String },
     /// A detached session's spec, snapshot or agent record didn't read.
     #[error("invalid session: {reason}")]
     InvalidSession { reason: String },
@@ -271,9 +263,8 @@ impl Session {
             .collect()
     }
 
-    /// Merges a state seen elsewhere, such as an OSC 7501 report from the
-    /// pane the harness runs in. Returns true if the visible state changed.
-    /// `Clear` is ignored.
+    /// Merges a state seen outside the harness's output. Returns true if
+    /// the visible state changed. `Clear` is ignored.
     pub fn observe(&self, state: SessionState) -> bool {
         match state.into_core() {
             Some(s) => lock(&self.inner).observe(s),
@@ -286,7 +277,7 @@ impl Session {
         lock(&self.inner).state().map(SessionState::from)
     }
 
-    /// The harness's own session id, for resume and takeover, once known.
+    /// The harness's own session id, for resume, once known.
     pub fn native_id(&self) -> Option<String> {
         lock(&self.inner).native_id().map(str::to_owned)
     }
@@ -303,36 +294,6 @@ impl Session {
     /// Options and their current values. Read again after `Event::OptionsChanged`.
     pub fn options(&self) -> Vec<OptionDef> {
         lock(&self.inner).options().iter().map(OptionDef::from).collect()
-    }
-}
-
-/// Follows a harness's own transcript file (Claude, Codex, pi) to observe a
-/// session ACC didn't start, before or instead of taking it over.
-#[derive(Debug, uniffi::Object)]
-pub struct TranscriptObserver {
-    inner: Mutex<core_session::TranscriptObserver>,
-}
-
-#[uniffi::export]
-impl TranscriptObserver {
-    #[uniffi::constructor]
-    pub fn new(harness: Harness) -> Result<Self, AccError> {
-        let h: acc_core::Harness = harness.into();
-        let inner = core_session::TranscriptObserver::new(h).ok_or_else(|| AccError::Unsupported {
-            reason: format!("ACC doesn't read {} transcripts", h.display_name()),
-        })?;
-        Ok(Self {
-            inner: Mutex::new(inner),
-        })
-    }
-
-    /// Feeds bytes appended to the transcript.
-    pub fn feed(&self, bytes: Vec<u8>, now_ms: u64) -> Vec<Event> {
-        lock(&self.inner)
-            .feed(&bytes, now_ms)
-            .into_iter()
-            .map(Event::from)
-            .collect()
     }
 }
 
@@ -383,84 +344,17 @@ impl DetachedSession {
     }
 }
 
-// ---------------------------------------------------------------------------
-// OSC 7501
-
-/// One OSC 7501 message seen in terminal output.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct ProgramStatus {
-    /// True for a probe (`OSC 7501 ; ?`); the terminal should reply with
-    /// [`osc7501_probe_reply`] before its DA1 response.
-    pub is_probe: bool,
-    pub state: Option<ProgramState>,
-    pub progress: Option<u8>,
-    pub id: Option<String>,
-    pub app: Option<String>,
-    pub title: Option<String>,
-    pub message: Option<String>,
-}
-
-/// Bytes a terminal writes back to answer an OSC 7501 probe.
+/// A shell command line that opens `harness`'s own TUI in `cwd`, for
+/// palette entries whose `exec` is `terminal`. It starts a fresh session
+/// rather than resuming the headless one, so the two never share a session.
 #[uniffi::export]
-pub fn osc7501_probe_reply() -> Vec<u8> {
-    osc7501::PROBE_REPLY.to_vec()
-}
-
-/// Incremental OSC 7501 extractor for a terminal byte stream.
-#[derive(Debug, uniffi::Object)]
-pub struct Osc7501Scanner {
-    inner: Mutex<osc7501::Scanner>,
-}
-
-#[uniffi::export]
-impl Osc7501Scanner {
-    #[uniffi::constructor]
-    pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(osc7501::Scanner::new()),
-        }
-    }
-
-    /// Feed raw terminal output; returns any status messages it completed.
-    pub fn feed(&self, bytes: Vec<u8>) -> Vec<ProgramStatus> {
-        lock(&self.inner)
-            .feed(&bytes)
-            .into_iter()
-            .map(to_status)
-            .collect()
-    }
-}
-
-impl Default for Osc7501Scanner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn to_status(msg: Osc7501) -> ProgramStatus {
-    match msg {
-        Osc7501::Probe => ProgramStatus {
-            is_probe: true,
-            state: None,
-            progress: None,
-            id: None,
-            app: None,
-            title: None,
-            message: None,
-        },
-        Osc7501::Report(r) => {
-            let (state, progress) = from_run_state(r.state.as_ref());
-            ProgramStatus {
-                is_probe: false,
-                state: Some(state),
-                progress,
-                id: r.id,
-                app: r.app,
-                title: r.title,
-                message: r.message,
-            }
-        }
-    }
+pub fn tui_command(harness: AccHarness, cwd: String) -> String {
+    let h: acc_core::Harness = harness.into();
+    format!(
+        "cd {} && exec {}",
+        acc_core::shell::quote(&cwd),
+        acc_core::shell::quote(h.program())
+    )
 }
 
 #[cfg(test)]
