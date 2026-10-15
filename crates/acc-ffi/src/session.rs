@@ -192,35 +192,30 @@ impl AccSession {
 
     pub fn items(&self) -> Vec<AccItem> {
         let s = lock(&self.inner);
-        let h = s.harness();
-        s.transcript().items().iter().map(|i| item(i, h)).collect()
+        s.transcript().items().iter().map(item).collect()
     }
 
     pub fn item(&self, id: String) -> Option<AccItem> {
         let s = lock(&self.inner);
-        let h = s.harness();
-        s.transcript().get(&id).map(|i| item(i, h))
+        s.transcript().get(&id).map(item)
     }
 
     /// The main conversation: items that didn't run inside a subagent.
     pub fn top_level_items(&self) -> Vec<AccItem> {
         let s = lock(&self.inner);
-        let h = s.harness();
-        s.transcript().top_level().map(|i| item(i, h)).collect()
+        s.transcript().top_level().map(item).collect()
     }
 
     /// The child conversation of the `Subagent` item `parent`.
     pub fn children(&self, parent: String) -> Vec<AccItem> {
         let s = lock(&self.inner);
-        let h = s.harness();
-        s.transcript().children(&parent).map(|i| item(i, h)).collect()
+        s.transcript().children(&parent).map(item).collect()
     }
 
     /// Every subagent run in the session.
     pub fn subagents(&self) -> Vec<AccItem> {
         let s = lock(&self.inner);
-        let h = s.harness();
-        s.transcript().subagents().map(|i| item(i, h)).collect()
+        s.transcript().subagents().map(item).collect()
     }
 
     pub fn usage(&self) -> AccUsage {

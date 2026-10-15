@@ -3,6 +3,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::*;
+use crate::event::ItemStatus;
+use crate::item::ItemDetail;
 
 const HI: &str = include_str!("../../tests/fixtures/claude/hi-and-controls.ndjson");
 const PERMISSION: &str = include_str!("../../tests/fixtures/claude/permission-deny.ndjson");
@@ -222,11 +224,15 @@ fn permission_round_trip_matches_recording() {
     );
 
     // The Bash tool item opened with its input and closed by the denied result.
+    assert!(
+        events.iter().any(|e| matches!(e,
+        Event::ItemStarted { id, kind: ItemKind::CommandExecution, parent: None,
+            detail: ItemDetail::Command { tool, command, .. }, .. }
+            if id == "toolu_01ADx3kHAMjJRN8Qvy9H8avv" && tool == "Bash" && command == "touch acc-probe.txt"))
+    );
     assert!(events.iter().any(|e| matches!(e,
-        Event::ItemStarted { id, kind: ItemKind::CommandExecution, parent: None, extensions }
-            if id == "toolu_01ADx3kHAMjJRN8Qvy9H8avv" && extensions["input"]["command"] == "touch acc-probe.txt")));
-    assert!(events.iter().any(|e| matches!(e,
-        Event::ItemCompleted { id, extensions } if id == "toolu_01ADx3kHAMjJRN8Qvy9H8avv" && extensions["is_error"] == true)));
+        Event::ItemCompleted { id, status: ItemStatus::Failed, detail: ItemDetail::Command { .. }, .. }
+            if id == "toolu_01ADx3kHAMjJRN8Qvy9H8avv")));
 }
 
 #[test]
@@ -446,7 +452,8 @@ fn unstreamed_assistant_text_is_announced_whole() {
                 id: "m1:0".into(),
                 kind: ItemKind::AgentMessage,
                 parent: None,
-                extensions: Value::Null
+                detail: ItemDetail::Text,
+                native: Value::Null
             },
             Event::ItemDelta {
                 id: "m1:0".into(),
@@ -454,7 +461,9 @@ fn unstreamed_assistant_text_is_announced_whole() {
             },
             Event::ItemCompleted {
                 id: "m1:0".into(),
-                extensions: Value::Null
+                status: ItemStatus::Completed,
+                detail: ItemDetail::Text,
+                native: Value::Null
             },
         ]
     );
@@ -947,7 +956,6 @@ const SUBAGENTS: &str = include_str!("../../tests/fixtures/claude/subagents.ndjs
 
 #[test]
 fn subagents_are_items_with_their_conversations() {
-    use crate::item::ItemDetail;
     use crate::transcript::{ItemStatus, Transcript};
     let mut d = ClaudeDriver::default();
     let mut t = Transcript::new();
@@ -977,7 +985,7 @@ fn subagents_are_items_with_their_conversations() {
             output,
             prompt,
             ..
-        } = sub.detail(Harness::Claude)
+        } = sub.detail.clone()
         else {
             panic!("subagent detail")
         };
@@ -995,14 +1003,14 @@ fn subagents_are_items_with_their_conversations() {
         assert!(kinds.contains(&ItemKind::AgentMessage), "{kinds:?}");
     }
     let fg = t.get("toolu_01WqrBFboSUXpcf1Bb8qoLzE").unwrap();
-    let ItemDetail::Subagent { output, child, .. } = fg.detail(Harness::Claude) else {
+    let ItemDetail::Subagent { output, child, .. } = fg.detail.clone() else {
         panic!()
     };
     assert_eq!(child.as_deref(), Some("adc9fb778705a136d"));
     assert!(output.unwrap().starts_with("Here are all the files"));
     assert!(t.children(&fg.id).any(|i| i.kind == ItemKind::UserMessage));
     let bg = t.get("toolu_01EJj1wwkNi2uz6whj1RpML9").unwrap();
-    let ItemDetail::Subagent { output, .. } = bg.detail(Harness::Claude) else {
+    let ItemDetail::Subagent { output, .. } = bg.detail.clone() else {
         panic!()
     };
     assert!(output.unwrap().contains("3 lines"));

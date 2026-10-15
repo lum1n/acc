@@ -59,44 +59,7 @@ pub struct Policy {
     pub rules: Vec<Rule>,
 }
 
-/// ACC's kind of tool, for rules that work on every harness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolKind {
-    Shell,
-    Edit,
-    Read,
-    Fetch,
-    Mcp,
-    Other,
-}
-
-impl ToolKind {
-    fn name(self) -> &'static str {
-        match self {
-            ToolKind::Shell => "shell",
-            ToolKind::Edit => "edit",
-            ToolKind::Read => "read",
-            ToolKind::Fetch => "fetch",
-            ToolKind::Mcp => "mcp",
-            ToolKind::Other => "other",
-        }
-    }
-
-    fn of(tool: &str) -> Self {
-        let t = tool.to_ascii_lowercase();
-        match t.as_str() {
-            "bash" | "shell" | "execute" | "exec_command" | "local_shell" | "run_terminal_cmd"
-            | "terminal" | "commandexecution" => ToolKind::Shell,
-            "edit" | "write" | "multiedit" | "notebookedit" | "apply_patch" | "filechange" | "delete"
-            | "move" => ToolKind::Edit,
-            "read" | "glob" | "grep" | "ls" | "view" | "search" | "find" | "list" => ToolKind::Read,
-            "webfetch" | "fetch" | "websearch" | "web_search" => ToolKind::Fetch,
-            _ if t.starts_with("mcp") => ToolKind::Mcp,
-            _ => ToolKind::Other,
-        }
-    }
-}
+pub use crate::item::ToolKind;
 
 /// What an approval is about, as far as the harness says.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,33 +74,38 @@ pub struct Request {
 impl Request {
     /// Reads a request from the tool call it is about (when the transcript
     /// has it) and the request's own input.
-    pub fn new(harness: Harness, item: Option<&Item>, input: &Value) -> Self {
+    pub fn new(item: Option<&Item>, input: &Value) -> Self {
         let mut r = Request::default();
         if let Some(item) = item {
-            r.tool = item_tool(item);
-            match item.detail(harness) {
-                ItemDetail::Command { command, .. } => {
+            match &item.detail {
+                ItemDetail::Command { tool, command, .. } => {
+                    r.tool = Some(tool.clone());
                     r.kind = Some(ToolKind::Shell);
-                    r.command = Some(command).filter(|c| !c.trim().is_empty());
+                    r.command = Some(command.clone()).filter(|c| !c.trim().is_empty());
                 }
-                ItemDetail::FileChange { files } => {
+                ItemDetail::FileChange { tool, files } => {
+                    r.tool = Some(tool.clone());
                     r.kind = Some(ToolKind::Edit);
-                    r.paths
-                        .extend(files.into_iter().map(|f| f.path).filter(|p| !p.is_empty()));
+                    for f in files {
+                        push_path(&mut r.paths, &f.path);
+                    }
                 }
-                ItemDetail::Tool { input, .. } => read_input(&input, &mut r),
-                ItemDetail::Subagent { .. } | ItemDetail::Text => {}
-            }
-            for loc in item
-                .ext
-                .get("locations")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(p) = loc.get("path").and_then(Value::as_str) {
-                    push_path(&mut r.paths, p);
+                ItemDetail::Tool {
+                    tool,
+                    kind,
+                    input,
+                    paths,
+                    ..
+                } => {
+                    r.tool = Some(tool.clone());
+                    r.kind = Some(*kind);
+                    for p in paths {
+                        push_path(&mut r.paths, p);
+                    }
+                    read_input(input, &mut r);
                 }
+                ItemDetail::Subagent { tool, .. } => r.tool = Some(tool.clone()),
+                ItemDetail::Text => {}
             }
         }
         read_input(input, &mut r);
@@ -149,15 +117,6 @@ impl Request {
         }
         r
     }
-}
-
-/// The tool's own name from an item's native JSON.
-fn item_tool(item: &Item) -> Option<String> {
-    let ext = &item.ext;
-    ["name", "tool", "kind", "type"]
-        .iter()
-        .find_map(|k| ext.get(*k).and_then(Value::as_str))
-        .map(str::to_owned)
 }
 
 fn push_path(paths: &mut Vec<String>, p: &str) {
@@ -606,22 +565,36 @@ mod tests {
 
     #[test]
     fn requests_read_codex_and_acp_inputs() {
-        let r = Request::new(
-            Harness::Codex,
-            None,
-            &json!({"command": "cargo test", "cwd": "/w"}),
-        );
+        let r = Request::new(None, &json!({"command": "cargo test", "cwd": "/w"}));
         assert_eq!(
             (r.kind, r.command.as_deref()),
             (Some(ToolKind::Shell), Some("cargo test"))
         );
-        let r = Request::new(
-            Harness::Cursor,
-            None,
-            &json!({"command": ["bash", "-lc", "ls -la"]}),
-        );
+        let r = Request::new(None, &json!({"command": ["bash", "-lc", "ls -la"]}));
         assert_eq!(r.command.as_deref(), Some("ls -la"));
-        let r = Request::new(Harness::Claude, None, &json!({"file_path": "/w/a.rs"}));
+        let r = Request::new(None, &json!({"file_path": "/w/a.rs"}));
+        assert_eq!(r.paths, ["/w/a.rs"]);
+    }
+
+    #[test]
+    fn requests_read_the_typed_item() {
+        let mut feed = crate::item::ItemFeed::new(Harness::Cursor);
+        let mut t = crate::transcript::Transcript::new();
+        let mut out = Vec::new();
+        feed.start(
+            "t1",
+            crate::event::ItemKind::ToolCall,
+            None,
+            json!({"toolCallId": "t1", "kind": "read", "title": "Read a.rs",
+                "locations": [{"path": "/w/a.rs"}]}),
+            &mut out,
+        );
+        for e in &out {
+            t.apply(e);
+        }
+        let r = Request::new(t.get("t1"), &Value::Null);
+        assert_eq!(r.tool.as_deref(), Some("read"));
+        assert_eq!(r.kind, Some(ToolKind::Read));
         assert_eq!(r.paths, ["/w/a.rs"]);
     }
 

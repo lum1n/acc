@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::command::Apply;
+use crate::event::ItemStatus;
+use crate::item::ItemDetail;
 
 fn driver(harness: Harness, start: Start) -> AcpDriver {
     AcpDriver::new(harness, AcpConfig::new("/home/v/proj", start))
@@ -326,10 +328,9 @@ fn a_full_turn_with_a_permission_prompt() {
         id: "item-2".into(),
         text: "cargo.".into()
     }));
-    assert!(events.contains(&Event::ItemCompleted {
-        id: "item-2".into(),
-        extensions: Value::Null
-    }));
+    assert!(events.iter().any(
+        |e| matches!(e, Event::ItemCompleted { id, status: ItemStatus::Completed, .. } if id == "item-2")
+    ));
     assert!(events.iter().any(|e| matches!(e, Event::PermissionRequested {
         request_id, title, options, kind: BlockKind::Permission, item_id, ..
     } if request_id == "7" && title == "cargo build" && item_id.is_some() && options == &vec![
@@ -382,12 +383,15 @@ fn a_full_turn_with_a_permission_prompt() {
         ],
     );
     assert_eq!(states(&events), [working(), RunState::Done]);
-    assert!(events.contains(&Event::ItemUpdated {
-        id: "t1".into(),
-        extensions: json!({ "toolCallId": "t1", "status": "in_progress" }),
-    }));
     assert!(
-        matches!(&events[2], Event::ItemCompleted { id, extensions } if id == "t1" && extensions["status"] == "completed")
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ItemUpdated { id, native, .. }
+        if id == "t1" && native == &json!({ "toolCallId": "t1", "status": "in_progress" })))
+    );
+    assert!(
+        matches!(&events[2], Event::ItemCompleted { id, status: ItemStatus::Completed, native, .. }
+        if id == "t1" && native["status"] == "completed")
     );
     assert!(events.contains(&Event::Usage(Usage {
         context_used: Some(53_000),
@@ -416,7 +420,8 @@ fn prompts_are_echoed_once() {
                 id: "prompt-1".into(),
                 kind: ItemKind::UserMessage,
                 parent: None,
-                extensions: Value::Null,
+                detail: ItemDetail::Text,
+                native: Value::Null,
             },
             Event::ItemDelta {
                 id: "prompt-1".into(),
@@ -424,7 +429,9 @@ fn prompts_are_echoed_once() {
             },
             Event::ItemCompleted {
                 id: "prompt-1".into(),
-                extensions: Value::Null,
+                status: ItemStatus::Completed,
+                detail: ItemDetail::Text,
+                native: Value::Null,
             },
         ]
     );
@@ -791,10 +798,11 @@ fn interrupt_cancels_open_permission_requests() {
     );
 
     let events = feed(&mut d, &[result("acc-2", json!({ "stopReason": "cancelled" }))]);
-    assert!(events.contains(&Event::ItemCompleted {
-        id: "t9".into(),
-        extensions: Value::Null
-    }));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ItemCompleted { id, .. } if id == "t9"))
+    );
     assert_eq!(states(&events), [RunState::Idle]);
 }
 

@@ -42,6 +42,7 @@ use crate::event::{
     Quota, QuotaWindow, Usage,
 };
 use crate::harness::{Harness, LaunchSpec};
+use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
 use crate::wire::{self, owned, str_at, u64_at};
@@ -120,6 +121,8 @@ struct Overrides {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CodexDriver {
     config: CodexConfig,
+    /// Every item the harness reported, for their typed detail.
+    items: ItemFeed,
     framer: LineFramer,
     next_id: u64,
     pending: HashMap<String, Req>,
@@ -161,6 +164,7 @@ impl CodexDriver {
     pub fn new(config: CodexConfig) -> Self {
         let mut d = Self {
             config,
+            items: ItemFeed::new(Harness::Codex),
             framer: LineFramer::new(wire::MAX_FRAME),
             next_id: 0,
             pending: HashMap::new(),
@@ -478,15 +482,10 @@ impl CodexDriver {
                     self.adopt_children(item);
                     let parent = self.parent_for(&p);
                     if let (Some(id), Some(kind)) = (owned(item, "id"), item_kind(item)) {
-                        out.push(Event::ItemStarted {
-                            id: id.clone(),
-                            kind,
-                            parent,
-                            extensions: ext,
-                        });
+                        self.items.start(id.clone(), kind, parent, ext, out);
                         // User messages and some others have no delta stream.
                         if let Some(text) = initial_text(item) {
-                            out.push(Event::ItemDelta { id, text });
+                            self.items.delta(id, text, out);
                         }
                     }
                 }
@@ -503,15 +502,9 @@ impl CodexDriver {
                         // Finished by `subagent_finished` when it started.
                     } else if is_activity(item, "started") {
                         // The spawn call returned; the subagent runs on.
-                        out.push(Event::ItemUpdated {
-                            id,
-                            extensions: item.clone(),
-                        });
+                        self.items.update(id, item.clone(), out);
                     } else {
-                        out.push(Event::ItemCompleted {
-                            id,
-                            extensions: item.clone(),
-                        });
+                        self.items.complete(id, item.clone(), out);
                     }
                 }
             }
@@ -524,7 +517,7 @@ impl CodexDriver {
                 if let (Some(id), Some(text)) = (owned(&p, "itemId"), owned(&p, "delta"))
                     && !text.is_empty()
                 {
-                    out.push(Event::ItemDelta { id, text });
+                    self.items.delta(id, text, out);
                 }
             }
             "thread/tokenUsage/updated" if ours => {
@@ -721,13 +714,14 @@ impl CodexDriver {
                 Some(other) => other,
                 None => "completed",
             };
-            out.push(Event::ItemCompleted {
-                id: spawn,
-                extensions: json!({
+            self.items.complete(
+                spawn,
+                json!({
                     "childStatus": status,
                     "report": child.and_then(|c| self.child_reports.get(c)),
                 }),
-            });
+                out,
+            );
         }
         true
     }
@@ -757,19 +751,11 @@ impl CodexDriver {
         let (Some(id), Some(kind)) = (owned(item, "id"), item_kind(item)) else {
             return;
         };
-        out.push(Event::ItemStarted {
-            id: id.clone(),
-            kind,
-            parent: None,
-            extensions: Value::Null,
-        });
+        self.items.start(id.clone(), kind, None, Value::Null, out);
         if let Some(text) = initial_text(item).or_else(|| final_text(item)) {
-            out.push(Event::ItemDelta { id: id.clone(), text });
+            self.items.delta(id.clone(), text, out);
         }
-        out.push(Event::ItemCompleted {
-            id,
-            extensions: item.clone(),
-        });
+        self.items.complete(id, item.clone(), out);
     }
 
     // ---- server requests ---------------------------------------------------

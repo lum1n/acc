@@ -10,10 +10,9 @@ use acc_core::harness;
 use acc_core::item;
 use acc_core::policy::{self, Policy, Rule};
 use acc_core::session::{self, LaunchRequest, Outbound, Session, SessionError, SessionSpec, Update};
-use serde_json::Value;
 use wasm_bindgen::prelude::*;
 
-use crate::{AccExec, arg, error, item_json, js, ms, num};
+use crate::{AccExec, arg, error, js, ms, num};
 
 pub(crate) fn session_error(e: SessionError) -> JsValue {
     let kind = match &e {
@@ -229,34 +228,29 @@ impl AccSession {
         js(&self.inner.state())
     }
 
-    /// JSON array of items, each with its `detail`.
+    /// JSON array of `Item`s.
     pub fn items(&self) -> JsValue {
-        let h = self.inner.harness();
-        items(self.inner.transcript().items().iter(), h)
+        items(self.inner.transcript().items().iter())
     }
 
     pub fn item(&self, id: &str) -> JsValue {
-        let h = self.inner.harness();
-        js(&self.inner.transcript().get(id).map(|i| item_json(i, h)))
+        js(&self.inner.transcript().get(id))
     }
 
     /// The main conversation: items that didn't run inside a subagent.
     #[wasm_bindgen(js_name = topLevelItems)]
     pub fn top_level_items(&self) -> JsValue {
-        let h = self.inner.harness();
-        items(self.inner.transcript().top_level(), h)
+        items(self.inner.transcript().top_level())
     }
 
     /// The child conversation of the `subagent` item `parent`.
     pub fn children(&self, parent: &str) -> JsValue {
-        let h = self.inner.harness();
-        items(self.inner.transcript().children(parent), h)
+        items(self.inner.transcript().children(parent))
     }
 
     /// Every subagent run in the session.
     pub fn subagents(&self) -> JsValue {
-        let h = self.inner.harness();
-        items(self.inner.transcript().subagents(), h)
+        items(self.inner.transcript().subagents())
     }
 
     pub fn usage(&self) -> JsValue {
@@ -322,11 +316,8 @@ impl AccSession {
     }
 }
 
-pub(crate) fn items<'a>(
-    it: impl Iterator<Item = &'a acc_core::transcript::Item>,
-    h: acc_core::Harness,
-) -> JsValue {
-    js(&it.map(|i| item_json(i, h)).collect::<Vec<Value>>())
+pub(crate) fn items<'a>(it: impl Iterator<Item = &'a acc_core::transcript::Item>) -> JsValue {
+    js(&it.collect::<Vec<_>>())
 }
 
 /// One line of a followed file.

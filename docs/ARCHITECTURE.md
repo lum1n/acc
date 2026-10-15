@@ -80,6 +80,28 @@ ACP harnesses). A prompt sent before the driver has a session (`AcpDriver` befor
 flushed once it does, rather than dropped with `DriverError::NotStarted`; Claude, pi and the rest of
 ACP's commands have no such readiness gate.
 
+## Items
+
+Every harness reports the same kinds of items (messages, reasoning, tool calls, commands, file
+changes, subagent runs), each in its own JSON. A client never reads that JSON: each driver sends its
+items through an `item::ItemFeed`, which merges the native frames of an item and emits
+`Event::ItemStarted`, `ItemUpdated` and `ItemCompleted` with the item's whole `item::ItemDetail` so
+far (a client replaces the detail it had, never merges), and `ItemCompleted` with its
+`ItemStatus`. The detail is the same shape on every harness:
+
+| Detail | Carries |
+|---|---|
+| `Text` | messages and reasoning; the content arrives only as `ItemDelta`s |
+| `Tool` | `tool` (the harness's own name), `kind` (ACC's `ToolKind`: shell, edit, read, fetch, mcp, other), a one-line `title`, the tool's arguments as `input`, `output`, and the `paths` it acts on |
+| `Command` | `tool`, the command line, `cwd`, output and exit code |
+| `FileChange` | `tool` and structured diffs (`FileDiff` with hunks) |
+| `Subagent` | `tool`, agent type, task, child conversation id, status, report, model, and `background` |
+
+The feed also settles what each harness says in its own words: the parent of a subagent's items,
+whether an item failed, and message text a harness sends only with the completion. The native JSON
+still rides along as `native`, for debugging and harness-specific UI. Anything else that reads a
+harness's items (a transcript file, say) uses the same feed.
+
 ## Interactive commands
 
 A TUI's interactive slash commands (pickers, dialogs) don't work headless: harnesses refuse them
@@ -111,8 +133,10 @@ describe what a client has to draw:
 The bindings carry two session layers. `acc_core::live::Session` is for an app that owns a live byte
 stream to the harness (a pipe, an SSH channel, `acc-ssh`): it picks the driver for a harness
 (`SessionConfig { harness, cwd, opening: New | Resume | Attach, model, client_tag }`), stamps state
-changes with the caller's clock, merges state the app saw elsewhere (`observe`) and remembers the
-harness's session id. It stays sans-IO, so the app owns the transport:
+changes with the caller's clock, merges state the app saw elsewhere (`observe`), remembers the
+harness's session id and keeps a `Transcript` of the items (`items`, `item`, `top_level_items`,
+`children` in the bindings; items a turn left unfinished complete in the events too). It stays
+sans-IO, so the app owns the transport:
 
 ```
 spawn launch_spec() on the host  →  write start()
@@ -123,7 +147,7 @@ on EOF:               exited(code, now_ms)
 
 | Binding | Crate | Types |
 |---|---|---|
-| Swift, Kotlin | `acc-ffi` (UniFFI 0.32) | Typed records and enums mirroring the core; harness-native payloads as JSON strings (`extensions_json`, `payload_json`). `Event.UsageUpdated` / `QuotaUpdated` are the core's `Usage` / `Quota` events. |
+| Swift, Kotlin | `acc-ffi` (UniFFI 0.32) | Typed records and enums mirroring the core, items with their typed `AccItemDetail`; free-form JSON as strings (`input_json`, `native_json`, `payload_json`). `Event.UsageUpdated` / `QuotaUpdated` are the core's `Usage` / `Quota` events. |
 | JS (browser, Node) | `acc-wasm` (wasm-bindgen) | Plain objects in the core's serde shape (snake_case, `type`-tagged), so they match `acc run --json`; bytes are `Uint8Array`; TypeScript declarations ship in the generated `.d.ts`. |
 
 Both also expose `DetachedSession` (the daemonless scripts below), `tui_command` (opening a
@@ -229,9 +253,8 @@ reach the log, so the Claude driver resolves a permission from the tool's result
 client, and every replay, sees it answered.
 
 Every update carries a `replay` flag (history vs. live, for notifications) and the change it made to
-the session's `Transcript`: items with accumulated text and merged extensions. `item::detail` turns
-each harness's native item JSON into one typed shape (tool call, command with output and exit code,
-file change with hunks) and `item::parse_unified` reads `git diff`. Commands a harness can only carry
+the session's `Transcript`: items with accumulated text and their latest typed detail (see
+[Items](#items)). `item::parse_unified` reads `git diff`. Commands a harness can only carry
 out with a new process (Claude fork, a model Cursor takes at spawn) come back as
 `Outbound::Relaunch`.
 
@@ -305,8 +328,8 @@ conversation — messages, tool calls, commands — carries the subagent item's 
 `parent`, so `Transcript::children(id)` is the run's own conversation and `Transcript::top_level()` is
 the main one with every subagent folded away; `Transcript::subagents()` lists the runs themselves.
 
-A subagent launched in the background outlives the turn that started it: `Transcript::settle` leaves
-it `Running` until it reports back (or the process exits), so a client doesn't show it as finished
+A subagent launched in the background (`background` in its `ItemDetail::Subagent`) outlives the turn that
+started it: `Transcript::settle` leaves it `Running` until it reports back (or the process exits), so a client doesn't show it as finished
 early. When its report will start another turn on its own, the session meanwhile is
 `RunState::Waiting` rather than `Done`: Claude (`background_tasks_changed`; the report is queued as a
 new turn, so it goes back to `Working` when the last one finishes) and pi (pi-subagents' `async: true`
@@ -319,7 +342,7 @@ back and the follow-up is answered, so they stay `Working`.
 |---|---|---|
 | Claude | `Agent`/`Task` tool call; `system/task_started`, `task_progress`, `task_updated`, `task_notification` merge onto it; a background launch's tool result only acknowledges (`isAsync`), the notification finishes it | `~/.claude/projects/<proj>/<session>/subagents/agent-<id>.jsonl`, named by `agent-<id>.meta.json`'s `toolUseId`; `Driver::launch` adds `--forward-subagent-text` so a driven session streams it live too |
 | Codex | 0.162: a `subAgentActivity` item (`kind: started`) names the child thread (`agentThreadId`) and the agent (`agentPath`); its immediate completion only updates it, and a later `subAgentActivity` with another `kind` finishes it with the child's last message as the report. Older: `collabAgentToolCall` (`spawnAgent`, ...) and `thread/started` with `source.subAgent.thread_spawn.parent_thread_id`. `wait` and the other collab tools stay `collabAgentToolCall` | the child's own thread: its `item/*` notifications carry its `threadId`, mapped back to the spawning item |
-| Cursor, Copilot, opencode (ACP) | a `task`/`subagent`-shaped tool call (name, or `rawInput.subagent_type`/`agent` with a prompt); the report is opencode's `task_id: …`/`<task_result>` (1.x) or `<subagent sessionID="…">` (2.0) wrapper, unwrapped by `item::detail` | opencode forwards the child session's updates under the parent's session id, tagged `_meta["opencode/child-session"]`; other agents report only the final text |
+| Cursor, Copilot, opencode (ACP) | a `task`/`subagent`-shaped tool call (name, or `rawInput.subagent_type`/`agent` with a prompt); the report is opencode's `task_id: …`/`<task_result>` (1.x) or `<subagent sessionID="…">` (2.0) wrapper, unwrapped by the item feed | opencode forwards the child session's updates under the parent's session id, tagged `_meta["opencode/child-session"]`; other agents report only the final text |
 | pi | the pi-subagents extension's `subagent` tool; an `async: true` launch's result only acknowledges (`details.asyncId`), its `subagent-notify` custom message finishes it | none (no child transcript) |
 
 ## State

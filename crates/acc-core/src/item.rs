@@ -1,43 +1,58 @@
-//! Typed views of transcript items.
+//! Typed items, the same shape whatever the harness.
 //!
-//! Drivers pass each harness's native item JSON through in `extensions`. This
-//! module turns it into one shape a UI can render without knowing the
-//! harness: tool calls with their input and output, shell commands with
-//! output and exit code, and file changes as structured diffs.
+//! Each driver feeds its harness's native item JSON through an [`ItemFeed`],
+//! which emits the item events with an [`ItemDetail`] a UI can render
+//! without knowing the harness: tool calls with their input and output,
+//! shell commands with output and exit code, file changes as structured
+//! diffs, and subagent runs. The native JSON rides along as `native`.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 
-use crate::event::ItemKind;
+use crate::event::{Event, ItemId, ItemKind, ItemStatus};
 use crate::harness::Harness;
 use crate::wire::{owned, str_at};
 
 /// What an item is, in a harness-independent shape.
+///
+/// `tool` is always the harness's own name for the tool (`Bash`,
+/// `commandExecution`, `execute`, `bash`), for display and for permission
+/// rules that name it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ItemDetail {
     /// User or agent message, or reasoning: the item's text is the content.
     Text,
     Tool {
-        name: String,
+        tool: String,
+        kind: ToolKind,
         /// One-line summary of what the tool acts on (path, pattern, URL...).
         title: String,
+        /// The tool's arguments.
         input: Value,
         output: Option<String>,
+        /// Files the tool acts on, as the harness gave them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
     },
     Command {
+        tool: String,
         command: String,
         cwd: Option<String>,
         output: String,
         exit_code: Option<i32>,
     },
     FileChange {
+        tool: String,
         files: Vec<FileDiff>,
     },
     /// A run of another agent: what it was asked and what it reported. The
     /// child conversation's items carry this item's id as their `parent`.
     Subagent {
+        tool: String,
         /// The agent type or name (Claude's `subagent_type`, opencode's
         /// agent, a Codex nickname or role), when known.
         agent: Option<String>,
@@ -52,7 +67,51 @@ pub enum ItemDetail {
         /// The agent's final report, or its latest summary while it runs.
         output: Option<String>,
         model: Option<String>,
+        /// It runs on after the turn that started it ends, until it
+        /// reports back or the process exits.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
     },
+}
+
+/// ACC's kind of tool, the same on every harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Shell,
+    Edit,
+    Read,
+    Fetch,
+    Mcp,
+    Other,
+}
+
+impl ToolKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            ToolKind::Shell => "shell",
+            ToolKind::Edit => "edit",
+            ToolKind::Read => "read",
+            ToolKind::Fetch => "fetch",
+            ToolKind::Mcp => "mcp",
+            ToolKind::Other => "other",
+        }
+    }
+
+    /// The kind of a harness's tool, by its name.
+    pub fn of(tool: &str) -> Self {
+        let t = tool.to_ascii_lowercase();
+        match t.as_str() {
+            "bash" | "shell" | "execute" | "exec_command" | "local_shell" | "run_terminal_cmd"
+            | "terminal" | "commandexecution" => ToolKind::Shell,
+            "edit" | "write" | "multiedit" | "notebookedit" | "apply_patch" | "filechange" | "delete"
+            | "move" => ToolKind::Edit,
+            "read" | "glob" | "grep" | "ls" | "view" | "search" | "find" | "list" => ToolKind::Read,
+            "webfetch" | "fetch" | "websearch" | "web_search" => ToolKind::Fetch,
+            _ if t.starts_with("mcp") => ToolKind::Mcp,
+            _ => ToolKind::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,11 +494,11 @@ fn i32_at(v: &Value, key: &str) -> Option<i32> {
         .and_then(|n| i32::try_from(n).ok())
 }
 
-/// Builds the typed detail of an item from its harness's extensions.
+/// Builds the typed detail of an item from its harness's native JSON.
 ///
-/// `ext` is the item's extensions with every update and the completion
+/// `ext` is the item's native JSON with every update and the completion
 /// merged over the start (later keys win); `text` is its streamed text.
-pub fn detail(harness: Harness, kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
+fn detail(harness: Harness, kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     match kind {
         ItemKind::UserMessage | ItemKind::AgentMessage | ItemKind::Reasoning => ItemDetail::Text,
         _ => match harness {
@@ -452,11 +511,48 @@ pub fn detail(harness: Harness, kind: ItemKind, ext: &Value, text: &str) -> Item
 }
 
 fn tool(name: &str, input: &Value, output: Option<String>) -> ItemDetail {
+    tool_of(name, ToolKind::of(name), input, output)
+}
+
+fn tool_of(name: &str, kind: ToolKind, input: &Value, output: Option<String>) -> ItemDetail {
     ItemDetail::Tool {
-        name: name.to_owned(),
+        tool: name.to_owned(),
+        kind,
         title: subject(input),
         input: input.clone(),
         output,
+        paths: input_paths(input),
+    }
+}
+
+/// The files a tool's arguments name.
+fn input_paths(input: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    for key in ["file_path", "path", "filePath", "notebook_path"] {
+        if let Some(p) = str_at(input, key) {
+            push_path(&mut paths, p);
+        }
+    }
+    paths
+}
+
+fn push_path(paths: &mut Vec<String>, p: &str) {
+    if !p.is_empty() && !paths.iter().any(|q| q == p) {
+        paths.push(p.to_owned());
+    }
+}
+
+/// A native item without the bookkeeping keys every protocol adds, as the
+/// input of a tool ACC has no shape for.
+fn without_bookkeeping(ext: &Value) -> Value {
+    match ext {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "id" | "type" | "status"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -485,7 +581,7 @@ fn claude_report(text: &str) -> Option<String> {
 /// A Claude `Agent`/`Task` call. The input names the agent and task; the
 /// driver merges `task_*` frames under `task` and the structured result
 /// (`toolUseResult`) under `result`.
-fn claude_subagent(ext: &Value, text: &str) -> ItemDetail {
+fn claude_subagent(name: &str, ext: &Value, text: &str) -> ItemDetail {
     let null = Value::Null;
     let input = ext.get("input").unwrap_or(&null);
     let task = ext.get("task").unwrap_or(&null);
@@ -501,6 +597,7 @@ fn claude_subagent(ext: &Value, text: &str) -> ItemDetail {
             (ext.get("is_error").and_then(Value::as_bool) == Some(true)).then(|| "failed".to_owned())
         });
     ItemDetail::Subagent {
+        tool: name.to_owned(),
         agent: owned(input, "subagent_type")
             .or_else(|| owned(task, "subagent_type"))
             .or_else(|| owned(result, "agentType")),
@@ -515,18 +612,21 @@ fn claude_subagent(ext: &Value, text: &str) -> ItemDetail {
         status,
         output: report.or_else(|| owned(task, "summary")),
         model: owned(result, "resolvedModel"),
+        background: result.get("isAsync").and_then(Value::as_bool) == Some(true)
+            || task.get("is_backgrounded").and_then(Value::as_bool) == Some(true),
     }
 }
 
 fn claude(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     let name = str_at(ext, "name").unwrap_or("tool");
     if kind == ItemKind::Subagent {
-        return claude_subagent(ext, text);
+        return claude_subagent(name, ext, text);
     }
     let input = ext.get("input").cloned().unwrap_or(Value::Null);
     let output = ext.get("content").and_then(content_text);
     match (kind, name) {
         (ItemKind::CommandExecution, _) => ItemDetail::Command {
+            tool: name.to_owned(),
             command: owned(&input, "command").unwrap_or_default(),
             cwd: None,
             output: output.unwrap_or_else(|| text.to_owned()),
@@ -569,7 +669,10 @@ fn claude(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
                     ),
                 ),
             };
-            ItemDetail::FileChange { files: vec![file] }
+            ItemDetail::FileChange {
+                tool: name.to_owned(),
+                files: vec![file],
+            }
         }
         _ => tool(name, &input, output),
     }
@@ -588,6 +691,7 @@ fn codex_subagent(ext: &Value, text: &str) -> ItemDetail {
             .filter(|n| !n.is_empty())
             .map(str::to_owned);
         return ItemDetail::Subagent {
+            tool: "spawnAgent".to_owned(),
             description: match &agent {
                 Some(name) => format!("Spawn agent {name}"),
                 None => "Spawn agent".to_owned(),
@@ -598,6 +702,7 @@ fn codex_subagent(ext: &Value, text: &str) -> ItemDetail {
             status: owned(ext, "childStatus").or_else(|| Some("running".to_owned())),
             output: owned(ext, "report"),
             model: owned(ext, "model"),
+            background: ext.get("childStatus").is_none(),
         };
     }
     let tool = str_at(ext, "tool").unwrap_or("spawnAgent");
@@ -623,6 +728,7 @@ fn codex_subagent(ext: &Value, text: &str) -> ItemDetail {
         None => description.to_owned(),
     };
     ItemDetail::Subagent {
+        tool: tool.to_owned(),
         agent: owned(ext, "agent"),
         description,
         prompt: owned(ext, "prompt"),
@@ -637,6 +743,7 @@ fn codex_subagent(ext: &Value, text: &str) -> ItemDetail {
             .or_else(|| owned(ext, "report"))
             .or_else(|| (!text.is_empty()).then(|| text.to_owned())),
         model: owned(ext, "model"),
+        background: false,
     }
 }
 
@@ -657,6 +764,7 @@ fn codex(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
                 None => String::new(),
             };
             ItemDetail::Command {
+                tool: "commandExecution".to_owned(),
                 command,
                 cwd: owned(ext, "cwd"),
                 output: owned(ext, "aggregatedOutput").unwrap_or_else(|| text.to_owned()),
@@ -669,7 +777,10 @@ fn codex(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
                 .and_then(Value::as_array)
                 .map(|changes| changes.iter().flat_map(codex_change).collect())
                 .unwrap_or_default();
-            ItemDetail::FileChange { files }
+            ItemDetail::FileChange {
+                tool: "fileChange".to_owned(),
+                files,
+            }
         }
         Some("mcpToolCall") => {
             let name = format!(
@@ -683,23 +794,36 @@ fn codex(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-            tool(&name, &input, output)
+            tool_of(&name, ToolKind::Mcp, &input, output)
         }
         Some("dynamicToolCall") => {
             let input = ext.get("arguments").cloned().unwrap_or(Value::Null);
             let output = ext.get("contentItems").and_then(content_text);
             tool(str_at(ext, "tool").unwrap_or("tool"), &input, output)
         }
-        Some("webSearch") => tool("web_search", ext, None),
-        Some(other) => tool(other, ext, (!text.is_empty()).then(|| text.to_owned())),
+        Some("webSearch") => {
+            let input = match ext.get("action") {
+                Some(action) if !action.is_null() => {
+                    serde_json::json!({"query": ext.get("query"), "action": action})
+                }
+                _ => serde_json::json!({"query": ext.get("query")}),
+            };
+            tool_of("web_search", ToolKind::Fetch, &input, None)
+        }
+        Some(other) => tool(
+            other,
+            &without_bookkeeping(ext),
+            (!text.is_empty()).then(|| text.to_owned()),
+        ),
         None => match kind {
             ItemKind::CommandExecution => ItemDetail::Command {
+                tool: "commandExecution".to_owned(),
                 command: String::new(),
                 cwd: None,
                 output: text.to_owned(),
                 exit_code: None,
             },
-            _ => tool("tool", ext, None),
+            _ => tool("tool", &without_bookkeeping(ext), None),
         },
     }
 }
@@ -744,6 +868,7 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
         // An async launch's result only acknowledges it; `notify` is its report.
         let running = ext.pointer("/result/details/asyncId").is_some() && ext.get("notify").is_none();
         return ItemDetail::Subagent {
+            tool: name.to_owned(),
             agent: owned(&args, "agent").or_else(|| first.and_then(|t| owned(t, "agent"))),
             description: owned(&args, "description")
                 .or_else(|| task.as_deref().map(|t| crate::wire::one_line(t, 160)))
@@ -759,10 +884,13 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
             },
             output: output.or_else(|| (!text.is_empty()).then(|| text.to_owned())),
             model: None,
+            background: ext.pointer("/result/details/asyncId").is_some(),
         };
     }
     match (kind, name) {
+        // A command the user ran (`!cmd`) names no tool.
         (ItemKind::CommandExecution, _) => ItemDetail::Command {
+            tool: str_at(ext, "tool").unwrap_or("bash").to_owned(),
             command: owned(&args, "command")
                 .or_else(|| owned(ext, "command"))
                 .unwrap_or_default(),
@@ -776,6 +904,7 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
             let path = owned(&args, "path").unwrap_or_default();
             let body = str_at(&args, "content").unwrap_or_default();
             ItemDetail::FileChange {
+                tool: name.to_owned(),
                 files: vec![FileDiff::new(
                     path,
                     FileChangeKind::Add,
@@ -805,6 +934,7 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
                 .flat_map(|(old, new)| text_hunks(old, new, false))
                 .collect();
             ItemDetail::FileChange {
+                tool: name.to_owned(),
                 files: vec![FileDiff::new(path, FileChangeKind::Update, hunks)],
             }
         }
@@ -855,7 +985,7 @@ fn acp_task_output(text: &str) -> (Option<String>, Option<String>) {
     (child, (!report.is_empty()).then(|| report.to_owned()))
 }
 
-fn acp_subagent(ext: &Value, output: Option<String>, text: &str) -> ItemDetail {
+fn acp_subagent(name: &str, ext: &Value, output: Option<String>, text: &str) -> ItemDetail {
     let null = Value::Null;
     let input = ext.get("rawInput").unwrap_or(&null);
     let raw_out = ext.get("rawOutput").unwrap_or(&null);
@@ -869,6 +999,7 @@ fn acp_subagent(ext: &Value, output: Option<String>, text: &str) -> ItemDetail {
         .or(child_in_text);
     let title = owned(ext, "title").filter(|t| !t.is_empty());
     ItemDetail::Subagent {
+        tool: name.to_owned(),
         agent: owned(input, "subagent_type").or_else(|| owned(input, "agent")),
         description: owned(input, "description").or(title).unwrap_or_default(),
         prompt: owned(input, "prompt").or_else(|| owned(input, "task")),
@@ -883,6 +1014,7 @@ fn acp_subagent(ext: &Value, output: Option<String>, text: &str) -> ItemDetail {
             .pointer("/metadata/model/modelID")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        background: false,
     }
 }
 
@@ -903,8 +1035,14 @@ fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
             }
         })
         .collect();
+    // ACP's tool kind (`read`, `edit`, `execute`, ...) is the closest it has
+    // to a tool name.
+    let name = str_at(ext, "kind").unwrap_or("other");
     if !diffs.is_empty() {
-        return ItemDetail::FileChange { files: diffs };
+        return ItemDetail::FileChange {
+            tool: name.to_owned(),
+            files: diffs,
+        };
     }
     let output = content
         .iter()
@@ -915,12 +1053,13 @@ fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     let raw_out = ext.get("rawOutput").and_then(content_text);
     let output = if output.is_empty() { raw_out } else { Some(output) };
     if kind == ItemKind::Subagent {
-        return acp_subagent(ext, output, text);
+        return acp_subagent(name, ext, output, text);
     }
     let input = ext.get("rawInput").cloned().unwrap_or(Value::Null);
     let title = owned(ext, "title").unwrap_or_default();
     if kind == ItemKind::CommandExecution || str_at(ext, "kind") == Some("execute") {
         return ItemDetail::Command {
+            tool: name.to_owned(),
             command: owned(&input, "command").unwrap_or(title),
             cwd: owned(&input, "cwd"),
             output: output.unwrap_or_else(|| text.to_owned()),
@@ -931,13 +1070,209 @@ fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
                 .and_then(|n| i32::try_from(n).ok()),
         };
     }
-    let name = str_at(ext, "kind").unwrap_or("tool");
+    let mut paths = input_paths(&input);
+    for loc in ext
+        .get("locations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(p) = str_at(loc, "path") {
+            push_path(&mut paths, p);
+        }
+    }
     ItemDetail::Tool {
-        name: name.to_owned(),
+        tool: name.to_owned(),
+        kind: ToolKind::of(name),
         title: if title.is_empty() { subject(&input) } else { title },
         input,
         output,
+        paths,
     }
+}
+
+/// Turns a harness's native item frames into typed item events.
+///
+/// Every driver sends its items through one, and so can anything else that
+/// reads a harness's items (a transcript file, say). It keeps each item's
+/// native JSON merged across frames and the text streamed into it, so every
+/// [`Event::ItemStarted`], [`Event::ItemUpdated`] and [`Event::ItemCompleted`]
+/// carries the item's whole [`ItemDetail`] so far. It also resolves what the
+/// harness reports in its own words: the parent of a subagent's items,
+/// whether an item failed, and message text sent only on completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemFeed {
+    harness: Harness,
+    items: HashMap<ItemId, Tracked>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Tracked {
+    kind: ItemKind,
+    /// Native JSON merged over every frame. Messages keep none: their
+    /// detail is their text.
+    ext: Value,
+    /// Streamed text, for items whose detail reads it (command output, a
+    /// subagent's report). Messages keep none.
+    text: String,
+    /// Whether any text was streamed in.
+    streamed: bool,
+}
+
+impl ItemFeed {
+    pub fn new(harness: Harness) -> Self {
+        Self {
+            harness,
+            items: HashMap::new(),
+        }
+    }
+
+    /// An item began, or started again with more to say (the same id).
+    /// Without `parent`, the parent keys of the harness's JSON are read.
+    pub fn start(
+        &mut self,
+        id: impl Into<ItemId>,
+        kind: ItemKind,
+        parent: Option<ItemId>,
+        native: Value,
+        out: &mut Vec<Event>,
+    ) {
+        let id = id.into();
+        let parent = parent.or_else(|| parent_of(&native));
+        let tracked = self.items.entry(id.clone()).or_insert_with(|| Tracked {
+            kind,
+            ext: Value::Null,
+            text: String::new(),
+            streamed: false,
+        });
+        tracked.kind = kind;
+        if !is_message(kind) {
+            merge(&mut tracked.ext, &native);
+        }
+        let detail = self.view(&id);
+        out.push(Event::ItemStarted {
+            id,
+            kind,
+            parent,
+            detail,
+            native,
+        });
+    }
+
+    /// Text streamed into an item.
+    pub fn delta(&mut self, id: impl Into<ItemId>, text: impl Into<String>, out: &mut Vec<Event>) {
+        let (id, text) = (id.into(), text.into());
+        if let Some(t) = self.items.get_mut(&id) {
+            t.streamed |= !text.is_empty();
+            if !is_message(t.kind) {
+                t.text.push_str(&text);
+            }
+        }
+        out.push(Event::ItemDelta { id, text });
+    }
+
+    /// The item changed without finishing.
+    pub fn update(&mut self, id: impl Into<ItemId>, native: Value, out: &mut Vec<Event>) {
+        let id = id.into();
+        self.absorb(&id, &native);
+        let detail = self.view(&id);
+        out.push(Event::ItemUpdated { id, detail, native });
+    }
+
+    /// The item finished. Failed when the harness's JSON says so (an error
+    /// flag, or a failed, declined or rejected status).
+    pub fn complete(&mut self, id: impl Into<ItemId>, native: Value, out: &mut Vec<Event>) {
+        let id = id.into();
+        self.absorb(&id, &native);
+        // Some harnesses only put a message's text in its completion.
+        if let Some(t) = self.items.get_mut(&id)
+            && is_message(t.kind)
+            && !t.streamed
+            && let Some(text) = owned(&native, "text").filter(|t| !t.is_empty())
+        {
+            t.streamed = true;
+            out.push(Event::ItemDelta { id: id.clone(), text });
+        }
+        let status = if failed(&native) {
+            ItemStatus::Failed
+        } else {
+            ItemStatus::Completed
+        };
+        let detail = self.view(&id);
+        // A message is done once complete; tools keep their JSON, since a
+        // background subagent reports after its call completed.
+        if self.items.get(&id).is_some_and(|t| is_message(t.kind)) {
+            self.items.remove(&id);
+        }
+        out.push(Event::ItemCompleted {
+            id,
+            status,
+            detail,
+            native,
+        });
+    }
+
+    fn absorb(&mut self, id: &str, native: &Value) {
+        if let Some(t) = self.items.get_mut(id) {
+            if !is_message(t.kind) {
+                merge(&mut t.ext, native);
+            }
+        } else {
+            // Never started (joined late): what this frame says is all there is.
+            self.items.insert(
+                id.to_owned(),
+                Tracked {
+                    kind: ItemKind::ToolCall,
+                    ext: native.clone(),
+                    text: String::new(),
+                    streamed: false,
+                },
+            );
+        }
+    }
+
+    fn view(&self, id: &str) -> ItemDetail {
+        match self.items.get(id) {
+            Some(t) => detail(self.harness, t.kind, &t.ext, &t.text),
+            None => ItemDetail::Text,
+        }
+    }
+}
+
+fn is_message(kind: ItemKind) -> bool {
+    matches!(
+        kind,
+        ItemKind::UserMessage | ItemKind::AgentMessage | ItemKind::Reasoning
+    )
+}
+
+/// Shallow merge: object keys from `from` overwrite `into`; a non-object
+/// replaces it; null leaves it alone.
+pub(crate) fn merge(into: &mut Value, from: &Value) {
+    match (into, from) {
+        (_, Value::Null) => {}
+        (Value::Object(a), Value::Object(b)) => {
+            for (k, v) in b {
+                if !v.is_null() {
+                    a.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        (slot, v) => *slot = v.clone(),
+    }
+}
+
+/// The subagent run an item belongs to, in the harness's own keys.
+fn parent_of(native: &Value) -> Option<ItemId> {
+    owned(native, "parent_tool_use_id").or_else(|| owned(native, "parentToolCallId"))
+}
+
+fn failed(native: &Value) -> bool {
+    native.get("is_error").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            str_at(native, "status"),
+            Some("failed" | "declined" | "error" | "rejected")
+        )
 }
 
 #[cfg(test)]
@@ -949,7 +1284,8 @@ mod tests {
     #[test]
     fn claude_edit_becomes_unpositioned_hunk() {
         let ext = json!({"name": "Edit", "input": {"file_path": "/p/a.rs", "old_string": "a\nb\n", "new_string": "a\nc\n"}});
-        let ItemDetail::FileChange { files } = detail(Harness::Claude, ItemKind::FileChange, &ext, "") else {
+        let ItemDetail::FileChange { files, .. } = detail(Harness::Claude, ItemKind::FileChange, &ext, "")
+        else {
             panic!("file change")
         };
         assert_eq!(files[0].path, "/p/a.rs");
@@ -966,6 +1302,7 @@ mod tests {
         assert_eq!(
             detail(Harness::Claude, ItemKind::CommandExecution, &ext, ""),
             ItemDetail::Command {
+                tool: "Bash".into(),
                 command: "ls".into(),
                 cwd: None,
                 output: "a\nb".into(),
@@ -980,7 +1317,8 @@ mod tests {
             {"path": "src/x.rs", "kind": {"type": "update", "move_path": "src/y.rs"},
              "diff": "@@ -1,2 +1,2 @@\n a\n-b\n+c\n"},
             {"path": "new.txt", "kind": {"type": "add"}, "diff": "hello\nworld\n"}]});
-        let ItemDetail::FileChange { files } = detail(Harness::Codex, ItemKind::FileChange, &ext, "") else {
+        let ItemDetail::FileChange { files, .. } = detail(Harness::Codex, ItemKind::FileChange, &ext, "")
+        else {
             panic!("file change")
         };
         assert_eq!(files[0].kind, FileChangeKind::Rename);
@@ -998,6 +1336,7 @@ mod tests {
         assert_eq!(
             detail(Harness::Codex, ItemKind::CommandExecution, &ext, "streamed"),
             ItemDetail::Command {
+                tool: "commandExecution".into(),
                 command: "cargo test".into(),
                 cwd: Some("/w".into()),
                 output: "ok".into(),
@@ -1010,7 +1349,7 @@ mod tests {
     fn acp_diff_content_is_a_positioned_file_change() {
         let ext = json!({"toolCallId": "t", "kind": "edit", "title": "Edit a.txt",
             "content": [{"type": "diff", "path": "/w/a.txt", "oldText": "1\n2\n3\n", "newText": "1\n2\n4\n"}]});
-        let ItemDetail::FileChange { files } = detail(Harness::Opencode, ItemKind::FileChange, &ext, "")
+        let ItemDetail::FileChange { files, .. } = detail(Harness::Opencode, ItemKind::FileChange, &ext, "")
         else {
             panic!("file change")
         };
@@ -1029,11 +1368,75 @@ mod tests {
         assert_eq!(
             detail(Harness::Pi, ItemKind::ToolCall, &ext, ""),
             ItemDetail::Tool {
-                name: "read".into(),
+                tool: "read".into(),
+                kind: ToolKind::Read,
                 title: "a".into(),
                 input: json!({"path": "a"}),
-                output: Some("body".into())
+                output: Some("body".into()),
+                paths: vec!["a".into()],
             }
+        );
+    }
+
+    #[test]
+    fn codex_web_search_and_unknown_items_have_their_arguments_as_input() {
+        let ext = json!({"type": "webSearch", "id": "ws1", "query": "rust 2024", "status": "completed"});
+        assert_eq!(
+            detail(Harness::Codex, ItemKind::ToolCall, &ext, ""),
+            ItemDetail::Tool {
+                tool: "web_search".into(),
+                kind: ToolKind::Fetch,
+                title: "rust 2024".into(),
+                input: json!({"query": "rust 2024"}),
+                output: None,
+                paths: vec![],
+            }
+        );
+        let ext = json!({"type": "imageView", "id": "iv1", "path": "/w/a.png"});
+        let ItemDetail::Tool {
+            tool, input, paths, ..
+        } = detail(Harness::Codex, ItemKind::ToolCall, &ext, "")
+        else {
+            panic!("tool")
+        };
+        assert_eq!(tool, "imageView");
+        assert_eq!(input, json!({"path": "/w/a.png"}));
+        assert_eq!(paths, ["/w/a.png"]);
+    }
+
+    #[test]
+    fn feed_sends_the_whole_detail_with_every_frame() {
+        let mut feed = ItemFeed::new(Harness::Codex);
+        let mut out = Vec::new();
+        feed.start(
+            "c1",
+            ItemKind::CommandExecution,
+            None,
+            json!({"type": "commandExecution", "id": "c1", "command": "ls", "cwd": "/w"}),
+            &mut out,
+        );
+        feed.delta("c1", "a\n", &mut out);
+        feed.delta("c1", "b\n", &mut out);
+        feed.update("c1", json!({"status": "inProgress"}), &mut out);
+        feed.complete("c1", json!({"status": "failed", "exitCode": 2}), &mut out);
+        let command = |output: &str, exit_code| ItemDetail::Command {
+            tool: "commandExecution".into(),
+            command: "ls".into(),
+            cwd: Some("/w".into()),
+            output: output.into(),
+            exit_code,
+        };
+        assert!(matches!(&out[0], Event::ItemStarted { detail, .. } if *detail == command("", None)));
+        assert!(matches!(&out[3], Event::ItemUpdated { detail, .. } if *detail == command("a\nb\n", None)));
+        assert!(
+            matches!(&out[4], Event::ItemCompleted { status: ItemStatus::Failed, detail, .. }
+            if *detail == command("a\nb\n", Some(2)))
+        );
+        // A frame for an item that never started stands on its own.
+        let mut out = Vec::new();
+        feed.complete("late", json!({"type": "webSearch", "query": "q"}), &mut out);
+        assert!(
+            matches!(&out[0], Event::ItemCompleted { detail: ItemDetail::Tool { tool, .. }, .. } if tool == "web_search")
         );
     }
 
@@ -1041,7 +1444,8 @@ mod tests {
     fn codex_apply_patch_becomes_file_changes() {
         let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@ fn main\n-old\n+new\n ctx\n*** Add File: b.txt\n+one\n+two\n*** Delete File: c.txt\n*** End Patch";
         let ext = json!({"type": "fileChange", "changes": apply_patch_changes(patch)});
-        let ItemDetail::FileChange { files } = detail(Harness::Codex, ItemKind::FileChange, &ext, "") else {
+        let ItemDetail::FileChange { files, .. } = detail(Harness::Codex, ItemKind::FileChange, &ext, "")
+        else {
             panic!("file change")
         };
         let summary: Vec<_> = files
@@ -1067,6 +1471,7 @@ mod tests {
         assert_eq!(
             detail(Harness::Claude, ItemKind::Subagent, &ext, ""),
             ItemDetail::Subagent {
+                tool: "Agent".into(),
                 agent: Some("Explore".into()),
                 description: "Find it".into(),
                 prompt: Some("Look for x".into()),
@@ -1074,6 +1479,7 @@ mod tests {
                 status: Some("completed".into()),
                 output: Some("Found x\nin a.rs".into()),
                 model: Some("claude-haiku-4-5".into()),
+                background: false,
             }
         );
         // A background launch: no report yet, the task frames' summary instead.

@@ -39,6 +39,7 @@ use crate::event::{
     Quota, QuotaWindow, Usage,
 };
 use crate::harness::{Harness, LaunchSpec};
+use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
 use crate::wire::{self, f64_at, owned, str_at, u64_at};
@@ -142,6 +143,8 @@ struct OpenMessage {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeDriver {
     config: ClaudeConfig,
+    /// Every item the harness reported, for their typed detail.
+    items: ItemFeed,
     framer: LineFramer,
     session_id: Option<String>,
     model: Option<String>,
@@ -188,6 +191,7 @@ impl ClaudeDriver {
     pub fn new(config: ClaudeConfig) -> Self {
         let mut d = Self {
             config,
+            items: ItemFeed::new(Harness::Claude),
             framer: LineFramer::new(wire::MAX_FRAME),
             session_id: None,
             model: None,
@@ -498,15 +502,10 @@ impl ClaudeDriver {
         match owned(&task, "tool_use_id") {
             Some(tool) if done && self.open_tools.remove(&tool).is_some() => {
                 let failed = matches!(str_at(&task, "status"), Some("failed" | "stopped"));
-                out.push(Event::ItemCompleted {
-                    id: tool,
-                    extensions: json!({"task": task, "is_error": failed}),
-                });
+                self.items
+                    .complete(tool, json!({"task": task, "is_error": failed}), out);
             }
-            Some(tool) => out.push(Event::ItemUpdated {
-                id: tool,
-                extensions: json!({"task": task}),
-            }),
+            Some(tool) => self.items.update(tool, json!({"task": task}), out),
             None => out.push(Event::Native {
                 kind: subtype.clone(),
                 payload: task,
@@ -553,12 +552,7 @@ impl ClaudeDriver {
                         } else {
                             ItemKind::Reasoning
                         };
-                        out.push(Event::ItemStarted {
-                            id: item_id,
-                            kind,
-                            parent: parent_of(v),
-                            extensions: Value::Null,
-                        });
+                        self.items.start(item_id, kind, parent_of(v), Value::Null, out);
                     }
                     _ => open.blocks.push_back(item_id),
                 }
@@ -573,10 +567,7 @@ impl ClaudeDriver {
                 if let Some(text) = text
                     && !text.is_empty()
                 {
-                    out.push(Event::ItemDelta {
-                        id: item_id,
-                        text: text.to_owned(),
-                    });
+                    self.items.delta(item_id, text.to_owned(), out);
                 }
             }
             _ => {}
@@ -620,25 +611,15 @@ impl ClaudeDriver {
                         None => {
                             // Not streamed (no partial messages): announce it whole.
                             let text = str_at(&block, "text").or_else(|| str_at(&block, "thinking"));
-                            out.push(Event::ItemStarted {
-                                id: fallback.clone(),
-                                kind,
-                                parent: parent_of(v),
-                                extensions: Value::Null,
-                            });
+                            self.items
+                                .start(fallback.clone(), kind, parent_of(v), Value::Null, out);
                             if let Some(text) = text {
-                                out.push(Event::ItemDelta {
-                                    id: fallback.clone(),
-                                    text: text.to_owned(),
-                                });
+                                self.items.delta(fallback.clone(), text.to_owned(), out);
                             }
                             fallback
                         }
                     };
-                    out.push(Event::ItemCompleted {
-                        id,
-                        extensions: Value::Null,
-                    });
+                    self.items.complete(id, Value::Null, out);
                 }
                 Some("tool_use" | "server_tool_use") => {
                     let id = owned(&block, "id").or(streamed).unwrap_or(fallback);
@@ -647,22 +628,18 @@ impl ClaudeDriver {
                         json!({"name": name, "input": block.get("input").cloned().unwrap_or(Value::Null)});
                     let kind = tool_kind(name);
                     self.open_tools.insert(id.clone(), kind);
-                    out.push(Event::ItemStarted {
-                        id,
-                        kind,
-                        parent: parent_of(v),
-                        extensions: ext,
-                    });
+                    self.items.start(id, kind, parent_of(v), ext, out);
                 }
                 // A server tool's result (`web_search_tool_result`, ...).
                 Some(kind) if kind.ends_with("_tool_result") => {
                     if let Some(id) = owned(&block, "tool_use_id")
                         && self.open_tools.remove(&id).is_some()
                     {
-                        out.push(Event::ItemCompleted {
+                        self.items.complete(
                             id,
-                            extensions: json!({"content": block.get("content").cloned().unwrap_or(Value::Null)}),
-                        });
+                            json!({"content": block.get("content").cloned().unwrap_or(Value::Null)}),
+                            out,
+                        );
                     }
                 }
                 _ => {}
@@ -703,10 +680,10 @@ impl ClaudeDriver {
                             result.is_some_and(|r| r.get("isAsync").and_then(Value::as_bool) == Some(true));
                         if launched {
                             // Still running: its `task_notification` completes it.
-                            out.push(Event::ItemUpdated { id, extensions: ext });
+                            self.items.update(id, ext, out);
                         } else {
                             self.open_tools.remove(&id);
-                            out.push(Event::ItemCompleted { id, extensions: ext });
+                            self.items.complete(id, ext, out);
                         }
                     }
                     Some("text") => text.push_str(str_at(block, "text").unwrap_or_default()),
@@ -749,20 +726,10 @@ impl ClaudeDriver {
         if !self.native_state_events && parent.is_none() {
             self.set_state(RunState::Working { progress: None }, None, out);
         }
-        out.push(Event::ItemStarted {
-            id: id.clone(),
-            kind: ItemKind::UserMessage,
-            parent,
-            extensions: Value::Null,
-        });
-        out.push(Event::ItemDelta {
-            id: id.clone(),
-            text: text.to_owned(),
-        });
-        out.push(Event::ItemCompleted {
-            id,
-            extensions: Value::Null,
-        });
+        self.items
+            .start(id.clone(), ItemKind::UserMessage, parent, Value::Null, out);
+        self.items.delta(id.clone(), text.to_owned(), out);
+        self.items.complete(id, Value::Null, out);
     }
 
     fn on_result(&mut self, v: &Value, out: &mut Vec<Event>) {

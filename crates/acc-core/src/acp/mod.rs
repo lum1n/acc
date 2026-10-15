@@ -31,6 +31,7 @@ use crate::command::{
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, PermissionOptionKind, Usage};
 use crate::harness::{Harness, LaunchSpec, Protocol};
+use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
 
@@ -126,6 +127,8 @@ struct PermissionWait {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct AcpDriver {
     harness: Harness,
+    /// Every item the harness reported, for their typed detail.
+    items: ItemFeed,
     cfg: AcpConfig,
     framer: LineFramer,
     next_id: u64,
@@ -197,6 +200,7 @@ impl AcpDriver {
         let attach = cfg.start == Start::Attach;
         let mut d = Self {
             harness,
+            items: ItemFeed::new(harness),
             cfg,
             framer: LineFramer::new(MAX_LINE),
             next_id: 0,
@@ -358,7 +362,12 @@ impl AcpDriver {
         self.echoed_turns += 1;
         self.history_next += 1;
         self.turn_open = true;
-        push_prompt(format!("prompt-{}", self.echo_seq), text, &mut self.echoes);
+        push_prompt(
+            &mut self.items,
+            format!("prompt-{}", self.echo_seq),
+            text,
+            &mut self.echoes,
+        );
     }
 
     /// A turn whose prompt nobody showed began: show it from the history.
@@ -370,7 +379,7 @@ impl AcpDriver {
         let n = self.history_next;
         self.history_next += 1;
         if let Some(text) = self.history.get(n).cloned() {
-            push_prompt(format!("history-{n}"), &text, out);
+            push_prompt(&mut self.items, format!("history-{n}"), &text, out);
         }
     }
 
@@ -634,16 +643,10 @@ impl AcpDriver {
     fn close_turn_items(&mut self, out: &mut Vec<Event>) {
         self.close_open_item(out);
         for (_, (id, _)) in std::mem::take(&mut self.child_open) {
-            out.push(Event::ItemCompleted {
-                id,
-                extensions: Value::Null,
-            });
+            self.items.complete(id, Value::Null, out);
         }
         for id in std::mem::take(&mut self.open_tools) {
-            out.push(Event::ItemCompleted {
-                id,
-                extensions: Value::Null,
-            });
+            self.items.complete(id, Value::Null, out);
         }
         for request_id in std::mem::take(&mut self.permissions).into_keys() {
             out.push(Event::PermissionResolved { request_id });
@@ -904,36 +907,22 @@ impl AcpDriver {
                 },
                 str::to_owned,
             );
-            out.push(Event::ItemStarted {
-                id: id.clone(),
-                kind,
-                parent: None,
-                extensions: Value::Null,
-            });
+            self.items.start(id.clone(), kind, None, Value::Null, out);
             self.open_item = Some((id, kind));
         }
         let Some((id, _)) = &self.open_item else { return };
         match content.get("text").and_then(Value::as_str) {
             Some(text) if content.get("type").and_then(Value::as_str) == Some("text") => {
-                out.push(Event::ItemDelta {
-                    id: id.clone(),
-                    text: text.to_owned(),
-                });
+                self.items.delta(id.clone(), text.to_owned(), out);
             }
             // Images, audio and resources ride along as updates to the item.
-            _ => out.push(Event::ItemUpdated {
-                id: id.clone(),
-                extensions: content.clone(),
-            }),
+            _ => self.items.update(id.clone(), content.clone(), out),
         }
     }
 
     fn close_open_item(&mut self, out: &mut Vec<Event>) {
         if let Some((id, _)) = self.open_item.take() {
-            out.push(Event::ItemCompleted {
-                id,
-                extensions: Value::Null,
-            });
+            self.items.complete(id, Value::Null, out);
         }
     }
 
@@ -959,12 +948,8 @@ impl AcpDriver {
             }
         };
         self.open_tools.insert(id.clone());
-        out.push(Event::ItemStarted {
-            id,
-            kind,
-            parent: parent.map(|(_, item)| item),
-            extensions: strip_tag(update),
-        });
+        self.items
+            .start(id, kind, parent.map(|(_, item)| item), strip_tag(update), out);
     }
 
     /// Records a subagent tool call, so the child session that shows up
@@ -988,12 +973,8 @@ impl AcpDriver {
             return;
         }
         self.note_subagent(id, session);
-        out.push(Event::ItemStarted {
-            id: id.to_owned(),
-            kind: ItemKind::Subagent,
-            parent: None,
-            extensions: strip_tag(update),
-        });
+        self.items
+            .start(id.to_owned(), ItemKind::Subagent, None, strip_tag(update), out);
     }
 
     /// The subagent tool call a child session runs for. opencode streams a
@@ -1051,12 +1032,8 @@ impl AcpDriver {
                         },
                         str::to_owned,
                     );
-                    out.push(Event::ItemStarted {
-                        id: id.clone(),
-                        kind: item_kind,
-                        parent: Some(parent.clone()),
-                        extensions: Value::Null,
-                    });
+                    self.items
+                        .start(id.clone(), item_kind, Some(parent.clone()), Value::Null, out);
                     self.child_open.insert(child.clone(), (id, item_kind));
                 }
                 let Some((id, _)) = self.child_open.get(&child) else {
@@ -1065,15 +1042,9 @@ impl AcpDriver {
                 let content = update.get("content").unwrap_or(&Value::Null);
                 match content.get("text").and_then(Value::as_str) {
                     Some(text) if content.get("type").and_then(Value::as_str) == Some("text") => {
-                        out.push(Event::ItemDelta {
-                            id: id.clone(),
-                            text: text.to_owned(),
-                        });
+                        self.items.delta(id.clone(), text.to_owned(), out);
                     }
-                    _ => out.push(Event::ItemUpdated {
-                        id: id.clone(),
-                        extensions: content.clone(),
-                    }),
+                    _ => self.items.update(id.clone(), content.clone(), out),
                 }
             }
             "tool_call" | "tool_call_update" => {
@@ -1084,10 +1055,7 @@ impl AcpDriver {
                 if self.open_tools.contains(id) {
                     self.upgrade_to_subagent(id, update, Some(child.clone()), out);
                     if !is_final(update) {
-                        out.push(Event::ItemUpdated {
-                            id: id.to_owned(),
-                            extensions: strip_tag(update),
-                        });
+                        self.items.update(id.to_owned(), strip_tag(update), out);
                     }
                 } else {
                     self.start_tool(id.to_owned(), update, Some((child, parent)), out);
@@ -1101,10 +1069,7 @@ impl AcpDriver {
 
     fn close_child_item(&mut self, child: &str, out: &mut Vec<Event>) {
         if let Some((id, _)) = self.child_open.remove(child) {
-            out.push(Event::ItemCompleted {
-                id,
-                extensions: Value::Null,
-            });
+            self.items.complete(id, Value::Null, out);
         }
     }
 
@@ -1116,10 +1081,7 @@ impl AcpDriver {
         self.working(out);
         if self.open_tools.contains(id) {
             self.upgrade_to_subagent(id, update, None, out);
-            out.push(Event::ItemUpdated {
-                id: id.to_owned(),
-                extensions: strip_tag(update),
-            });
+            self.items.update(id.to_owned(), strip_tag(update), out);
         } else {
             self.start_tool(id.to_owned(), update, None, out);
         }
@@ -1148,10 +1110,7 @@ impl AcpDriver {
             self.start_tool(id.to_owned(), update, None, out);
         } else if !is_final(update) {
             self.upgrade_to_subagent(id, update, None, out);
-            out.push(Event::ItemUpdated {
-                id: id.to_owned(),
-                extensions: strip_tag(update),
-            });
+            self.items.update(id.to_owned(), strip_tag(update), out);
         }
         self.finish_tool_if_done(id, update, out);
     }
@@ -1169,10 +1128,7 @@ impl AcpDriver {
                 self.close_child_item(&child, out);
             }
             self.unclaimed_subagents.retain(|(t, _)| t != id);
-            out.push(Event::ItemCompleted {
-                id: id.to_owned(),
-                extensions: strip_tag(update),
-            });
+            self.items.complete(id.to_owned(), strip_tag(update), out);
         }
     }
 
@@ -1560,21 +1516,10 @@ pub fn launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
     }
 }
 
-fn push_prompt(id: ItemId, text: &str, out: &mut Vec<Event>) {
-    out.push(Event::ItemStarted {
-        id: id.clone(),
-        kind: ItemKind::UserMessage,
-        parent: None,
-        extensions: Value::Null,
-    });
-    out.push(Event::ItemDelta {
-        id: id.clone(),
-        text: text.to_owned(),
-    });
-    out.push(Event::ItemCompleted {
-        id,
-        extensions: Value::Null,
-    });
+fn push_prompt(items: &mut ItemFeed, id: ItemId, text: &str, out: &mut Vec<Event>) {
+    items.start(id.clone(), ItemKind::UserMessage, None, Value::Null, out);
+    items.delta(id.clone(), text.to_owned(), out);
+    items.complete(id, Value::Null, out);
 }
 
 fn line(v: &Value) -> Vec<u8> {

@@ -29,6 +29,7 @@ var now: UInt64 = 1_000
 var answered = false
 var sawDelta = false
 var sawTurnEnd = false
+var sawCommand = false
 var offset = 0
 while offset < fixture.count {
     let end = min(fixture.count, offset + 997)
@@ -42,6 +43,9 @@ while offset < fixture.count {
             let bytes = try! session.send(command: .answerPermission(requestId: requestId, optionId: deny.id))
             check(String(decoding: bytes, as: UTF8.self).contains(requestId), "answer carries request id")
             answered = true
+        case let .itemStarted(_, _, _, .command(tool, command, _, _, _), _)
+            where tool == "Bash" && command == "touch acc-probe.txt":
+            sawCommand = true
         case .itemDelta:
             sawDelta = true
         case .turnCompleted:
@@ -53,6 +57,7 @@ while offset < fixture.count {
 }
 
 check(answered && sawDelta && sawTurnEnd, "permission, text and turn end")
+check(sawCommand, "the Bash call as a typed command")
 check(session.nativeId() == "5f3c1a52-8a3e-4c1e-9d47-2b6f0e9a7c11", "native id")
 check(!session.commands().isEmpty, "command palette")
 check(session.state()?.source == .native, "native state")
