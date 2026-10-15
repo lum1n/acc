@@ -460,6 +460,76 @@ fn unstreamed_assistant_text_is_announced_whole() {
     );
 }
 
+/// Claude Code names the message only in `message_start`; its other stream
+/// events carry no `api_message_id`.
+#[test]
+fn stream_events_without_a_message_id_stream_into_their_own_blocks() {
+    let mut d = ClaudeDriver::default();
+    let stream = |event: Value| json!({"type": "stream_event", "event": event, "parent_tool_use_id": null});
+    let lines = [
+        stream(json!({"type": "message_start", "message": {"id": "m1", "content": []}})),
+        stream(
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        ),
+        stream(
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+        ),
+        json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "thinking", "thinking": "hmm"}]}, "parent_tool_use_id": null}),
+        stream(json!({"type": "content_block_stop", "index": 0})),
+        stream(
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+        ),
+        stream(
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "he"}}),
+        ),
+        stream(
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "llo"}}),
+        ),
+        json!({"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "hello"}]}, "parent_tool_use_id": null}),
+        stream(json!({"type": "content_block_stop", "index": 1})),
+        stream(json!({"type": "message_stop"})),
+    ];
+    let mut t = crate::transcript::Transcript::default();
+    for l in &lines {
+        for e in d.on_output(&wire::line(l)) {
+            t.apply(&e);
+        }
+    }
+    let items: Vec<_> = t
+        .items()
+        .iter()
+        .map(|i| (i.id.as_str(), i.kind, i.text.as_str()))
+        .collect();
+    assert_eq!(
+        items,
+        [
+            ("m1:0", ItemKind::Reasoning, "hmm"),
+            ("m1:1", ItemKind::AgentMessage, "hello"),
+        ]
+    );
+}
+
+#[test]
+fn unstreamed_blocks_of_one_message_stay_apart() {
+    let mut d = ClaudeDriver::default();
+    let mut t = crate::transcript::Transcript::default();
+    for block in [
+        json!({"type": "thinking", "thinking": "hmm"}),
+        json!({"type": "text", "text": "hello"}),
+    ] {
+        let frame = json!({"type": "assistant", "message": {"id": "m1", "content": [block]}, "parent_tool_use_id": null});
+        for e in d.on_output(&wire::line(&frame)) {
+            t.apply(&e);
+        }
+    }
+    let items: Vec<_> = t
+        .items()
+        .iter()
+        .map(|i| (i.id.as_str(), i.text.as_str()))
+        .collect();
+    assert_eq!(items, [("m1:0", "hmm"), ("m1:1", "hello")]);
+}
+
 #[test]
 fn failed_turn_reports_error_before_turn_completed() {
     let mut d = ClaudeDriver::default();

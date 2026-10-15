@@ -157,6 +157,10 @@ pub struct ClaudeDriver {
     pending: HashMap<String, Pending>,
     permissions: HashMap<String, PendingPermission>,
     open: HashMap<String, OpenMessage>,
+    /// The message streaming under each parent tool call (`""` for the top
+    /// level): newer CLIs name it only in `message_start`.
+    #[serde(default)]
+    streaming: HashMap<String, String>,
     /// Tool-use items waiting for their result, with their kind.
     open_tools: HashMap<String, ItemKind>,
     /// Background tasks (subagents, shells, monitors) by task id: the
@@ -199,6 +203,7 @@ impl ClaudeDriver {
             pending: HashMap::new(),
             permissions: HashMap::new(),
             open: HashMap::new(),
+            streaming: HashMap::new(),
             open_tools: HashMap::new(),
             tasks: HashMap::new(),
             background_agents: 0,
@@ -520,12 +525,20 @@ impl ClaudeDriver {
 
     fn on_stream_event(&mut self, v: &Value, out: &mut Vec<Event>) {
         let Some(event) = v.get("event") else { return };
-        let msg_id = owned(v, "api_message_id").or_else(|| {
-            event
-                .pointer("/message/id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
+        let parent = parent_of(v).unwrap_or_default();
+        let started = event
+            .pointer("/message/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(id) = &started {
+            self.streaming.insert(parent.clone(), id.clone());
+        }
+        let msg_id = owned(v, "api_message_id")
+            .or(started)
+            .or_else(|| self.streaming.get(&parent).cloned());
+        if str_at(event, "type") == Some("message_stop") {
+            self.streaming.remove(&parent);
+        }
         let Some(msg_id) = msg_id else { return };
         let index = u64_at(event, "index").unwrap_or(0);
         let item_id = format!("{msg_id}:{index}");
@@ -661,9 +674,8 @@ impl ClaudeDriver {
                 _ => {}
             }
         }
-        if self.open.get(&msg_id).is_some_and(|o| o.blocks.is_empty()) {
-            self.open.remove(&msg_id);
-        }
+        // Kept until the turn ends: the message's next block may come in its
+        // own frame and must not reuse this one's id.
     }
 
     fn on_user(&mut self, v: &Value, out: &mut Vec<Event>) {
@@ -760,6 +772,8 @@ impl ClaudeDriver {
     }
 
     fn on_result(&mut self, v: &Value, out: &mut Vec<Event>) {
+        // Messages of the finished turn; a background subagent's may still stream.
+        self.open.retain(|_, o| !o.blocks.is_empty());
         let usage = v.get("usage").cloned().unwrap_or(Value::Null);
         if let Some(window) = self
             .model
