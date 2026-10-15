@@ -114,6 +114,21 @@ export interface Quota {
   windows: QuotaWindow[];
 }
 
+export type Hook = { type: "command"; command: string } | { type: "webhook"; url: string };
+
+/** One event a session follower recorded while no client was connected. */
+export interface HostEvent {
+  /** Seconds since the Unix epoch, by the host's clock. */
+  at: number;
+  session: string;
+  state: "blocked" | "done" | "error" | "exited";
+  kind?: "permission" | "question" | "auth";
+  detail?: string;
+  code?: number | null;
+  /** The session log's length at the time. */
+  offset: number;
+}
+
 export interface PermissionOption {
   id: string;
   label: string;

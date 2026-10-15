@@ -577,6 +577,20 @@ impl Session {
         Exec::with_stdin(self.dir.input_script(), bytes)
     }
 
+    /// Starts a follower on the host that records approvals, finished turns,
+    /// errors and the exit in `events.ndjson` while no client is connected,
+    /// and runs `hook` for each (see [`crate::watch`]). Run it again after a
+    /// relaunch; running it again replaces the hook.
+    pub fn watch_exec(&self, hook: Option<&crate::watch::Hook>) -> Exec {
+        Exec::new(crate::watch::watch_script(&self.dir, self.spec.harness, hook))
+    }
+
+    /// Prints the follower's events from byte `offset`; parse them with
+    /// [`crate::watch::parse_events`].
+    pub fn events_exec(&self, offset: u64) -> Exec {
+        Exec::new(crate::watch::events_script(&self.dir, offset))
+    }
+
     pub fn kill_exec(&self) -> Exec {
         Exec::new(self.dir.kill_script(3_000))
     }

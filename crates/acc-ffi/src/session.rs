@@ -117,6 +117,21 @@ impl AccSession {
         lock(&self.inner).kill_exec().into()
     }
 
+    /// Starts a follower on the host that records approvals, finished
+    /// turns, errors and the exit in the session's events while no client is
+    /// connected, running `hook` for each. Run again after a relaunch, or to
+    /// change the hook.
+    pub fn watch_exec(&self, hook: Option<AccHook>) -> AccExec {
+        let hook = hook.map(Into::into);
+        lock(&self.inner).watch_exec(hook.as_ref()).into()
+    }
+
+    /// Prints the follower's events from byte `offset` (see
+    /// `parse_session_events`).
+    pub fn events_exec(&self, offset: u64) -> AccExec {
+        lock(&self.inner).events_exec(offset).into()
+    }
+
     pub fn remove_exec(&self) -> AccExec {
         lock(&self.inner).remove_exec().into()
     }
@@ -328,6 +343,15 @@ pub fn parse_session_list(stdout: String) -> Vec<AccListing> {
 #[uniffi::export]
 pub fn parse_session_status(stdout: String) -> Option<AccStatus> {
     detached::parse_status(&stdout).map(Into::into)
+}
+
+/// Parses a follower's events (from `events_exec` or a `SessionEvents` feed).
+#[uniffi::export]
+pub fn parse_session_events(stdout: String) -> Vec<AccHostEvent> {
+    acc_core::watch::parse_events(&stdout)
+        .into_iter()
+        .map(Into::into)
+        .collect()
 }
 
 /// Finds the installed harnesses (login `PATH`, with versions).
@@ -713,6 +737,32 @@ mod tests {
                 .contains("Bash(npm test:*)")
         );
         assert!(w.skipped.is_empty());
+    }
+
+    #[test]
+    fn watch_and_events_through_ffi() {
+        let a = AccSession::attach(
+            acc_core::session::SessionSpec::new(
+                "w1",
+                acc_core::Harness::Codex,
+                "/w",
+                acc_core::Harness::Codex.launch(None),
+                1,
+            )
+            .to_json(),
+            "desk".into(),
+        )
+        .unwrap();
+        let w = a.watch_exec(Some(AccHook::Webhook {
+            url: "https://example.com/acc".into(),
+        }));
+        assert!(w.script.contains("h=codex") && w.script.contains("example.com/acc"));
+        assert!(a.events_exec(5).script.contains("events.ndjson"));
+        let got = parse_session_events(
+            "{\"at\":1,\"session\":\"w1\",\"state\":\"blocked\",\"kind\":\"question\",\"offset\":3}\n".into(),
+        );
+        assert_eq!(got[0].state, AccHostState::Blocked);
+        assert_eq!(got[0].kind, Some(AccBlockKind::Question));
     }
 
     #[test]

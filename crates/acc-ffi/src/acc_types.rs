@@ -20,6 +20,7 @@ use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
 use acc_core::transcript::{Item, ItemChange, ItemStatus};
 use acc_core::usage::{AccountUsage, Bucket, DayUsage, HarnessSpend, Spend, UsageRecord, UsageRollup};
+use acc_core::watch::{Hook, HostEvent, HostState};
 use acc_core::{Exec, Harness};
 use serde_json::Value;
 
@@ -61,6 +62,10 @@ mirror_enum!(
 mirror_enum!(
     /// What answering with a permission option does.
     AccPermissionOptionKind <=> PermissionOptionKind { AllowOnce, AllowAlways, RejectOnce, RejectAlways }
+);
+mirror_enum!(
+    /// What a session follower recorded.
+    AccHostState <=> HostState { Blocked, Done, Error, Exited }
 );
 mirror_enum!(
     /// Whether a policy rule allows or denies.
@@ -1111,6 +1116,10 @@ pub enum AccFeedPath {
     SessionExit {
         id: String,
     },
+    /// The events a follower (`AccSession.watch_exec`) recorded.
+    SessionEvents {
+        id: String,
+    },
     /// Any file, such as a harness transcript (`~/` is expanded).
     File {
         path: String,
@@ -1131,6 +1140,7 @@ impl From<AccFeedEntry> for FeedEntry {
             path: match e.path {
                 AccFeedPath::SessionLog { id } => FeedPath::SessionLog(id),
                 AccFeedPath::SessionExit { id } => FeedPath::SessionExit(id),
+                AccFeedPath::SessionEvents { id } => FeedPath::SessionEvents(id),
                 AccFeedPath::File { path } => FeedPath::File(path),
             },
             offset: e.offset,
@@ -1364,4 +1374,52 @@ impl From<AccPolicyRule> for Rule {
 pub struct AccSettingsWrite {
     pub exec: AccExec,
     pub skipped: Vec<u32>,
+}
+
+/// What a session follower runs for every event, with the event's JSON
+/// line on stdin.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum AccHook {
+    /// A shell command on the host, with `ACC_SESSION` and `ACC_STATE` set.
+    Command { command: String },
+    /// Posted as JSON with `curl` (or `wget`).
+    Webhook { url: String },
+}
+
+impl From<AccHook> for Hook {
+    fn from(h: AccHook) -> Self {
+        match h {
+            AccHook::Command { command } => Hook::Command { command },
+            AccHook::Webhook { url } => Hook::Webhook { url },
+        }
+    }
+}
+
+/// One event a session follower recorded while no client was connected.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccHostEvent {
+    /// Seconds since the Unix epoch, by the host's clock.
+    pub at: u64,
+    pub session: String,
+    pub state: AccHostState,
+    pub kind: Option<AccBlockKind>,
+    /// The tool, command or dialog title, when the log says.
+    pub detail: Option<String>,
+    pub code: Option<i32>,
+    /// The session log's length at the time.
+    pub offset: u64,
+}
+
+impl From<HostEvent> for AccHostEvent {
+    fn from(e: HostEvent) -> Self {
+        Self {
+            at: e.at,
+            session: e.session,
+            state: e.state.into(),
+            kind: e.kind.map(Into::into),
+            detail: e.detail,
+            code: e.code,
+            offset: e.offset,
+        }
+    }
 }

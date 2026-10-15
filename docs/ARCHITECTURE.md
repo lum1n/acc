@@ -164,12 +164,29 @@ session.
 Every client reads and writes the same layout under `~/.acc/s/<id>/`, whichever layer started the
 session: `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json` (one line, a
 `session::SessionSpec`: harness, cwd, launch command, model, native id, title, origin, launcher),
-`sent` (write ids already delivered) and `lock`. The status line is `alive <pid> <log bytes>`,
+`sent` (write ids already delivered), `lock`, and `events.ndjson`, `watch.pid` and `watch.tail`
+while a follower runs (below). The status line is `alive <pid> <log bytes>`,
 `exited <code|-> <log bytes>` or `missing`; the list script prints one `S` line per session plus a
 `J` line with its `spec.json`. Launches fail fast (`EXIT_NO_CWD`) when the directory is missing and
 give up after `LAUNCH_WAIT_TICKS`; `attach_script` heartbeats on stderr and ends when the harness
 does; `write_script` delivers a write whole and at most once per id; `input_script` and
 `write_script` exit `EXIT_NOT_RUNNING` once the harness is gone.
+
+**While no client is connected.** Any client can be away (a phone in the background, a closed
+laptop, a shut browser tab). `Session::watch_exec(hook)` starts `watch::watch_script` on the host,
+detached like the harness and with nothing installed: `tail -f` on the log through an `awk` program
+that knows each protocol's markers. Claude's `can_use_tool` control requests and `result`, Codex's
+approval and user-input requests, the main thread's `turn/completed` (a subagent's turn, whose
+`rootTurnId` differs, isn't the session's) and final `error`, ACP's `session/request_permission`
+and `stopReason`, and pi's dialogs and the assistant's `message_end` with `stop` or `error`. Each
+becomes one line of `events.ndjson` (`watch::HostEvent`: host time, `blocked` with
+permission/question, `done`, `error`, `exited` with the code, a short detail such as the tool or
+command, and the log offset at that moment). A reconnecting client reads them with `events_exec` or
+a fan-in `SessionEvents` entry to catch up, then replays the log as usual. An embedder's
+`watch::Hook` runs for every event: a command (`sh -c`, the event on stdin, `ACC_SESSION` and
+`ACC_STATE` set) or a webhook posted with `curl` or `wget`. Delivering a notification from there is
+the embedder's business. Running `watch_exec` again replaces the follower; it ends once the harness
+has exited and its last lines are handled.
 
 ### SSH transport (`acc-ssh`)
 

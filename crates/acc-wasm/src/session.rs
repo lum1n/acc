@@ -142,6 +142,22 @@ impl AccSession {
         self.inner.kill_exec().into()
     }
 
+    /// Starts a follower on the host that records approvals, finished
+    /// turns, errors and the exit in the session's events while no client is
+    /// connected, running `hook` (a `Hook`, or `null`) for each. Run again
+    /// after a relaunch, or to change the hook.
+    #[wasm_bindgen(js_name = watchExec)]
+    pub fn watch_exec(&self, hook: JsValue) -> Result<AccExec, JsValue> {
+        let hook: Option<acc_core::watch::Hook> = arg(hook, "hook")?;
+        Ok(self.inner.watch_exec(hook.as_ref()).into())
+    }
+
+    /// Prints the follower's events from byte `offset` (see `parseSessionEvents`).
+    #[wasm_bindgen(js_name = eventsExec)]
+    pub fn events_exec(&self, offset: f64) -> AccExec {
+        self.inner.events_exec(ms(offset)).into()
+    }
+
     #[wasm_bindgen(js_name = removeExec)]
     pub fn remove_exec(&self) -> AccExec {
         self.inner.remove_exec().into()
@@ -383,6 +399,13 @@ pub fn parse_session_list(stdout: &str) -> JsValue {
 #[wasm_bindgen(js_name = parseSessionStatus)]
 pub fn parse_session_status(stdout: &str) -> JsValue {
     js(&detached::parse_status(stdout))
+}
+
+/// A follower's events (from `eventsExec` or a `session_events` feed): a
+/// JSON array of `HostEvent`s.
+#[wasm_bindgen(js_name = parseSessionEvents)]
+pub fn parse_session_events(stdout: &str) -> JsValue {
+    js(&acc_core::watch::parse_events(stdout))
 }
 
 /// Finds the installed harnesses (login `PATH`, with versions).

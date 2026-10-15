@@ -30,6 +30,7 @@
 //! - [`handoff`]: priming another harness with a conversation so far.
 //! - [`usage`]: what sessions spent, added up per account and per day.
 //! - [`worktree`]: a git worktree per session, its diff, merge and discard.
+//! - [`watch`]: session events recorded on the host while no client is connected.
 
 pub mod claude;
 pub mod codex;
@@ -57,6 +58,7 @@ pub mod state;
 pub mod takeover;
 pub mod transcript;
 pub mod usage;
+pub mod watch;
 mod wire;
 pub mod worktree;
 
