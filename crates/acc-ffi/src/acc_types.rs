@@ -10,10 +10,12 @@ use acc_core::command::{
 };
 use acc_core::detached::{FeedEntry, FeedPath, Listing, Status};
 use acc_core::event::{
-    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
+    Quota, QuotaWindow, Usage,
 };
 use acc_core::harness::{Availability, Compat, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag};
+use acc_core::policy::{Decision, Rule};
 use acc_core::session::{LaunchRequest, Origin, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
 use acc_core::transcript::{Item, ItemChange, ItemStatus};
@@ -55,6 +57,14 @@ mirror_enum!(AccLineTag <=> LineTag { Context, Add, Remove });
 mirror_enum!(
     /// A harness version against the range ACC was tested with.
     AccCompat <=> Compat { Tested, Newer, Older, Unknown }
+);
+mirror_enum!(
+    /// What answering with a permission option does.
+    AccPermissionOptionKind <=> PermissionOptionKind { AllowOnce, AllowAlways, RejectOnce, RejectAlways }
+);
+mirror_enum!(
+    /// Whether a policy rule allows or denies.
+    AccDecision <=> Decision { Allow, Deny }
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -105,6 +115,8 @@ impl From<SessionState> for AccSessionState {
 pub struct AccPermissionOption {
     pub id: String,
     pub label: String,
+    /// What it does, when the harness says.
+    pub kind: Option<AccPermissionOptionKind>,
 }
 
 impl From<PermissionOption> for AccPermissionOption {
@@ -112,6 +124,7 @@ impl From<PermissionOption> for AccPermissionOption {
         Self {
             id: o.id,
             label: o.label,
+            kind: o.kind.map(Into::into),
         }
     }
 }
@@ -1320,4 +1333,35 @@ impl From<UsageRollup> for AccUsageRollup {
             days: r.days.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+/// One permission rule; every field given must match (see `AccSession.set_policy`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPolicyRule {
+    pub decision: AccDecision,
+    /// The harness's tool name or `shell`, `edit`, `read`, `fetch`, `mcp`.
+    pub tool: Option<String>,
+    /// Glob over the files the tool acts on, relative to the session's directory.
+    pub path: Option<String>,
+    /// A shell command's start, in whole words.
+    pub command: Option<String>,
+}
+
+impl From<AccPolicyRule> for Rule {
+    fn from(r: AccPolicyRule) -> Self {
+        Self {
+            decision: r.decision.into(),
+            tool: r.tool,
+            path: r.path,
+            command: r.command,
+        }
+    }
+}
+
+/// The settings file with the rules added, as a script, and the rules the
+/// harness has no way to say (their indexes).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccSettingsWrite {
+    pub exec: AccExec,
+    pub skipped: Vec<u32>,
 }

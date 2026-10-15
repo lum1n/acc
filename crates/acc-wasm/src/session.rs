@@ -8,6 +8,7 @@ use acc_core::detached::{self, FanInParser, FeedEntry};
 use acc_core::driver::DriverError;
 use acc_core::harness;
 use acc_core::item;
+use acc_core::policy::{self, Policy, Rule};
 use acc_core::session::{self, LaunchRequest, Outbound, Session, SessionError, SessionSpec, Update};
 use serde_json::Value;
 use wasm_bindgen::prelude::*;
@@ -251,6 +252,17 @@ impl AccSession {
         js(&self.inner.quota())
     }
 
+    /// Answers approvals by these rules (a JSON array of `Rule`s) from now
+    /// on, including any waiting (deny wins over allow; questions are left
+    /// to the user). Set it on one client per session. An empty list stops.
+    /// JSON array of `Update`s.
+    #[wasm_bindgen(js_name = setPolicy)]
+    pub fn set_policy(&mut self, rules: JsValue) -> Result<JsValue, JsValue> {
+        let rules: Vec<Rule> = arg(rules, "policy rules")?;
+        let policy = (!rules.is_empty()).then_some(Policy { rules });
+        Ok(updates(self.inner.set_policy(policy)))
+    }
+
     /// Prints what the session changed in its worktree as a `git diff`
     /// (parse it with `parseUnifiedDiff`).
     #[wasm_bindgen(js_name = worktreeDiffExec)]
@@ -404,6 +416,52 @@ pub fn worktree_add_exec(cwd: &str, name: &str, base: Option<String>) -> Result<
         name,
         base.as_deref(),
     )))
+}
+
+/// The settings file with the rules added, as a script, and the indexes of
+/// rules the harness has no way to say.
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Debug, Clone)]
+pub struct AccSettingsWrite {
+    pub exec: AccExec,
+    pub skipped: Vec<u32>,
+}
+
+/// Prints `harness`'s permission settings for a session in `cwd`, for
+/// `permissionSettingsWriteExec`. `undefined` for Copilot and pi.
+#[wasm_bindgen(js_name = permissionSettingsReadExec)]
+pub fn permission_settings_read_exec(harness: &str, cwd: &str) -> Result<Option<AccExec>, JsValue> {
+    Ok(policy::settings_read_script(crate::harness(harness)?, cwd).map(AccExec::script))
+}
+
+/// Adds `rules` (a JSON array of `Rule`s) to the settings `existing` (from
+/// `permissionSettingsReadExec`) and writes them back, so the harness stops
+/// asking: Claude, Codex, Cursor and opencode.
+#[wasm_bindgen(js_name = permissionSettingsWriteExec)]
+pub fn permission_settings_write_exec(
+    harness: &str,
+    cwd: &str,
+    existing: &str,
+    rules: JsValue,
+) -> Result<AccSettingsWrite, JsValue> {
+    let h = crate::harness(harness)?;
+    let rules: Vec<Rule> = arg(rules, "policy rules")?;
+    let (text, skipped) = policy::merge_settings(h, existing, &rules).map_err(|e| {
+        let kind = match e {
+            policy::SettingsError::Unsupported(_) => "Unsupported",
+            policy::SettingsError::Unreadable(_) => "InvalidArgument",
+        };
+        error(kind, &e.to_string())
+    })?;
+    let script = policy::settings_write_script(h, cwd)
+        .ok_or_else(|| error("Unsupported", &format!("{h:?} has no permission settings")))?;
+    Ok(AccSettingsWrite {
+        exec: AccExec {
+            script,
+            stdin: text.into_bytes(),
+        },
+        skipped: skipped.into_iter().map(|i| i as u32).collect(),
+    })
 }
 
 /// A session id from at least 15 random bytes supplied by the caller.

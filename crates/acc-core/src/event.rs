@@ -125,6 +125,35 @@ pub enum ItemKind {
 pub struct PermissionOption {
     pub id: String,
     pub label: String,
+    /// What answering with this option does, when the harness says (ACP's
+    /// option kinds, mapped from each harness's own decisions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<PermissionOptionKind>,
+}
+
+impl PermissionOption {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            kind: None,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: PermissionOptionKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+}
+
+/// What a permission option does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
 }
 
 /// Token, cost and context usage as reported by the harness itself.

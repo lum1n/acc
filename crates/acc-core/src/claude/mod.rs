@@ -41,7 +41,8 @@ use crate::command::{
 };
 use crate::driver::{Driver, DriverError};
 use crate::event::{
-    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
+    Quota, QuotaWindow, Usage,
 };
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
@@ -869,10 +870,7 @@ impl ClaudeDriver {
                 .map(|opts| {
                     opts.iter()
                         .filter_map(|o| str_at(o, "label"))
-                        .map(|l| PermissionOption {
-                            id: l.to_owned(),
-                            label: l.to_owned(),
-                        })
+                        .map(|l| PermissionOption::new(l.to_owned(), l.to_owned()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -887,22 +885,17 @@ impl ClaudeDriver {
                 Some(d) => format!("{name}: {}", wire::one_line(d, 200)),
                 None => name.to_owned(),
             };
-            let mut options = vec![PermissionOption {
-                id: "allow".into(),
-                label: "Allow".into(),
-            }];
+            let mut options =
+                vec![PermissionOption::new("allow", "Allow").with_kind(PermissionOptionKind::AllowOnce)];
             let always = suggestions.as_array().is_some_and(|s| !s.is_empty())
                 && req.get("suppress_always_allow_rule").and_then(Value::as_bool) != Some(true);
             if always {
-                options.push(PermissionOption {
-                    id: "allow_always".into(),
-                    label: "Always allow".into(),
-                });
+                options.push(
+                    PermissionOption::new("allow_always", "Always allow")
+                        .with_kind(PermissionOptionKind::AllowAlways),
+                );
             }
-            options.push(PermissionOption {
-                id: "deny".into(),
-                label: "Deny".into(),
-            });
+            options.push(PermissionOption::new("deny", "Deny").with_kind(PermissionOptionKind::RejectOnce));
             (title, options, None)
         };
         let is_question = question.is_some();

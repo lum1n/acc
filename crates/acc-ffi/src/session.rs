@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use acc_core::detached::{self, FanInParser, FeedEntry};
 use acc_core::harness;
 use acc_core::item;
+use acc_core::policy::{self, Policy};
 use acc_core::session::{self, Session, SessionError, SessionSpec};
 use acc_core::worktree;
 
@@ -215,6 +216,16 @@ impl AccSession {
         lock(&self.inner).quota().cloned().map(Into::into)
     }
 
+    /// Answers approvals by these rules from now on, including any waiting
+    /// (deny wins over allow; questions are left to the user). Set it on one
+    /// client per session. An empty list stops.
+    pub fn set_policy(&self, rules: Vec<AccPolicyRule>) -> Vec<AccUpdate> {
+        let policy = (!rules.is_empty()).then(|| Policy {
+            rules: rules.into_iter().map(Into::into).collect(),
+        });
+        convert(lock(&self.inner).set_policy(policy))
+    }
+
     /// Prints what the session changed in its worktree as a `git diff`
     /// (parse it with `parse_unified_diff`).
     pub fn worktree_diff_exec(&self) -> Result<AccExec, AccError> {
@@ -352,6 +363,45 @@ pub fn worktree_add_exec(cwd: String, name: String, base: Option<String>) -> Res
         &name,
         base.as_deref(),
     )))
+}
+
+/// Prints `harness`'s permission settings for a session in `cwd`, for
+/// `permission_settings_write_exec`. `None` for Copilot and pi.
+#[uniffi::export]
+pub fn permission_settings_read_exec(harness: AccHarness, cwd: String) -> Option<AccExec> {
+    policy::settings_read_script(harness.into(), &cwd).map(AccExec::script)
+}
+
+/// Adds `rules` to the settings `existing` (from
+/// `permission_settings_read_exec`) and writes them back, so the harness
+/// stops asking: Claude, Codex, Cursor and opencode.
+#[uniffi::export]
+pub fn permission_settings_write_exec(
+    harness: AccHarness,
+    cwd: String,
+    existing: String,
+    rules: Vec<AccPolicyRule>,
+) -> Result<AccSettingsWrite, AccError> {
+    let h = harness.into();
+    let rules: Vec<_> = rules.into_iter().map(Into::into).collect();
+    let (text, skipped) = policy::merge_settings(h, &existing, &rules).map_err(|e| match e {
+        policy::SettingsError::Unsupported(_) => AccError::Unsupported {
+            reason: e.to_string(),
+        },
+        policy::SettingsError::Unreadable(_) => AccError::InvalidArgument {
+            reason: e.to_string(),
+        },
+    })?;
+    let script = policy::settings_write_script(h, &cwd).ok_or_else(|| AccError::Unsupported {
+        reason: format!("{h:?} has no permission settings"),
+    })?;
+    Ok(AccSettingsWrite {
+        exec: AccExec {
+            script,
+            stdin: text.into_bytes(),
+        },
+        skipped: skipped.into_iter().map(|i| i as u32).collect(),
+    })
 }
 
 /// A session id from at least 15 random bytes supplied by the caller.
@@ -596,6 +646,73 @@ mod tests {
         assert_eq!(rollup.days.len(), 1);
         assert_eq!(rollup.days[0].date, "2026-10-14");
         assert_eq!(rollup.accounts[0].harness, AccHarness::Claude);
+    }
+
+    #[test]
+    fn policy_and_settings_through_ffi() {
+        const DENY: &[u8] = include_bytes!("../../acc-core/tests/fixtures/claude/permission-deny.ndjson");
+        let open: Vec<u8> = String::from_utf8_lossy(DENY)
+            .lines()
+            .take_while(|l| !l.contains("\"tool_result\""))
+            .flat_map(|l| format!("{l}\n").into_bytes())
+            .collect();
+        let s = AccSession::launch(
+            AccLaunchRequest {
+                harness: AccHarness::Claude,
+                cwd: "/w".into(),
+                model: None,
+                permission: None,
+                resume: None,
+                fork: false,
+                title: None,
+                prompt: None,
+                attachments: vec![],
+                parent: None,
+                replaces_parent: false,
+                origin: AccOrigin::Started,
+                launcher: None,
+                worktree: None,
+            },
+            new_session_id(AccHarness::Claude, vec![12; 15]),
+            "ph".into(),
+            1,
+        )
+        .unwrap();
+        let a = AccSession::attach(s.spec().json, "desk".into()).unwrap();
+        a.on_status(format!("alive 3 {}", open.len()), 2);
+        a.feed(open, 3);
+        let waiting = a.permissions();
+        assert_eq!(waiting.len(), 1);
+        assert!(
+            waiting[0]
+                .options
+                .iter()
+                .any(|o| o.kind == Some(AccPermissionOptionKind::AllowOnce))
+        );
+        let ups = a.set_policy(vec![AccPolicyRule {
+            decision: AccDecision::Allow,
+            tool: None,
+            path: None,
+            command: None,
+        }]);
+        assert!(ups.iter().any(|u| matches!(&u.event, AccEvent::Notice { .. })));
+        assert!(a.permissions().is_empty());
+
+        let rules = vec![AccPolicyRule {
+            decision: AccDecision::Allow,
+            tool: Some("shell".into()),
+            path: None,
+            command: Some("npm test".into()),
+        }];
+        assert!(permission_settings_read_exec(AccHarness::Pi, "/w".into()).is_none());
+        let w =
+            permission_settings_write_exec(AccHarness::Claude, "/w".into(), String::new(), rules).unwrap();
+        assert!(
+            String::from_utf8(w.exec.stdin)
+                .unwrap()
+                .contains("Bash(npm test:*)")
+        );
+        assert!(w.skipped.is_empty());
     }
 
     #[test]

@@ -36,6 +36,7 @@ use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
 use crate::harness::{Harness, LaunchSpec, Launcher};
 use crate::multiplexer::Exec;
 use crate::pi::PiDriver;
+use crate::policy::{Decision, Policy, Request};
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
 use crate::transcript::{ItemChange, Transcript};
 use crate::usage::{Spending, UsageRecord};
@@ -235,6 +236,10 @@ pub struct Session {
     quota: Option<Quota>,
     quota_at_ms: Option<u64>,
     permissions: Vec<Permission>,
+    /// Rules this client answers approvals with (see [`Session::set_policy`]).
+    policy: Option<Policy>,
+    /// Requests the policy already answered, so a failed answer isn't retried.
+    policed: Vec<String>,
     transmit: Vec<u8>,
     /// First prompt, held until the harness has a session to take it.
     pending_prompt: Option<Command>,
@@ -420,6 +425,8 @@ impl Session {
             quota: None,
             quota_at_ms: None,
             permissions: Vec::new(),
+            policy: None,
+            policed: Vec::new(),
             transmit,
             pending_prompt,
             spec_dirty: false,
@@ -450,6 +457,8 @@ impl Session {
             quota: None,
             quota_at_ms: None,
             permissions: Vec::new(),
+            policy: None,
+            policed: Vec::new(),
             transmit: Vec::new(),
             pending_prompt: None,
             spec_dirty: false,
@@ -529,6 +538,8 @@ impl Session {
             quota: snap.quota.into_owned(),
             quota_at_ms: snap.quota_at_ms,
             permissions: snap.permissions.into_owned(),
+            policy: None,
+            policed: Vec::new(),
             transmit: Vec::new(),
             pending_prompt: snap.pending_prompt.into_owned(),
             spec_dirty: snap.spec_dirty,
@@ -654,6 +665,7 @@ impl Session {
             Status::Exited { code, .. } => self.exit(code, now_ms, &mut out),
             Status::Missing => self.exit(None, now_ms, &mut out),
         }
+        self.police(&mut out);
         out
     }
 
@@ -692,6 +704,7 @@ impl Session {
             self.transmit.extend(t);
         }
         out.extend(self.take_updates(now_ms));
+        self.police(&mut out);
         out
     }
 
@@ -849,6 +862,23 @@ impl Session {
         &self.permissions
     }
 
+    /// Answers approvals by `policy` from now on, including any already
+    /// waiting: matching requests get the harness's allow-once or reject
+    /// option, sent with the next [`Session::take_transmit`], and a
+    /// [`Event::Notice`] says so. Questions are always left to the user,
+    /// and so is history replayed on attach. Set it on one client per
+    /// session, or several clients answer the same request. `None` stops.
+    pub fn set_policy(&mut self, policy: Option<Policy>) -> Vec<Update> {
+        self.policy = policy;
+        let mut out = Vec::new();
+        self.police(&mut out);
+        out
+    }
+
+    pub fn policy(&self) -> Option<&Policy> {
+        self.policy.as_ref()
+    }
+
     pub fn commands(&self) -> &[CommandEntry] {
         self.driver.commands()
     }
@@ -858,6 +888,51 @@ impl Session {
     }
 
     // ---- internals -----------------------------------------------------------
+
+    /// Answers waiting approvals the policy decides, once each.
+    fn police(&mut self, out: &mut Vec<Update>) {
+        let Some(policy) = &self.policy else { return };
+        if self.is_replaying() || !self.is_alive() {
+            return;
+        }
+        let mut answers = Vec::new();
+        for p in &self.permissions {
+            if p.kind != BlockKind::Permission || self.policed.contains(&p.request_id) {
+                continue;
+            }
+            let item = p.item_id.as_deref().and_then(|id| self.transcript.get(id));
+            let request = Request::new(self.spec.harness, item, &p.input);
+            let Some((decision, _)) = policy.decide(&request, &self.spec.cwd) else {
+                continue;
+            };
+            if let Some(option) = crate::policy::option_for(decision, &p.options) {
+                answers.push((p.request_id.clone(), option.id.clone(), decision, p.title.clone()));
+            }
+        }
+        for (request_id, option_id, decision, title) in answers {
+            self.policed.push(request_id.clone());
+            let cmd = Command::AnswerPermission {
+                request_id: request_id.clone(),
+                option_id,
+            };
+            let message = match self.driver.command(cmd) {
+                Ok(bytes) => {
+                    self.transmit.extend(bytes);
+                    self.permissions.retain(|p| p.request_id != request_id);
+                    match decision {
+                        Decision::Allow => format!("Allowed by policy: {title}"),
+                        Decision::Deny => format!("Denied by policy: {title}"),
+                    }
+                }
+                Err(e) => format!("Couldn't answer by policy ({title}): {e}"),
+            };
+            out.push(Update {
+                event: Event::Notice { message },
+                item: None,
+                replay: false,
+            });
+        }
+    }
 
     fn finish_replay(&mut self) {
         let Some(until) = self.replay_until else { return };
@@ -1461,6 +1536,53 @@ mod tests {
             }),
             Err(SessionError::Driver(DriverError::Unsupported { .. }))
         ));
+    }
+
+    #[test]
+    fn policy_answers_waiting_and_new_approvals_but_never_history() {
+        use crate::policy::{Decision, Rule};
+        let open: String = CLAUDE_PERMISSION
+            .lines()
+            .take_while(|l| !l.contains("\"tool_result\""))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let (s, _) = Session::launch(req(Harness::Claude), "s1", "a", 1).unwrap();
+        let mut b = Session::attach(s.spec().clone(), "b").unwrap();
+        b.on_status(&format!("alive 1 {}", open.len()), 0);
+        let deny_all = Policy {
+            rules: vec![Rule {
+                decision: Decision::Deny,
+                tool: None,
+                path: None,
+                command: None,
+            }],
+        };
+        // Nothing is answered while replaying, even with a policy.
+        b.set_policy(Some(deny_all.clone()));
+        let ups = b.feed(open.as_bytes(), 1);
+        assert_eq!(b.permissions().len(), 0, "answered once the replay ended");
+        let notice = ups.iter().find_map(|u| match &u.event {
+            Event::Notice { message } => Some(message.clone()),
+            _ => None,
+        });
+        assert!(notice.unwrap().starts_with("Denied by policy"));
+        let sent = String::from_utf8(b.take_transmit()).unwrap();
+        assert!(sent.contains("\"behavior\":\"deny\""), "{sent}");
+
+        // A rule that doesn't match leaves the request to the user.
+        let mut c = Session::attach(s.spec().clone(), "c").unwrap();
+        c.on_status(&format!("alive 1 {}", open.len()), 0);
+        c.feed(open.as_bytes(), 1);
+        let only_git = Policy {
+            rules: vec![Rule {
+                decision: Decision::Allow,
+                tool: Some("shell".into()),
+                path: None,
+                command: Some("git".into()),
+            }],
+        };
+        c.set_policy(Some(only_git));
+        assert_eq!(c.permissions().len(), 1);
     }
 
     #[test]

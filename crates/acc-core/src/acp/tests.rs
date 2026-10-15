@@ -333,14 +333,8 @@ fn a_full_turn_with_a_permission_prompt() {
     assert!(events.iter().any(|e| matches!(e, Event::PermissionRequested {
         request_id, title, options, kind: BlockKind::Permission, item_id, ..
     } if request_id == "7" && title == "cargo build" && item_id.is_some() && options == &vec![
-            PermissionOption {
-                id: "allow-once".into(),
-                label: "Allow".into()
-            },
-            PermissionOption {
-                id: "reject-once".into(),
-                label: "Reject".into()
-            },
+            PermissionOption::new("allow-once", "Allow").with_kind(PermissionOptionKind::AllowOnce),
+            PermissionOption::new("reject-once", "Reject").with_kind(PermissionOptionKind::RejectOnce),
         ])));
 
     // The answer echoes the agent's numeric id.

@@ -232,6 +232,27 @@ file change with hunks) and `item::parse_unified` reads `git diff`. Commands a h
 out with a new process (Claude fork, a model Cursor takes at spawn) come back as
 `Outbound::Relaunch`.
 
+**Permission policy.** Every harness asks for approvals its own way, so `policy::Policy` is one
+list of allow and deny rules for all of them: by tool (the harness's own name, or ACC's kinds
+`shell`, `edit`, `read`, `fetch`, `mcp`), by a glob over the files the tool acts on (relative to the
+session's directory), and by a command's start in whole words. Deny wins over allow, and an allow
+rule never matches a command that chains others (`;`, `&&`, `|`, `$(...)`, redirects); a deny rule
+matches any command in the chain. `Session::set_policy` checks every live approval (and those
+waiting when it is set or when a replay ends, never history) against the request's tool call in
+the transcript and its input, and answers a match with the option whose `PermissionOption::kind`
+is `AllowOnce` (or `RejectOnce` / `RejectAlways`), followed by an `Event::Notice`. Drivers set
+`kind` from each harness's decisions (ACP's option kinds, Claude's allow/deny, Codex's
+accept/decline). Questions are always left to the user. One client per session should hold the
+policy, or several answer the same request.
+
+The same rules go into the harnesses' own settings, so they stop asking: `settings_read_script`,
+then `merge_settings` (pure, reports rules a harness can't say) and `settings_write_script`. Claude
+gets `permissions.allow`/`deny` in `.claude/settings.local.json` (`Bash(npm test:*)`,
+`Edit(src/**)`), Codex `prefix_rule(...)` lines in `~/.codex/rules/default.rules` (commands only),
+Cursor `Shell(...)`/`Read(...)`/`Write(...)` in `.cursor/cli.json`, and opencode `permission.bash`
+patterns and `edit`/`webfetch` in `opencode.json` (left alone when it has comments). Copilot and pi
+have no rules file.
+
 **Worktrees.** Several agents can work on one repository at once, each in a git worktree of its
 own. `worktree::add_script(cwd, name, base)` (`worktree_add_exec` in the bindings; use the session
 id as the name) makes `~/.acc/w/<name>` on branch `acc/<name>` from `base` (default `HEAD`) and

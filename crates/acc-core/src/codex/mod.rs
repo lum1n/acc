@@ -40,7 +40,8 @@ use crate::command::{
 };
 use crate::driver::{Driver, DriverError};
 use crate::event::{
-    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, Quota, QuotaWindow, Usage,
+    Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
+    Quota, QuotaWindow, Usage,
 };
 use crate::harness::{Harness, LaunchSpec};
 use crate::ndjson::{Frame, LineFramer};
@@ -777,10 +778,7 @@ impl CodexDriver {
 
     fn on_server_request(&mut self, id: Value, method: String, v: Value, out: &mut Vec<Event>) {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
-        let opt = |id: &str, label: &str| PermissionOption {
-            id: id.into(),
-            label: label.into(),
-        };
+        let opt = |id: &str, label: &str| PermissionOption::new(id, label);
         let (title, options, kind) = match method.as_str() {
             "item/commandExecution/requestApproval" => {
                 let what = str_at(&params, "command")
@@ -809,9 +807,9 @@ impl CodexDriver {
                     None => "Grant additional permissions".into(),
                 };
                 let options = vec![
-                    opt("turn", "Allow this turn"),
-                    opt("session", "Allow for session"),
-                    opt("decline", "Deny"),
+                    opt("turn", "Allow this turn").with_kind(PermissionOptionKind::AllowOnce),
+                    opt("session", "Allow for session").with_kind(PermissionOptionKind::AllowAlways),
+                    opt("decline", "Deny").with_kind(PermissionOptionKind::RejectOnce),
                 ];
                 (title, options, BlockKind::Permission)
             }
@@ -1512,16 +1510,20 @@ fn request_key(id: &Value) -> String {
 
 fn decision_options(offered: &[&str]) -> Vec<PermissionOption> {
     let all = [
-        ("accept", "Allow"),
-        ("acceptForSession", "Allow for session"),
-        ("decline", "Deny"),
-        ("cancel", "Deny and stop"),
+        ("accept", "Allow", Some(PermissionOptionKind::AllowOnce)),
+        (
+            "acceptForSession",
+            "Allow for session",
+            Some(PermissionOptionKind::AllowAlways),
+        ),
+        ("decline", "Deny", Some(PermissionOptionKind::RejectOnce)),
+        ("cancel", "Deny and stop", None),
     ];
     all.iter()
-        .filter(|(id, _)| offered.is_empty() || offered.contains(id))
-        .map(|(id, label)| PermissionOption {
-            id: (*id).into(),
-            label: (*label).into(),
+        .filter(|(id, ..)| offered.is_empty() || offered.contains(id))
+        .map(|&(id, label, kind)| PermissionOption {
+            kind,
+            ..PermissionOption::new(id, label)
         })
         .collect()
 }

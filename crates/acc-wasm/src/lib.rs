@@ -114,6 +114,23 @@ export interface Quota {
   windows: QuotaWindow[];
 }
 
+export interface PermissionOption {
+  id: string;
+  label: string;
+  /** What answering with it does, when the harness says. */
+  kind?: "allow_once" | "allow_always" | "reject_once" | "reject_always";
+}
+
+export interface PolicyRule {
+  decision: "allow" | "deny";
+  /** The harness's tool name, or "shell" | "edit" | "read" | "fetch" | "mcp". */
+  tool?: string | null;
+  /** Glob over the files the tool acts on, relative to the session's directory. */
+  path?: string | null;
+  /** A shell command's start, in whole words. */
+  command?: string | null;
+}
+
 export interface Spend {
   input_tokens: number;
   output_tokens: number;
@@ -153,7 +170,7 @@ export type Event =
   | { type: "item_delta"; id: string; text: string }
   | { type: "item_updated"; id: string; extensions?: unknown }
   | { type: "item_completed"; id: string; extensions?: unknown }
-  | { type: "permission_requested"; request_id: string; title: string; options: { id: string; label: string }[] }
+  | { type: "permission_requested"; request_id: string; title: string; options: PermissionOption[] }
   | { type: "permission_resolved"; request_id: string }
   | ({ type: "usage" } & Usage)
   | ({ type: "quota" } & Quota)

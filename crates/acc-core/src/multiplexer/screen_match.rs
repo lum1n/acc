@@ -85,14 +85,8 @@ impl Dialog {
             options: self
                 .options
                 .iter()
-                .map(|o| PermissionOption {
-                    id: o.id.clone(),
-                    label: o.label.clone(),
-                })
-                .chain([PermissionOption {
-                    id: CANCEL.into(),
-                    label: "Cancel (Esc)".into(),
-                }])
+                .map(|o| PermissionOption::new(o.id.clone(), o.label.clone()))
+                .chain([PermissionOption::new(CANCEL, "Cancel (Esc)")])
                 .collect(),
             kind: crate::state::BlockKind::Permission,
             item_id: None,
