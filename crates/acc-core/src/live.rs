@@ -16,6 +16,7 @@ use crate::event::Event;
 use crate::harness::{Harness, LaunchSpec};
 use crate::pi::{self, PiDriver};
 use crate::state::{SessionState, StateTracker};
+use crate::transcript::Transcript;
 
 /// How long a higher-fidelity state wins before a lower one may replace it.
 pub const DEFAULT_STALE_AFTER_MS: u64 = 30_000;
@@ -80,6 +81,10 @@ pub struct Session {
     /// A model to select over the protocol at start, for harnesses whose
     /// launch command doesn't take one (pi).
     start_model: Option<String>,
+    /// Every item the events so far described, with its text and merged
+    /// extensions, so an embedder can read each one in a harness-neutral
+    /// shape ([`crate::transcript::Item::detail`]) without parsing them.
+    transcript: Transcript,
 }
 
 impl Session {
@@ -144,6 +149,7 @@ impl Session {
             tracker: StateTracker::new(DEFAULT_STALE_AFTER_MS),
             launch,
             start_model,
+            transcript: Transcript::new(),
         }
     }
 
@@ -186,6 +192,8 @@ impl Session {
         let transmit = d.poll_transmit();
         for event in &mut events {
             self.note(event, now_ms);
+            self.transcript.settle(event);
+            self.transcript.apply(event);
         }
         Received { events, transmit }
     }
@@ -208,7 +216,17 @@ impl Session {
             observed_at_ms: 0,
         });
         self.note(&mut state, now_ms);
+        self.transcript.settle(&state);
         vec![state, Event::Exited { code }]
+    }
+
+    /// The items the session's events described so far: messages, reasoning,
+    /// tool calls, commands and file changes, each with its accumulated text
+    /// and merged extensions. Read one after its `ItemStarted`,
+    /// `ItemUpdated` or `ItemCompleted` for the harness-neutral
+    /// [`crate::transcript::Item::detail`].
+    pub fn transcript(&self) -> &Transcript {
+        &self.transcript
     }
 
     /// Merges a state seen elsewhere (OSC 7501 in a pane, a transcript, a
@@ -353,6 +371,40 @@ mod tests {
         let s = Session::new(cfg);
         assert_eq!(s.native_id(), Some("abc"));
         assert!(s.launch_spec().args.ends_with(&["--resume".into(), "abc".into()]));
+    }
+
+    #[test]
+    fn the_transcript_follows_the_events() {
+        const PERMISSION: &str = include_str!("../tests/fixtures/claude/permission-deny.ndjson");
+        let mut s = Session::new(SessionConfig::new(Harness::Claude, "/tmp"));
+        let mut tool = None;
+        for line in PERMISSION.lines() {
+            let got = s.receive(format!("{line}\n").as_bytes(), 1);
+            for event in got.events {
+                if let Event::ItemStarted { id, kind, .. } = event
+                    && kind == crate::event::ItemKind::CommandExecution
+                {
+                    tool = Some(id);
+                }
+            }
+        }
+        let id = tool.expect("the fixture runs a Bash call");
+        let item = s.transcript().get(&id).expect("the transcript kept it");
+        match item.detail(Harness::Claude) {
+            crate::item::ItemDetail::Command { command, output, .. } => {
+                assert!(command.contains("acc-probe.txt"));
+                assert!(output.contains("Denied"));
+            }
+            other => panic!("expected a command, got {other:?}"),
+        }
+        assert_eq!(item.status, crate::transcript::ItemStatus::Failed);
+        assert!(
+            s.transcript()
+                .items()
+                .iter()
+                .any(|i| i.kind == crate::event::ItemKind::AgentMessage)
+        );
+        assert!(s.exited(Some(0), 2).len() == 2);
     }
 
     #[test]

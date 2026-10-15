@@ -455,6 +455,32 @@ impl Session {
     pub fn options(&self) -> Result<JsValue, JsError> {
         to_js(self.inner.options())
     }
+
+    /// Every item the events so far described, with its text, merged
+    /// extensions and harness-neutral `detail`.
+    pub fn items(&self) -> JsValue {
+        let h = self.inner.harness();
+        crate::session::items(self.inner.transcript().items().iter(), h)
+    }
+
+    /// One item by its id, once its `item_started` has been received.
+    pub fn item(&self, id: &str) -> JsValue {
+        let h = self.inner.harness();
+        js(&self.inner.transcript().get(id).map(|i| item_json(i, h)))
+    }
+
+    /// The main conversation: items that didn't run inside a subagent.
+    #[wasm_bindgen(js_name = topLevelItems)]
+    pub fn top_level_items(&self) -> JsValue {
+        let h = self.inner.harness();
+        crate::session::items(self.inner.transcript().top_level(), h)
+    }
+
+    /// The child conversation of the `subagent` item `parent`.
+    pub fn children(&self, parent: &str) -> JsValue {
+        let h = self.inner.harness();
+        crate::session::items(self.inner.transcript().children(parent), h)
+    }
 }
 
 /// Follows a harness's own transcript file (Claude, Codex, pi).

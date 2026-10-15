@@ -304,6 +304,35 @@ impl Session {
     pub fn options(&self) -> Vec<OptionDef> {
         lock(&self.inner).options().iter().map(OptionDef::from).collect()
     }
+
+    /// Every item the events so far described, with its text, merged
+    /// extensions and harness-neutral `detail`.
+    pub fn items(&self) -> Vec<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().items().iter().map(|i| item(i, h)).collect()
+    }
+
+    /// One item by its id, once its `ItemStarted` has been received.
+    pub fn item(&self, id: String) -> Option<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().get(&id).map(|i| item(i, h))
+    }
+
+    /// The main conversation: items that didn't run inside a subagent.
+    pub fn top_level_items(&self) -> Vec<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().top_level().map(|i| item(i, h)).collect()
+    }
+
+    /// The child conversation of the `Subagent` item `parent`.
+    pub fn children(&self, parent: String) -> Vec<AccItem> {
+        let s = lock(&self.inner);
+        let h = s.harness();
+        s.transcript().children(&parent).map(|i| item(i, h)).collect()
+    }
 }
 
 /// Follows a harness's own transcript file (Claude, Codex, pi) to observe a

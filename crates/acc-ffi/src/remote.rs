@@ -14,7 +14,7 @@ use acc_core::multiplexer as core_mux;
 use acc_ssh as ssh;
 
 use crate::{AccError, Command, Event, Harness, LaunchSpec, OptionDef, SessionConfig, SessionState};
-use crate::{CommandEntry, core_session_config};
+use crate::{AccItem, CommandEntry, acc_types::item, core_session_config};
 
 impl From<ssh::Error> for AccError {
     fn from(e: ssh::Error) -> Self {
@@ -332,6 +332,40 @@ impl RemoteSession {
     /// Log bytes delivered so far.
     pub fn offset(&self) -> u64 {
         self.inner.pipe().offset()
+    }
+
+    /// Every item the events so far described, with its text, merged
+    /// extensions and harness-neutral `detail`.
+    pub fn items(&self) -> Vec<AccItem> {
+        self.inner.with_core(|c| {
+            c.transcript()
+                .items()
+                .iter()
+                .map(|i| item(i, c.harness()))
+                .collect()
+        })
+    }
+
+    /// One item by its id, once its `ItemStarted` has been received.
+    pub fn item(&self, id: String) -> Option<AccItem> {
+        self.inner
+            .with_core(|c| c.transcript().get(&id).map(|i| item(i, c.harness())))
+    }
+
+    /// The main conversation: items that didn't run inside a subagent.
+    pub fn top_level_items(&self) -> Vec<AccItem> {
+        self.inner
+            .with_core(|c| c.transcript().top_level().map(|i| item(i, c.harness())).collect())
+    }
+
+    /// The child conversation of the `Subagent` item `parent`.
+    pub fn children(&self, parent: String) -> Vec<AccItem> {
+        self.inner.with_core(|c| {
+            c.transcript()
+                .children(&parent)
+                .map(|i| item(i, c.harness()))
+                .collect()
+        })
     }
 
     /// Waits for the next events, reconnecting as needed. After the harness
