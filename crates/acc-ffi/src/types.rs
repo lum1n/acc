@@ -2,13 +2,16 @@
 //!
 //! The core types carry serde attributes and `serde_json::Value` payloads that
 //! UniFFI can't express, so the boundary gets its own plain records and enums.
-//! Harness-native payloads (`extensions`, `payload`) cross as JSON strings.
+//! Items carry the typed `AccItemDetail`; free-form JSON (`native`,
+//! `payload`) crosses as JSON strings.
 
 use acc_core::command as core_cmd;
 use acc_core::event as core_ev;
 use acc_core::harness as core_h;
 use acc_core::state::{self as core_st, BlockKind, RunState};
 use serde_json::Value;
+
+use crate::acc_types::{AccItemDetail, AccItemStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
 pub enum Harness {
@@ -367,25 +370,33 @@ pub enum Event {
     StateChanged {
         state: SessionState,
     },
+    /// An item began; `detail` is what it is so far, the same shape on
+    /// every harness.
     ItemStarted {
         id: String,
         kind: ItemKind,
         /// The subagent item this one ran inside, if any.
         parent: Option<String>,
-        /// Harness-specific details as JSON, if any.
-        extensions_json: Option<String>,
+        detail: AccItemDetail,
+        /// The harness's own JSON for this frame; for debugging only.
+        native_json: Option<String>,
     },
     ItemDelta {
         id: String,
         text: String,
     },
+    /// `detail` replaces the item's previous detail whole.
     ItemUpdated {
         id: String,
-        extensions_json: Option<String>,
+        detail: AccItemDetail,
+        native_json: Option<String>,
     },
+    /// `detail` replaces the item's previous detail whole.
     ItemCompleted {
         id: String,
-        extensions_json: Option<String>,
+        status: AccItemStatus,
+        detail: AccItemDetail,
+        native_json: Option<String>,
     },
     PermissionRequested {
         request_id: String,
@@ -452,21 +463,31 @@ impl From<core_ev::Event> for Event {
                 id,
                 kind,
                 parent,
-                extensions,
+                detail,
+                native,
             } => Self::ItemStarted {
                 id,
                 kind: kind.into(),
                 parent,
-                extensions_json: json(&extensions),
+                detail: detail.into(),
+                native_json: json(&native),
             },
             E::ItemDelta { id, text } => Self::ItemDelta { id, text },
-            E::ItemUpdated { id, extensions } => Self::ItemUpdated {
+            E::ItemUpdated { id, detail, native } => Self::ItemUpdated {
                 id,
-                extensions_json: json(&extensions),
+                detail: detail.into(),
+                native_json: json(&native),
             },
-            E::ItemCompleted { id, extensions } => Self::ItemCompleted {
+            E::ItemCompleted {
                 id,
-                extensions_json: json(&extensions),
+                status,
+                detail,
+                native,
+            } => Self::ItemCompleted {
+                id,
+                status: status.into(),
+                detail: detail.into(),
+                native_json: json(&native),
             },
             E::PermissionRequested {
                 request_id,

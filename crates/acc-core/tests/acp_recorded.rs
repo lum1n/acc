@@ -117,7 +117,7 @@ fn check_turn(harness: Harness, out_log: &str, in_log: &str, approve: &str) -> V
         }
     )));
     assert!(events.iter().any(|e| matches!(e,
-        Event::ItemCompleted { extensions, .. } if extensions["status"] == "completed")));
+        Event::ItemCompleted { native, .. } if native["status"] == "completed")));
     assert_eq!(events.last(), Some(&Event::TurnCompleted));
     events
 }
@@ -268,7 +268,7 @@ fn opencode_subagent_and_its_child_session() {
         status,
         output,
         ..
-    } = sub.detail(Harness::Opencode)
+    } = sub.detail.clone()
     else {
         panic!("subagent detail")
     };

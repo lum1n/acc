@@ -23,6 +23,7 @@ use acc_core::command::{Command, OptionId};
 use acc_core::driver::{Driver, DriverError};
 use acc_core::event::ItemKind;
 use acc_core::harness::LaunchSpec;
+use acc_core::item::ItemDetail;
 use acc_core::pi::PiDriver;
 use acc_core::state::RunState;
 use acc_core::{Event, Harness};
@@ -529,9 +530,7 @@ impl Printer {
                 let msg = s.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default();
                 self.line(&format!("[state {state}{msg}]"));
             }
-            Event::ItemStarted {
-                id, kind, extensions, ..
-            } => {
+            Event::ItemStarted { id, kind, detail, .. } => {
                 self.kinds.insert(id.clone(), *kind);
                 if self.mid_line {
                     println!();
@@ -542,7 +541,7 @@ impl Printer {
                     ItemKind::AgentMessage | ItemKind::UserMessage | ItemKind::Reasoning
                 ) {
                     let label = format!("{kind:?}");
-                    self.line(&format!("→ {label} {}", summary(extensions)));
+                    self.line(&format!("→ {label} {}", summary(detail)));
                 }
             }
             Event::ItemDelta { id, text } => {
@@ -640,17 +639,20 @@ impl Printer {
 }
 
 /// A short one-line view of a tool item's native details.
-fn summary(v: &serde_json::Value) -> String {
-    for key in ["title", "command", "name", "path"] {
-        if let Some(s) = v.get(key).and_then(|s| s.as_str()) {
-            return truncate(s);
-        }
-    }
-    if v.is_null() {
-        String::new()
-    } else {
-        truncate(&v.to_string())
-    }
+fn summary(detail: &ItemDetail) -> String {
+    let s = match detail {
+        ItemDetail::Tool { tool, title, .. } if title.is_empty() => tool.clone(),
+        ItemDetail::Tool { tool, title, .. } => format!("{tool}: {title}"),
+        ItemDetail::Command { command, .. } => command.clone(),
+        ItemDetail::FileChange { files, .. } => files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        ItemDetail::Subagent { description, .. } => description.clone(),
+        ItemDetail::Text => String::new(),
+    };
+    truncate(&s)
 }
 
 fn truncate(s: &str) -> String {

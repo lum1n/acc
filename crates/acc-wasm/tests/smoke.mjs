@@ -81,7 +81,7 @@ desk.onStatus(`alive 3 ${hi.length}`, Date.now());
 const updates = desk.feed(hi, Date.now());
 assert.ok(updates.length > 0 && updates.every((u) => u.replay));
 assert.equal(desk.offset(), hi.length);
-assert.ok(desk.items().some((i) => i.kind === "agent_message" && i.text === "hi" && i.detail));
+assert.ok(desk.items().some((i) => i.kind === "agent_message" && i.text === "hi" && i.detail?.type === "text"));
 assert.equal(desk.item("nope"), null);
 
 const out = desk.command({ type: "prompt", text: "again" });

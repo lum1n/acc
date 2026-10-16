@@ -1,8 +1,8 @@
 //! FFI mirrors of acc-core types, with conversions.
 //!
-//! Harness-native JSON (`extensions`, tool input) crosses as JSON strings, so
-//! UIs can light up harness-specific features without the bindings knowing
-//! every shape.
+//! Items cross typed ([`AccItemDetail`]), the same shape whatever the
+//! harness. Free-form JSON (tool arguments, the harness's own frames) crosses
+//! as JSON strings.
 
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ use acc_core::event::{
     Quota, QuotaWindow, Usage,
 };
 use acc_core::harness::{Availability, Compat, Launcher};
-use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag};
+use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag, ToolKind};
 use acc_core::policy::{Decision, Rule};
 use acc_core::session::{LaunchRequest, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
@@ -52,6 +52,10 @@ mirror_enum!(AccBlockKind <=> BlockKind { Permission, Question, Auth });
 mirror_enum!(AccStateSource <=> StateSource { Heuristic, ScreenMatch, Transcript, Osc7501, Native });
 mirror_enum!(AccItemKind <=> ItemKind { UserMessage, AgentMessage, Reasoning, ToolCall, CommandExecution, FileChange, Subagent });
 mirror_enum!(AccItemStatus <=> ItemStatus { Running, Completed, Failed });
+mirror_enum!(
+    /// ACC's kind of tool, the same on every harness.
+    AccToolKind <=> ToolKind { Shell, Edit, Read, Fetch, Mcp, Other }
+);
 mirror_enum!(AccOptionId <=> OptionId { Model, Effort, Mode, Permission });
 mirror_enum!(AccApply <=> Apply { Live, NextTurn, Restart });
 mirror_enum!(AccCommandSource <=> CommandSource { Builtin, Custom, Skill, Mcp, Plugin, Acc });
@@ -255,24 +259,32 @@ pub enum AccEvent {
     StateChanged {
         state: AccSessionState,
     },
+    /// An item began; `detail` is what it is so far.
     ItemStarted {
         id: String,
         kind: AccItemKind,
         /// The `Subagent` item this one runs inside, for child conversations.
         parent: Option<String>,
-        extensions_json: String,
+        detail: AccItemDetail,
+        /// The harness's own JSON for this frame; for debugging only.
+        native_json: String,
     },
     ItemDelta {
         id: String,
         text: String,
     },
+    /// `detail` replaces the item's previous detail whole.
     ItemUpdated {
         id: String,
-        extensions_json: String,
+        detail: AccItemDetail,
+        native_json: String,
     },
+    /// `detail` replaces the item's previous detail whole.
     ItemCompleted {
         id: String,
-        extensions_json: String,
+        status: AccItemStatus,
+        detail: AccItemDetail,
+        native_json: String,
     },
     PermissionRequested {
         permission: AccPermission,
@@ -325,21 +337,31 @@ impl From<Event> for AccEvent {
                 id,
                 kind,
                 parent,
-                extensions,
+                detail,
+                native,
             } => Self::ItemStarted {
                 id,
                 kind: kind.into(),
                 parent,
-                extensions_json: json(&extensions),
+                detail: detail.into(),
+                native_json: json(&native),
             },
             Event::ItemDelta { id, text } => Self::ItemDelta { id, text },
-            Event::ItemUpdated { id, extensions } => Self::ItemUpdated {
+            Event::ItemUpdated { id, detail, native } => Self::ItemUpdated {
                 id,
-                extensions_json: json(&extensions),
+                detail: detail.into(),
+                native_json: json(&native),
             },
-            Event::ItemCompleted { id, extensions } => Self::ItemCompleted {
+            Event::ItemCompleted {
                 id,
-                extensions_json: json(&extensions),
+                status,
+                detail,
+                native,
+            } => Self::ItemCompleted {
+                id,
+                status: status.into(),
+                detail: detail.into(),
+                native_json: json(&native),
             },
             Event::PermissionRequested {
                 request_id,
@@ -471,28 +493,37 @@ impl From<FileDiff> for AccFileDiff {
     }
 }
 
-/// What an item is, in a harness-independent shape.
+/// What an item is, the same shape on every harness. `tool` is the
+/// harness's own name for the tool (`Bash`, `commandExecution`, `execute`).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum AccItemDetail {
     /// A message or reasoning; the item's text is the content.
     Text,
     Tool {
-        name: String,
+        tool: String,
+        kind: AccToolKind,
+        /// One-line summary of what the tool acts on (path, pattern, URL...).
         title: String,
+        /// The tool's arguments as JSON.
         input_json: String,
         output: Option<String>,
+        /// Files the tool acts on.
+        paths: Vec<String>,
     },
     Command {
+        tool: String,
         command: String,
         cwd: Option<String>,
         output: String,
         exit_code: Option<i32>,
     },
     FileChange {
+        tool: String,
         files: Vec<AccFileDiff>,
     },
     /// A run of another agent. Its child conversation is `children(id)`.
     Subagent {
+        tool: String,
         /// Agent type or name (Claude `subagent_type`, opencode agent, Codex nickname).
         agent: Option<String>,
         description: String,
@@ -504,6 +535,8 @@ pub enum AccItemDetail {
         /// The final report, or the latest summary while it runs.
         output: Option<String>,
         model: Option<String>,
+        /// It runs on after its turn ends, until it reports back.
+        background: bool,
     },
 }
 
@@ -512,6 +545,7 @@ impl From<ItemDetail> for AccItemDetail {
         match d {
             ItemDetail::Text => Self::Text,
             ItemDetail::Subagent {
+                tool,
                 agent,
                 description,
                 prompt,
@@ -519,7 +553,9 @@ impl From<ItemDetail> for AccItemDetail {
                 status,
                 output,
                 model,
+                background,
             } => Self::Subagent {
+                tool,
                 agent,
                 description,
                 prompt,
@@ -527,30 +563,38 @@ impl From<ItemDetail> for AccItemDetail {
                 status,
                 output,
                 model,
+                background,
             },
             ItemDetail::Tool {
-                name,
+                tool,
+                kind,
                 title,
                 input,
                 output,
+                paths,
             } => Self::Tool {
-                name,
+                tool,
+                kind: kind.into(),
                 title,
                 input_json: json(&input),
                 output,
+                paths,
             },
             ItemDetail::Command {
+                tool,
                 command,
                 cwd,
                 output,
                 exit_code,
             } => Self::Command {
+                tool,
                 command,
                 cwd,
                 output,
                 exit_code,
             },
-            ItemDetail::FileChange { files } => Self::FileChange {
+            ItemDetail::FileChange { tool, files } => Self::FileChange {
+                tool,
                 files: files.into_iter().map(Into::into).collect(),
             },
         }
@@ -565,20 +609,20 @@ pub struct AccItem {
     pub status: AccItemStatus,
     pub text: String,
     pub detail: AccItemDetail,
-    /// The merged harness-native extensions as JSON.
-    pub ext_json: String,
+    /// The harness's own JSON, every frame merged; for debugging only.
+    pub native_json: String,
     pub parent: Option<String>,
     pub seq: u64,
 }
 
-pub fn item(i: &Item, h: Harness) -> AccItem {
+pub fn item(i: &Item) -> AccItem {
     AccItem {
         id: i.id.clone(),
         kind: i.kind.into(),
         status: i.status.into(),
         text: i.text.clone(),
-        detail: i.detail(h).into(),
-        ext_json: json(&i.ext),
+        detail: i.detail.clone().into(),
+        native_json: json(&i.native),
         parent: i.parent.clone(),
         seq: i.seq,
     }

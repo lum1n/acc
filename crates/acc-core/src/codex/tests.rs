@@ -3,6 +3,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::*;
+use crate::item::ItemDetail;
 
 const HANDSHAKE: &str = include_str!("../../tests/fixtures/codex/handshake.ndjson");
 const TURN: &str = include_str!("../../tests/fixtures/codex/turn-network-error.ndjson");
@@ -246,7 +247,8 @@ fn turn_lifecycle_and_sticky_done() {
         id: "a1".into(),
         kind: ItemKind::AgentMessage,
         parent: None,
-        extensions: json!({"type": "agentMessage", "id": "a1", "text": ""})
+        detail: ItemDetail::Text,
+        native: json!({"type": "agentMessage", "id": "a1", "text": ""})
     }));
     assert!(events.contains(&Event::ItemDelta {
         id: "a1".into(),
@@ -812,7 +814,6 @@ fn prompts_with_images_are_data_url_inputs() {
 /// second `subAgentActivity` (`kind: completed`) says it stopped.
 #[test]
 fn recorded_subagent_is_one_item_with_its_childs_conversation() {
-    use crate::item::ItemDetail;
     use crate::transcript::{ItemStatus, Transcript};
     let mut d = CodexDriver::default();
     d.handshake();
@@ -833,7 +834,7 @@ fn recorded_subagent_is_one_item_with_its_childs_conversation() {
     );
     let subs: Vec<_> = t
         .subagents()
-        .filter(|i| i.ext["type"] == "subAgentActivity")
+        .filter(|i| i.native["type"] == "subAgentActivity")
         .collect();
     assert_eq!(subs.len(), 1, "the completion activity isn't an item of its own");
     let sub = subs[0];
@@ -845,7 +846,7 @@ fn recorded_subagent_is_one_item_with_its_childs_conversation() {
         output,
         model,
         ..
-    } = sub.detail(Harness::Codex)
+    } = sub.detail.clone()
     else {
         panic!()
     };
@@ -891,7 +892,6 @@ fn recorded_subagent_is_one_item_with_its_childs_conversation() {
 /// `wait`; the spawn itself is recorded above.
 #[test]
 fn collab_spawn_is_a_subagent_and_child_thread_items_belong_to_it() {
-    use crate::item::ItemDetail;
     use crate::transcript::Transcript;
     let mut d = started();
     let child = "019a0000-0000-7000-8000-00000000c41d";
@@ -970,7 +970,7 @@ fn collab_spawn_is_a_subagent_and_child_thread_items_belong_to_it() {
         prompt,
         model,
         ..
-    } = sub.detail(Harness::Codex)
+    } = sub.detail.clone()
     else {
         panic!()
     };

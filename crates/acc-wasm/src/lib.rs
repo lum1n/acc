@@ -24,7 +24,6 @@ use acc_core::detached::SessionDir;
 use acc_core::harness::LaunchSpec;
 use acc_core::live::{self as core_session, Opening};
 use acc_core::state::SessionState;
-use acc_core::transcript::Item;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -86,7 +85,71 @@ export interface SessionState {
 }
 
 export type ItemKind =
-  | "user_message" | "agent_message" | "reasoning" | "tool_call" | "command_execution" | "file_change";
+  | "user_message" | "agent_message" | "reasoning" | "tool_call" | "command_execution" | "file_change"
+  | "subagent";
+
+export type ItemStatus = "running" | "completed" | "failed";
+
+export type ToolKind = "shell" | "edit" | "read" | "fetch" | "mcp" | "other";
+
+export interface FileDiff {
+  path: string;
+  old_path: string | null;
+  kind: "add" | "delete" | "update" | "rename";
+  hunks: {
+    old_start: number;
+    old_lines: number;
+    new_start: number;
+    new_lines: number;
+    lines: { tag: "context" | "add" | "remove"; text: string }[];
+  }[];
+  added: number;
+  removed: number;
+}
+
+/**
+ * What an item is, the same shape on every harness. `tool` is the
+ * harness's own name for the tool (`Bash`, `commandExecution`, `execute`).
+ */
+export type ItemDetail =
+  | { type: "text" }
+  | {
+      type: "tool";
+      tool: string;
+      kind: ToolKind;
+      title: string;
+      /** The tool's arguments. */
+      input: unknown;
+      output: string | null;
+      paths?: string[];
+    }
+  | { type: "command"; tool: string; command: string; cwd: string | null; output: string; exit_code: number | null }
+  | { type: "file_change"; tool: string; files: FileDiff[] }
+  | {
+      type: "subagent";
+      tool: string;
+      agent: string | null;
+      description: string;
+      prompt: string | null;
+      child: string | null;
+      status: string | null;
+      output: string | null;
+      model: string | null;
+      /** Runs on after its turn ends, until it reports back. */
+      background?: boolean;
+    };
+
+export interface Item {
+  id: string;
+  kind: ItemKind;
+  status: ItemStatus;
+  text: string;
+  detail: ItemDetail;
+  /** The harness's own JSON, every frame merged; for debugging only. */
+  native: unknown;
+  parent: string | null;
+  seq: number;
+}
 
 export interface Usage {
   input_tokens: number | null;
@@ -179,10 +242,10 @@ export interface UsageRollup {
 export type Event =
   | { type: "session_started"; harness: HarnessId; native_id: string; model: string | null }
   | ({ type: "state_changed" } & SessionState)
-  | { type: "item_started"; id: string; kind: ItemKind; extensions?: unknown }
+  | { type: "item_started"; id: string; kind: ItemKind; parent?: string; detail: ItemDetail; native?: unknown }
   | { type: "item_delta"; id: string; text: string }
-  | { type: "item_updated"; id: string; extensions?: unknown }
-  | { type: "item_completed"; id: string; extensions?: unknown }
+  | { type: "item_updated"; id: string; detail: ItemDetail; native?: unknown }
+  | { type: "item_completed"; id: string; status: ItemStatus; detail: ItemDetail; native?: unknown }
   | { type: "permission_requested"; request_id: string; title: string; options: PermissionOption[] }
   | { type: "permission_resolved"; request_id: string }
   | ({ type: "usage" } & Usage)
@@ -449,6 +512,27 @@ impl Session {
     pub fn options(&self) -> Result<JsValue, JsError> {
         to_js(self.inner.options())
     }
+
+    /// Every `Item` the events so far described.
+    pub fn items(&self) -> JsValue {
+        crate::session::items(self.inner.transcript().items().iter())
+    }
+
+    /// One `Item` by its id, once its `item_started` has been received.
+    pub fn item(&self, id: &str) -> JsValue {
+        js(&self.inner.transcript().get(id))
+    }
+
+    /// The main conversation: items that didn't run inside a subagent.
+    #[wasm_bindgen(js_name = topLevelItems)]
+    pub fn top_level_items(&self) -> JsValue {
+        crate::session::items(self.inner.transcript().top_level())
+    }
+
+    /// The child conversation of the `subagent` item `parent`.
+    pub fn children(&self, parent: &str) -> JsValue {
+        crate::session::items(self.inner.transcript().children(parent))
+    }
 }
 
 /// Shell scripts for a detached, disconnect-proof session under
@@ -578,18 +662,6 @@ pub(crate) fn harness(name: &str) -> Result<Harness, JsValue> {
                 || h.id() == name
         })
         .ok_or_else(|| error("InvalidArgument", &format!("unknown harness {name:?}")))
-}
-
-/// An item as the core serializes it, plus its harness-independent `detail`.
-pub(crate) fn item_json(i: &Item, h: Harness) -> serde_json::Value {
-    let mut v = serde_json::to_value(i).unwrap_or_default();
-    if let Some(o) = v.as_object_mut() {
-        o.insert(
-            "detail".into(),
-            serde_json::to_value(i.detail(h)).unwrap_or_default(),
-        );
-    }
-    v
 }
 
 /// Byte offsets as JS numbers (exact up to 2^53).

@@ -1,12 +1,14 @@
 //! The normalized event stream every driver produces.
 //!
-//! Native details that don't fit the common model ride along in `extensions`
-//! rather than being dropped, so a UI can light up harness-specific features.
+//! Items come typed ([`ItemDetail`]) whatever the harness. The harness's own
+//! JSON rides along in `native` rather than being dropped, for debugging and
+//! harness-specific UI.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::Harness;
+use crate::item::ItemDetail;
 use crate::state::{BlockKind, SessionState};
 
 fn permission_kind() -> BlockKind {
@@ -27,6 +29,7 @@ pub enum Event {
         model: Option<String>,
     },
     StateChanged(SessionState),
+    /// An item began. `detail` is its harness-independent view so far.
     ItemStarted {
         id: ItemId,
         kind: ItemKind,
@@ -34,23 +37,32 @@ pub enum Event {
         /// item in the same transcript), when it isn't the main conversation's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<ItemId>,
+        detail: ItemDetail,
+        /// The harness's own JSON for this frame, for debugging and
+        /// harness-specific UI. Nothing in ACC's model depends on it.
         #[serde(default, skip_serializing_if = "Value::is_null")]
-        extensions: Value,
+        native: Value,
     },
+    /// Text appended to an item: message content, reasoning, or output.
     ItemDelta {
         id: ItemId,
         text: String,
     },
     /// An item changed (status, content, diff) without finishing yet.
+    /// `detail` replaces the previous one whole.
     ItemUpdated {
         id: ItemId,
+        detail: ItemDetail,
         #[serde(default, skip_serializing_if = "Value::is_null")]
-        extensions: Value,
+        native: Value,
     },
+    /// An item finished. `detail` replaces the previous one whole.
     ItemCompleted {
         id: ItemId,
+        status: ItemStatus,
+        detail: ItemDetail,
         #[serde(default, skip_serializing_if = "Value::is_null")]
-        extensions: Value,
+        native: Value,
     },
     /// The harness is waiting for an approval. Answer with the request id.
     PermissionRequested {
@@ -119,6 +131,14 @@ pub enum ItemKind {
     /// collab tools, opencode's `task`, pi's `subagent`). Items of the child
     /// conversation carry this item's id as their `parent`.
     Subagent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemStatus {
+    Running,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

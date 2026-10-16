@@ -15,6 +15,7 @@ use crate::event::Event;
 use crate::harness::{Harness, LaunchSpec};
 use crate::pi::PiDriver;
 use crate::state::{SessionState, StateTracker};
+use crate::transcript::Transcript;
 
 /// How long a higher-fidelity state wins before a lower one may replace it.
 pub const DEFAULT_STALE_AFTER_MS: u64 = 30_000;
@@ -79,6 +80,8 @@ pub struct Session {
     /// A model to select over the protocol at start, for harnesses whose
     /// launch command doesn't take one (pi).
     start_model: Option<String>,
+    /// Every item the events so far described.
+    transcript: Transcript,
 }
 
 impl Session {
@@ -143,6 +146,7 @@ impl Session {
             tracker: StateTracker::new(DEFAULT_STALE_AFTER_MS),
             launch,
             start_model,
+            transcript: Transcript::new(),
         }
     }
 
@@ -181,10 +185,12 @@ impl Session {
     /// stamps state changes, since the core has no clock.
     pub fn receive(&mut self, bytes: &[u8], now_ms: u64) -> Received {
         let d = self.driver.get_mut();
-        let mut events = d.on_output(bytes);
+        let got = d.on_output(bytes);
         let transmit = d.poll_transmit();
-        for event in &mut events {
-            self.note(event, now_ms);
+        let mut events = Vec::with_capacity(got.len());
+        for mut event in got {
+            self.note(&mut event, now_ms);
+            self.follow(event, &mut events);
         }
         Received { events, transmit }
     }
@@ -207,7 +213,27 @@ impl Session {
             observed_at_ms: 0,
         });
         self.note(&mut state, now_ms);
-        vec![state, Event::Exited { code }]
+        let mut events = Vec::new();
+        self.follow(state, &mut events);
+        self.follow(Event::Exited { code }, &mut events);
+        events
+    }
+
+    /// The items the session's events described so far, each with its
+    /// text and typed detail.
+    pub fn transcript(&self) -> &Transcript {
+        &self.transcript
+    }
+
+    /// Applies `event` to the transcript and passes it on, after completions
+    /// for the items it leaves unfinished for good (a turn ended without
+    /// completing every tool call), so the events tell the same story.
+    fn follow(&mut self, event: Event, out: &mut Vec<Event>) {
+        for change in self.transcript.settle(&event) {
+            out.push(self.transcript.completion(&change));
+        }
+        self.transcript.apply(&event);
+        out.push(event);
     }
 
     /// Merges a state the embedder saw outside the harness's output.
@@ -314,6 +340,58 @@ mod tests {
         let s = Session::new(cfg);
         assert_eq!(s.native_id(), Some("abc"));
         assert!(s.launch_spec().args.ends_with(&["--resume".into(), "abc".into()]));
+    }
+
+    #[test]
+    fn the_transcript_follows_the_events() {
+        use crate::event::{ItemKind, ItemStatus};
+        use crate::item::ItemDetail;
+        const PERMISSION: &str = include_str!("../tests/fixtures/claude/permission-deny.ndjson");
+        let mut s = Session::new(SessionConfig::new(Harness::Claude, "/tmp"));
+        let mut events = Vec::new();
+        for line in PERMISSION.lines() {
+            events.extend(s.receive(format!("{line}\n").as_bytes(), 1).events);
+        }
+        let id = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ItemStarted {
+                    id,
+                    kind: ItemKind::CommandExecution,
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("the fixture runs a Bash call");
+        let item = s.transcript().get(&id).expect("the transcript kept it");
+        assert_eq!(item.status, ItemStatus::Failed);
+        let ItemDetail::Command { command, output, .. } = &item.detail else {
+            panic!("expected a command, got {:?}", item.detail)
+        };
+        assert!(command.contains("acc-probe.txt"));
+        assert!(output.contains("Denied"), "{output}");
+        assert!(
+            s.transcript()
+                .items()
+                .iter()
+                .any(|i| i.kind == ItemKind::AgentMessage)
+        );
+        assert_eq!(s.exited(Some(0), 2).len(), 2);
+    }
+
+    #[test]
+    fn items_left_running_at_turn_end_complete_in_the_events() {
+        let mut s = Session::new(SessionConfig::new(Harness::Pi, "/tmp"));
+        let start =
+            r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"read","args":{"path":"a"}}"#;
+        s.receive(format!("{start}\n").as_bytes(), 1);
+        let got = s.exited(None, 2);
+        assert!(
+            matches!(&got[0], Event::ItemCompleted { id, detail: crate::item::ItemDetail::Tool { tool, .. }, .. }
+                if id == "t1" && tool == "read"),
+            "{got:?}"
+        );
+        assert_eq!(got.len(), 3);
     }
 
     #[test]

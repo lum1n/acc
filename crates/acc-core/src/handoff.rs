@@ -30,7 +30,7 @@ pub fn primer(
     next: Option<&str>,
     budget: usize,
 ) -> String {
-    let entries: Vec<String> = transcript.top_level().filter_map(|i| entry(i, from)).collect();
+    let entries: Vec<String> = transcript.top_level().filter_map(entry).collect();
     let mut kept = Vec::new();
     let mut used = 0;
     for e in entries.iter().rev() {
@@ -72,14 +72,14 @@ pub fn primer(
 
 /// One item as a primer entry, or `None` for items with nothing to carry
 /// over (reasoning, empty messages).
-fn entry(item: &Item, harness: Harness) -> Option<String> {
+fn entry(item: &Item) -> Option<String> {
     let text = item.text.trim();
     let e = match item.kind {
         ItemKind::Reasoning => return None,
         ItemKind::UserMessage if !text.is_empty() => format!("[user]\n{}", clip(text)),
         ItemKind::AgentMessage if !text.is_empty() => format!("[assistant]\n{}", clip(text)),
         ItemKind::UserMessage | ItemKind::AgentMessage => return None,
-        _ => match item.detail(harness) {
+        _ => match item.detail.clone() {
             ItemDetail::Command {
                 command,
                 output,
@@ -97,18 +97,18 @@ fn entry(item: &Item, harness: Harness) -> Option<String> {
                     format!("[ran] {command}{status}\n{}", clip(output))
                 }
             }
-            ItemDetail::FileChange { files } if !files.is_empty() => {
+            ItemDetail::FileChange { files, .. } if !files.is_empty() => {
                 let paths: Vec<String> = files
                     .iter()
                     .map(|f| format!("{} (+{} -{})", f.path, f.added, f.removed))
                     .collect();
                 format!("[changed files] {}", paths.join(", "))
             }
-            ItemDetail::Tool { name, title, .. } => {
+            ItemDetail::Tool { tool, title, .. } => {
                 if title.is_empty() {
-                    format!("[tool] {name}")
+                    format!("[tool] {tool}")
                 } else {
-                    format!("[tool] {name}: {title}")
+                    format!("[tool] {tool}: {title}")
                 }
             }
             ItemDetail::Subagent {
@@ -145,26 +145,21 @@ fn clip(text: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::event::Event;
+    use crate::item::ItemFeed;
     use serde_json::{Value, json};
 
+    /// A Codex item, through the feed its driver uses.
     fn add(t: &mut Transcript, id: &str, kind: ItemKind, text: &str, ext: Value) {
-        t.apply(&Event::ItemStarted {
-            id: id.into(),
-            kind,
-            parent: None,
-            extensions: Value::Null,
-        });
+        let mut feed = ItemFeed::new(Harness::Codex);
+        let mut out = Vec::new();
+        feed.start(id, kind, None, Value::Null, &mut out);
         if !text.is_empty() {
-            t.apply(&Event::ItemDelta {
-                id: id.into(),
-                text: text.into(),
-            });
+            feed.delta(id, text, &mut out);
         }
-        t.apply(&Event::ItemCompleted {
-            id: id.into(),
-            extensions: ext,
-        });
+        feed.complete(id, ext, &mut out);
+        for e in &out {
+            t.apply(e);
+        }
     }
 
     #[test]

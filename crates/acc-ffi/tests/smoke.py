@@ -60,6 +60,17 @@ def main() -> None:
     for kind in ("SESSION_STARTED", "STATE_CHANGED", "PERMISSION_REQUESTED", "ITEM_DELTA", "TURN_COMPLETED"):
         assert kind in kinds, f"no {kind} event in {sorted(kinds)}"
     assert answered is not None
+    # The live event stream carries items typed, whatever the harness.
+    assert any(
+        e.is_ITEM_STARTED()
+        and e.detail.is_COMMAND()
+        and e.detail.tool == "Bash"
+        and e.detail.command == "touch acc-probe.txt"
+        for e in events
+    ), "the Bash call isn't a typed command"
+    bash = next(i for i in session.items() if i.detail.is_COMMAND())
+    assert bash.status == acc.AccItemStatus.FAILED and bash.detail.tool == "Bash"
+    assert session.item(bash.id) == bash
     assert session.native_id() == "5f3c1a52-8a3e-4c1e-9d47-2b6f0e9a7c11"
     assert session.commands(), "palette is empty"
     assert any(o.id == acc.OptionId.PERMISSION for o in session.options())

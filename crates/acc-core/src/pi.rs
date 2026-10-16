@@ -30,6 +30,7 @@ use crate::event::{
     Usage,
 };
 use crate::harness::{Harness, LaunchSpec};
+use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
 
@@ -64,6 +65,8 @@ enum Dialog {
 /// Drives `pi --mode rpc`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct PiDriver {
+    /// Every item the harness reported, for their typed detail.
+    items: ItemFeed,
     framer: LineFramer,
     id_prefix: String,
     next_id: u64,
@@ -97,6 +100,7 @@ impl Default for PiDriver {
 impl PiDriver {
     pub fn new() -> Self {
         Self {
+            items: ItemFeed::new(Harness::Pi),
             framer: LineFramer::new(MAX_LINE),
             id_prefix: "acc".into(),
             next_id: 0,
@@ -221,11 +225,13 @@ impl PiDriver {
                 self.resume_working(out);
                 let id = str_field(&v, "toolCallId");
                 let tool = str_field(&v, "toolName");
-                out.push(Event::ItemStarted {
+                self.items.start(
                     id,
-                    kind: tool_kind(&tool),
-                    parent: None, extensions: json!({ "tool": tool, "args": v.get("args").cloned().unwrap_or(Value::Null) }),
-                });
+                    tool_kind(&tool),
+                    None,
+                    json!({ "tool": tool, "args": v.get("args").cloned().unwrap_or(Value::Null) }),
+                    out,
+                );
             }
             "tool_execution_update" => self.resume_working(out),
             "tool_execution_end" => {
@@ -240,25 +246,18 @@ impl PiDriver {
                 let details = v.pointer("/result/details");
                 if let Some(run) = async_run(&str_field(&v, "toolName"), details, is_error) {
                     self.background.insert(run.to_owned(), id.clone());
-                    out.push(Event::ItemUpdated { id, extensions });
+                    self.items.update(id, extensions, out);
                 } else {
-                    out.push(Event::ItemCompleted { id, extensions });
+                    self.items.complete(id, extensions, out);
                 }
             }
             "bash_execution_update" => {
                 let id = format!("bash-{}", str_field(&v, "id"));
                 if self.shell_items.insert(id.clone(), true).is_none() {
-                    out.push(Event::ItemStarted {
-                        id: id.clone(),
-                        kind: ItemKind::CommandExecution,
-                        parent: None,
-                        extensions: Value::Null,
-                    });
+                    self.items
+                        .start(id.clone(), ItemKind::CommandExecution, None, Value::Null, out);
                 }
-                out.push(Event::ItemDelta {
-                    id,
-                    text: str_field(&v, "delta"),
-                });
+                self.items.delta(id, str_field(&v, "delta"), out);
             }
             "compaction_start" => {
                 out.push(self.state(RunState::Working { progress: None }, Some("compacting".into())));
@@ -319,10 +318,7 @@ impl PiDriver {
         if v.get("success").and_then(Value::as_bool) != Some(true) {
             let id = id.to_owned();
             if self.shell_items.remove(&format!("bash-{id}")).is_some() {
-                out.push(Event::ItemCompleted {
-                    id: format!("bash-{id}"),
-                    extensions: Value::Null,
-                });
+                self.items.complete(format!("bash-{id}"), Value::Null, out);
             }
             out.push(Event::Notice {
                 message: format!("{command} failed: {}", str_field(v, "error")),
@@ -426,17 +422,10 @@ impl PiDriver {
                 let item = format!("bash-{id}");
                 if self.shell_items.remove(&item).is_none() {
                     // No output was streamed; still report the command.
-                    out.push(Event::ItemStarted {
-                        id: item.clone(),
-                        kind: ItemKind::CommandExecution,
-                        parent: None,
-                        extensions: Value::Null,
-                    });
+                    self.items
+                        .start(item.clone(), ItemKind::CommandExecution, None, Value::Null, out);
                 }
-                out.push(Event::ItemCompleted {
-                    id: item,
-                    extensions: data,
-                });
+                self.items.complete(item, data, out);
             }
             _ => {}
         }
@@ -515,15 +504,11 @@ impl PiDriver {
             Some("user") => {
                 self.msg_seq += 1;
                 let id = format!("u{}", self.msg_seq);
-                out.push(Event::ItemStarted {
-                    id: id.clone(),
-                    kind: ItemKind::UserMessage,
-                    parent: None,
-                    extensions: Value::Null,
-                });
+                self.items
+                    .start(id.clone(), ItemKind::UserMessage, None, Value::Null, out);
                 let text = user_text(msg.get("content"));
                 if !text.is_empty() {
-                    out.push(Event::ItemDelta { id, text });
+                    self.items.delta(id, text, out);
                 }
             }
             Some("assistant") => {
@@ -533,12 +518,8 @@ impl PiDriver {
                 self.current_msg = Some(id.clone());
                 // The start record already holds the first chunk, which is
                 // then repeated as a delta, so its content is ignored here.
-                out.push(Event::ItemStarted {
-                    id,
-                    kind: ItemKind::AgentMessage,
-                    parent: None,
-                    extensions: Value::Null,
-                });
+                self.items
+                    .start(id, ItemKind::AgentMessage, None, Value::Null, out);
             }
             _ => {}
         }
@@ -554,24 +535,13 @@ impl PiDriver {
         let idx = ev.get("contentIndex").and_then(Value::as_u64).unwrap_or(0);
         let reasoning = format!("{msg}.{idx}");
         match ev.get("type").and_then(Value::as_str) {
-            Some("text_delta") => out.push(Event::ItemDelta {
-                id: msg,
-                text: str_field(ev, "delta"),
-            }),
-            Some("thinking_start") => out.push(Event::ItemStarted {
-                id: reasoning,
-                kind: ItemKind::Reasoning,
-                parent: None,
-                extensions: Value::Null,
-            }),
-            Some("thinking_delta") => out.push(Event::ItemDelta {
-                id: reasoning,
-                text: str_field(ev, "delta"),
-            }),
-            Some("thinking_end") => out.push(Event::ItemCompleted {
-                id: reasoning,
-                extensions: Value::Null,
-            }),
+            Some("text_delta") => self.items.delta(msg, str_field(ev, "delta"), out),
+            Some("thinking_start") => {
+                self.items
+                    .start(reasoning, ItemKind::Reasoning, None, Value::Null, out)
+            }
+            Some("thinking_delta") => self.items.delta(reasoning, str_field(ev, "delta"), out),
+            Some("thinking_end") => self.items.complete(reasoning, Value::Null, out),
             _ => {}
         }
     }
@@ -579,11 +549,10 @@ impl PiDriver {
     fn on_message_end(&mut self, v: &Value, out: &mut Vec<Event>) {
         let Some(msg) = v.get("message") else { return };
         match msg.get("role").and_then(Value::as_str) {
-            Some("custom") => subagent_notify(&mut self.background, msg, out),
-            Some("user") => out.push(Event::ItemCompleted {
-                id: format!("u{}", self.msg_seq),
-                extensions: Value::Null,
-            }),
+            Some("custom") => subagent_notify(&mut self.items, &mut self.background, msg, out),
+            Some("user") => self
+                .items
+                .complete(format!("u{}", self.msg_seq), Value::Null, out),
             Some("assistant") => {
                 let Some(id) = self.current_msg.take() else { return };
                 let stop = msg.get("stopReason").and_then(Value::as_str).unwrap_or_default();
@@ -598,15 +567,16 @@ impl PiDriver {
                             .to_owned(),
                     );
                 }
-                out.push(Event::ItemCompleted {
+                self.items.complete(
                     id,
-                    extensions: json!({
+                    json!({
                         "provider": msg.get("provider"),
                         "model": msg.get("model"),
                         "stop_reason": stop,
                         "error": msg.get("errorMessage"),
                     }),
-                });
+                    out,
+                );
                 if let Some(u) = msg.get("usage") {
                     add_usage(&mut self.usage, u);
                     out.push(Event::Usage(self.usage.clone()));
@@ -1154,7 +1124,12 @@ pub fn async_run<'a>(tool: &str, details: Option<&'a Value>, is_error: bool) -> 
 /// pi-subagents' report of finished async runs (a `subagent-notify` custom
 /// message): completes the calls that launched them, with the report as
 /// their output.
-pub fn subagent_notify(background: &mut HashMap<String, String>, msg: &Value, out: &mut Vec<Event>) {
+pub fn subagent_notify(
+    items: &mut ItemFeed,
+    background: &mut HashMap<String, String>,
+    msg: &Value,
+    out: &mut Vec<Event>,
+) {
     if msg.get("customType").and_then(Value::as_str) != Some("subagent-notify") {
         return;
     }
@@ -1171,14 +1146,15 @@ pub fn subagent_notify(background: &mut HashMap<String, String>, msg: &Value, ou
             continue;
         };
         let failed = run.get("status").and_then(Value::as_str) != Some("completed");
-        out.push(Event::ItemCompleted {
+        items.complete(
             id,
-            extensions: json!({
+            json!({
                 "notify": run,
                 "result": {"content": [{"type": "text", "text": text}]},
                 "is_error": failed,
             }),
-        });
+            out,
+        );
     }
 }
 
@@ -1586,7 +1562,7 @@ mod tests {
                 if let Event::StateChanged(s) = &e {
                     states.push(s.state.clone());
                     if s.state == RunState::Waiting {
-                        while_waiting = t.get("call_1").map(|i| (i.status, i.detail(Harness::Pi)));
+                        while_waiting = t.get("call_1").map(|i| (i.status, i.detail.clone()));
                     }
                 }
             }
@@ -1605,7 +1581,7 @@ mod tests {
         assert!(matches!(detail, ItemDetail::Subagent { status: Some(s), .. } if s == "running"));
         let item = t.get("call_1").unwrap();
         assert_eq!(item.status, ItemStatus::Completed);
-        let ItemDetail::Subagent { status, output, .. } = item.detail(Harness::Pi) else {
+        let ItemDetail::Subagent { status, output, .. } = &item.detail else {
             panic!()
         };
         assert_eq!(status.as_deref(), Some("completed"));

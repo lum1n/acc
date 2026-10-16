@@ -32,6 +32,7 @@ fun main(args: Array<String>) {
     var answered = false
     var sawDelta = false
     var sawTurnEnd = false
+    var sawCommand = false
     var offset = 0
     while (offset < fixture.size) {
         val end = minOf(fixture.size, offset + 997)
@@ -46,6 +47,12 @@ fun main(args: Array<String>) {
                     check(String(bytes).contains(event.requestId), "answer carries request id")
                     answered = true
                 }
+                is Event.ItemStarted -> {
+                    val d = event.detail
+                    if (d is AccItemDetail.Command && d.tool == "Bash" && d.command == "touch acc-probe.txt") {
+                        sawCommand = true
+                    }
+                }
                 is Event.ItemDelta -> sawDelta = true
                 is Event.TurnCompleted -> sawTurnEnd = true
                 else -> {}
@@ -54,6 +61,7 @@ fun main(args: Array<String>) {
     }
 
     check(answered && sawDelta && sawTurnEnd, "permission, text and turn end")
+    check(sawCommand, "the Bash call as a typed command")
     check(session.nativeId() == "5f3c1a52-8a3e-4c1e-9d47-2b6f0e9a7c11", "native id")
     check(session.commands().isNotEmpty(), "command palette")
     check(session.state()?.source == StateSource.NATIVE, "native state")

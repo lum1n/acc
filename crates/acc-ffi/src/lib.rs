@@ -295,6 +295,30 @@ impl Session {
     pub fn options(&self) -> Vec<OptionDef> {
         lock(&self.inner).options().iter().map(OptionDef::from).collect()
     }
+
+    /// Every item the events so far described, with its text and detail.
+    pub fn items(&self) -> Vec<AccItem> {
+        lock(&self.inner).transcript().items().iter().map(item).collect()
+    }
+
+    /// One item by its id, once its `ItemStarted` has been received.
+    pub fn item(&self, id: String) -> Option<AccItem> {
+        lock(&self.inner).transcript().get(&id).map(item)
+    }
+
+    /// The main conversation: items that didn't run inside a subagent.
+    pub fn top_level_items(&self) -> Vec<AccItem> {
+        lock(&self.inner).transcript().top_level().map(item).collect()
+    }
+
+    /// The child conversation of the `Subagent` item `parent`.
+    pub fn children(&self, parent: String) -> Vec<AccItem> {
+        lock(&self.inner)
+            .transcript()
+            .children(&parent)
+            .map(item)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

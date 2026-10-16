@@ -47,7 +47,7 @@ pub const SPEC_VERSION: u32 = 1;
 
 /// Version of [`Session::snapshot`]. Bump it whenever a driver's state
 /// changes meaning without changing shape; older snapshots are then refused.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// After this long without news, a lower-fidelity state source may override.
 const STALE_MS: u64 = 30_000;
@@ -906,7 +906,7 @@ impl Session {
                 continue;
             }
             let item = p.item_id.as_deref().and_then(|id| self.transcript.get(id));
-            let request = Request::new(self.spec.harness, item, &p.input);
+            let request = Request::new(item, &p.input);
             let Some((decision, _)) = policy.decide(&request, &self.spec.cwd) else {
                 continue;
             };
@@ -993,7 +993,8 @@ impl Session {
             observed_at_ms: now_ms,
         }));
         self.apply(events, replay, now_ms, out);
-        out.extend(completions(self.transcript.close_running(), replay));
+        let closed = self.transcript.close_running();
+        out.extend(completions(closed, &self.transcript, replay));
     }
 
     fn apply(&mut self, events: Vec<Event>, replay: bool, now_ms: u64, out: &mut Vec<Update>) {
@@ -1063,7 +1064,8 @@ impl Session {
                 }
                 _ => {}
             }
-            out.extend(completions(self.transcript.settle(&event), replay));
+            let closed = self.transcript.settle(&event);
+            out.extend(completions(closed, &self.transcript, replay));
             let item = self.transcript.apply(&event);
             if self.spec.title.is_none()
                 && let Some(ItemChange::Completed { id }) = &item
@@ -1081,15 +1083,15 @@ impl Session {
 
 /// Updates for items [`Transcript`] closed itself, as if the harness had
 /// completed them.
-pub fn completions(changes: Vec<ItemChange>, replay: bool) -> impl Iterator<Item = Update> {
-    changes.into_iter().map(move |change| Update {
-        event: Event::ItemCompleted {
-            id: change.id().to_owned(),
-            extensions: Value::Null,
-        },
-        item: Some(change),
-        replay,
-    })
+pub fn completions(changes: Vec<ItemChange>, transcript: &Transcript, replay: bool) -> Vec<Update> {
+    changes
+        .into_iter()
+        .map(|change| Update {
+            event: transcript.completion(&change),
+            item: Some(change),
+            replay,
+        })
+        .collect()
 }
 
 fn merge_usage(into: &mut Usage, from: &Usage) {
