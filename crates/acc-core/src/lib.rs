@@ -43,6 +43,7 @@ pub mod handoff;
 pub mod harness;
 pub mod item;
 pub mod live;
+pub mod loadout;
 // Harness drivers.
 pub mod acp;
 pub mod ndjson;

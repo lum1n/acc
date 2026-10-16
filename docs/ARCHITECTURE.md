@@ -313,6 +313,31 @@ every other; writing a native session file instead (pi's or Claude's JSONL) woul
 undocumented formats and their versions, so ACC doesn't. Drivers alone refuse the command
 (`Unsupported`); the original session keeps running until the client stops it.
 
+**Skills and MCP servers.** Every harness reads skills from a directory of its own and MCP
+servers from a config file of its own, in its own spelling; `loadout` knows those places at user
+scope and per project and follows the script-plus-pure-function rule, so one client manages them on
+the Mac and on any SSH host alike. Skills live once in a store, `~/.agents/skills/<name>/SKILL.md`
+(or `<project>/.agents/skills`, the layout the `skills` CLI uses), and a harness has one when its
+skills directory holds a relative symlink to the store entry (`~/.claude/skills`, `~/.codex/skills`,
+`~/.cursor/skills`, `~/.copilot/skills`, `~/.config/opencode/skills`) or when it reads the store
+itself (pi, and every harness but Claude in a project). `skills::list_script` prints the store (each
+skill's front matter and files, the lock file) and every harness's directory, and `parse_listing`
+turns that into skills with a `LinkState` per harness (linked, native, missing, or foreign when a
+real directory or another symlink is in the way) and the skills living only inside a harness's
+directory; `link_script`, `unlink_script`, `adopt_script` (move one into the store, link left
+behind), `write_script` and `remove_script` change one thing each and exit `EXIT_CONFLICT` or
+`EXIT_NO_SKILL` when they can't. `skills::issues` checks a `SKILL.md`'s front matter the way the
+spec does. MCP servers stay in the harnesses' files, read into one `McpServer` shape (stdio, HTTP or
+SSE, enabled, plus the harness-specific extras) by `mcp::servers` from `mcp::read_script`'s output,
+and edited by `mcp::upsert`, `mcp::remove` and `mcp::set_enabled` in place: `loadout::json` splices
+one value of a JSON(C) file and `loadout::toml` one table of Codex's `config.toml`, so comments, key
+order and the unrelated state those files carry survive. `mcp::write_script` writes the result back
+after a copy to `~/.acc/backups/`. Claude (`~/.claude.json`, `.mcp.json`, `type: stdio/http/sse`),
+Codex (`[mcp_servers.<name>]`), Cursor (`mcp.json`, `url`, `disabled`), Copilot
+(`mcp-config.json`, `type: local`, `tools`), opencode (`opencode.json(c)`, `mcp`, `command` as an
+array, `enabled`) and pi (`~/.pi/agent/mcp.json`, `.pi/mcp.json`, `enabled`, no SSE); Claude's and
+Copilot's files can't keep a disabled server, so `set_enabled` is `Unsupported` there.
+
 `detached::fan_in_script` follows any number of logs and transcripts on one SSH channel, tagged per
 file, with byte offsets so a restarted follower resumes without loss; closing the channel takes all
 its processes down. One long-lived channel per host keeps a client inside sshd's per-connection

@@ -27,8 +27,10 @@ use acc_core::state::SessionState;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+pub mod loadout;
 pub mod session;
 
+pub use loadout::*;
 pub use session::*;
 
 #[wasm_bindgen(typescript_custom_section)]
