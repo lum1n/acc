@@ -6,6 +6,7 @@ edition.workspace = true
 # russh needs 1.89.
 rust-version = "1.89"
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 acc-core.workspace = true

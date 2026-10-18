@@ -156,3 +156,7 @@ they are stored in `spec.json` and carried over to relaunches.
 
 Apps that already ship a Rust static library should link `acc-ffi` into it (one `staticlib` crate
 depending on both) rather than adding a second Rust library to the binary.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
