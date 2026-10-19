@@ -29,7 +29,7 @@ use crate::command::{
     offer_option, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemId, ItemKind, PermissionOption, PermissionOptionKind, Usage};
+use crate::event::{Event, ItemId, ItemKind, PermissionOption, PermissionOptionKind, Plan, Usage};
 use crate::harness::{Harness, LaunchSpec, Protocol};
 use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
@@ -532,9 +532,14 @@ impl AcpDriver {
             }
             // A rejected fork or setting leaves the session as it was.
             Pending::Fork | Pending::SetConfig | Pending::SetMode { .. } | Pending::SetModel { .. } => {
-                out.push(Event::Native {
-                    kind: "request_failed".into(),
-                    payload: err.clone(),
+                let what = match kind {
+                    Pending::Fork => "fork the session",
+                    Pending::SetMode { .. } => "change the mode",
+                    Pending::SetModel { .. } => "change the model",
+                    _ => "change the setting",
+                };
+                out.push(Event::Notice {
+                    message: format!("Couldn't {what}: {message}"),
                 });
             }
         }
@@ -868,6 +873,7 @@ impl AcpDriver {
                     message: title.to_owned(),
                 });
             }
+            "plan" => out.push(Event::Plan(Plan::from_list(update.get("entries"), "content"))),
             _ => out.push(native(kind, update)),
         }
     }

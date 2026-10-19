@@ -3,6 +3,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::*;
+use crate::event::PlanStatus;
 use crate::item::ItemDetail;
 
 const HANDSHAKE: &str = include_str!("../../tests/fixtures/codex/handshake.ndjson");
@@ -640,13 +641,54 @@ fn late_client_adopts_thread_from_shared_log_and_ignores_foreign_errors() {
 }
 
 #[test]
-fn turn_diff_is_passed_through() {
+fn turn_diff_is_typed() {
     let mut d = started();
     let events = feed(
         &mut d,
         json!({"method": "turn/diff/updated", "params": {"threadId": THREAD, "turnId": "t1", "diff": "diff --git a/x b/x\n"}}),
     );
-    assert!(events.iter().any(|e| matches!(e, Event::Native { kind, payload } if kind == "turn_diff" && payload["diff"].as_str().is_some())));
+    assert!(events.contains(&Event::TurnDiff {
+        turn_id: Some("t1".into()),
+        diff: "diff --git a/x b/x\n".into(),
+    }));
+}
+
+#[test]
+fn turn_plan_is_typed_and_other_threads_plans_are_not_ours() {
+    let mut d = started();
+    let events = feed(
+        &mut d,
+        json!({"method": "turn/plan/updated", "params": {"threadId": THREAD, "turnId": "t1",
+            "explanation": "Two steps",
+            "plan": [{"step": "Read", "status": "completed"}, {"step": "Write", "status": "inProgress"},
+                     {"step": "Test", "status": "pending"}]}}),
+    );
+    let plan = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Plan(p) => Some(p),
+            _ => None,
+        })
+        .expect("plan");
+    assert_eq!(plan.explanation.as_deref(), Some("Two steps"));
+    let entries: Vec<_> = plan
+        .entries
+        .iter()
+        .map(|e| (e.content.as_str(), e.status))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("Read", PlanStatus::Completed),
+            ("Write", PlanStatus::InProgress),
+            ("Test", PlanStatus::Pending)
+        ]
+    );
+    let other = feed(
+        &mut d,
+        json!({"method": "turn/plan/updated", "params": {"threadId": "other", "turnId": "c1", "plan": []}}),
+    );
+    assert!(other.is_empty());
 }
 
 fn invoke(d: &mut CodexDriver, name: &str, args: &str) -> Result<Vec<Value>, DriverError> {

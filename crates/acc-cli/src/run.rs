@@ -21,7 +21,7 @@ use acc_core::claude::{ClaudeConfig, ClaudeDriver};
 use acc_core::codex::{CodexConfig, CodexDriver};
 use acc_core::command::{Command, OptionId};
 use acc_core::driver::{Driver, DriverError};
-use acc_core::event::ItemKind;
+use acc_core::event::{ItemKind, PlanStatus};
 use acc_core::harness::LaunchSpec;
 use acc_core::item::ItemDetail;
 use acc_core::pi::PiDriver;
@@ -612,6 +612,17 @@ impl Printer {
                     }
                 }
             }
+            Event::Plan(plan) => {
+                self.line("☰ plan");
+                for e in &plan.entries {
+                    let mark = match e.status {
+                        PlanStatus::Pending => ' ',
+                        PlanStatus::InProgress => '~',
+                        PlanStatus::Completed => 'x',
+                    };
+                    self.line(&format!("  [{mark}] {}", e.content));
+                }
+            }
             Event::Exited { code } => self.line(&format!(
                 "● exited ({})",
                 code.map_or("signal".into(), |c| c.to_string())
@@ -632,6 +643,7 @@ impl Printer {
             }
             Event::ItemUpdated { .. }
             | Event::ItemCompleted { .. }
+            | Event::TurnDiff { .. }
             | Event::Unrecognized { .. }
             | Event::Native { .. } => {}
         }

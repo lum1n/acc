@@ -99,6 +99,16 @@ pub enum Event {
     /// with the actions it offers. Answers a palette entry; a newer panel
     /// with the same `id` replaces the old one.
     Panel(Panel),
+    /// The agent's to-do list for the main conversation (Codex's turn plan,
+    /// ACP's plan, Claude's `TodoWrite`). A newer plan replaces the old one.
+    Plan(Plan),
+    /// The turn's aggregated unified diff so far, for clients that show one
+    /// per turn rather than per file-change item. A newer one replaces it.
+    TurnDiff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        diff: String,
+    },
     /// The last event of a turn, on every harness: the state the turn ended
     /// in (done, error, idle, waiting) has already been reported.
     TurnCompleted,
@@ -109,8 +119,8 @@ pub enum Event {
     Unrecognized {
         raw: String,
     },
-    /// A harness-native update with no common shape yet (plans, session
-    /// titles, extension notifications), passed through for UIs.
+    /// A harness-native update with no common shape yet (session titles,
+    /// extension notifications), passed through for UIs.
     Native {
         kind: String,
         #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -209,6 +219,89 @@ pub struct QuotaWindow {
     pub resets_at: Option<u64>,
     /// Harness status such as `allowed`, `allowed_warning` or `rejected`.
     pub status: Option<String>,
+}
+
+/// The agent's to-do list, whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    pub entries: Vec<PlanEntry>,
+    /// Why the plan is what it is, when the harness says (Codex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+impl Plan {
+    /// A harness's list of entries, each naming its text under `text`
+    /// (Codex's `step`, ACP's and Claude's `content`) beside `status` and,
+    /// on ACP, `priority`. Entries without text are dropped.
+    pub(crate) fn from_list(list: Option<&Value>, text: &str) -> Self {
+        let str_at = |e: &Value, k: &str| e.get(k).and_then(Value::as_str).map(str::to_owned);
+        let entries = list
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                Some(PlanEntry {
+                    content: str_at(e, text)?,
+                    status: PlanStatus::parse(str_at(e, "status").as_deref()),
+                    priority: PlanPriority::parse(str_at(e, "priority").as_deref()),
+                })
+            })
+            .collect();
+        Self {
+            entries,
+            explanation: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEntry {
+    pub content: String,
+    pub status: PlanStatus,
+    /// Only ACP agents rank their entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<PlanPriority>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl PlanStatus {
+    /// A harness's status string: ACP's and Claude's `in_progress`, Codex's
+    /// `inProgress`. Anything unknown counts as pending.
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("in_progress" | "inProgress") => Self::InProgress,
+            Some("completed") => Self::Completed,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPriority {
+    High,
+    Medium,
+    Low,
+}
+
+impl PlanPriority {
+    fn parse(s: Option<&str>) -> Option<Self> {
+        match s? {
+            "high" => Some(Self::High),
+            "medium" => Some(Self::Medium),
+            "low" => Some(Self::Low),
+            _ => None,
+        }
+    }
 }
 
 /// A dialog's content in a shape any client can draw: sections of rows,

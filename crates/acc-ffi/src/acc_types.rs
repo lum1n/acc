@@ -13,7 +13,7 @@ use acc_core::command::{
 use acc_core::detached::{FeedEntry, FeedPath, Listing, Status};
 use acc_core::event::{
     Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
-    Quota, QuotaWindow, Usage,
+    Plan, PlanPriority, PlanStatus, Quota, QuotaWindow, Usage,
 };
 use acc_core::harness::{Availability, Compat, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag, ToolKind};
@@ -57,6 +57,8 @@ mirror_enum!(
     AccToolKind <=> ToolKind { Shell, Edit, Read, Fetch, Mcp, Other }
 );
 mirror_enum!(AccOptionId <=> OptionId { Model, Effort, Mode, Permission });
+mirror_enum!(AccPlanStatus <=> PlanStatus { Pending, InProgress, Completed });
+mirror_enum!(AccPlanPriority <=> PlanPriority { High, Medium, Low });
 mirror_enum!(AccApply <=> Apply { Live, NextTurn, Restart });
 mirror_enum!(AccCommandSource <=> CommandSource { Builtin, Custom, Skill, Mcp, Plugin, Acc });
 mirror_enum!(AccFileChangeKind <=> FileChangeKind { Add, Delete, Update, Rename });
@@ -307,6 +309,15 @@ pub enum AccEvent {
     Panel {
         panel: AccPanel,
     },
+    /// The agent's to-do list; replaces the previous one.
+    Plan {
+        plan: AccPlan,
+    },
+    /// The turn's aggregated unified diff so far; replaces the previous one.
+    TurnDiff {
+        turn_id: Option<String>,
+        diff: String,
+    },
     TurnCompleted,
     Exited {
         code: Option<i32>,
@@ -388,6 +399,8 @@ impl From<Event> for AccEvent {
             Event::OptionsChanged => Self::OptionsChanged,
             Event::Notice { message } => Self::Notice { message },
             Event::Panel(panel) => Self::Panel { panel: panel.into() },
+            Event::Plan(plan) => Self::Plan { plan: plan.into() },
+            Event::TurnDiff { turn_id, diff } => Self::TurnDiff { turn_id, diff },
             Event::TurnCompleted => Self::TurnCompleted,
             Event::Exited { code } => Self::Exited { code },
             Event::Unrecognized { raw } => Self::Unrecognized { raw },
@@ -776,6 +789,38 @@ impl From<Panel> for AccPanel {
             id: p.id,
             title: p.title,
             sections: p.sections.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// The agent's to-do list, whole.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPlan {
+    pub entries: Vec<AccPlanEntry>,
+    /// Why the plan is what it is, when the harness says (Codex).
+    pub explanation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccPlanEntry {
+    pub content: String,
+    pub status: AccPlanStatus,
+    pub priority: Option<AccPlanPriority>,
+}
+
+impl From<Plan> for AccPlan {
+    fn from(p: Plan) -> Self {
+        Self {
+            entries: p
+                .entries
+                .into_iter()
+                .map(|e| AccPlanEntry {
+                    content: e.content,
+                    status: e.status.into(),
+                    priority: e.priority.map(Into::into),
+                })
+                .collect(),
+            explanation: p.explanation,
         }
     }
 }
