@@ -1212,6 +1212,17 @@ impl ItemFeed {
         });
     }
 
+    /// The detail of a tool call an approval is about: the item `id`'s
+    /// native JSON so far (when it started) with `native` merged over it,
+    /// without changing the item. `kind` is for an item that hasn't started.
+    pub fn preview(&self, id: Option<&str>, kind: ItemKind, native: &Value) -> ItemDetail {
+        let tracked = id.and_then(|id| self.items.get(id));
+        let mut ext = tracked.map(|t| t.ext.clone()).unwrap_or(Value::Null);
+        merge(&mut ext, native);
+        let kind = tracked.map_or(kind, |t| t.kind);
+        detail(self.harness, kind, &ext, tracked.map_or("", |t| t.text.as_str()))
+    }
+
     fn absorb(&mut self, id: &str, native: &Value) {
         if let Some(t) = self.items.get_mut(id) {
             if !is_message(t.kind) {

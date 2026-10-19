@@ -73,42 +73,13 @@ pub struct Request {
 
 impl Request {
     /// Reads a request from the tool call it is about (when the transcript
-    /// has it) and the request's own input.
-    pub fn new(item: Option<&Item>, input: &Value) -> Self {
+    /// has it) and the request's own typed detail
+    /// ([`crate::event::Event::PermissionRequested`]).
+    pub fn new(item: Option<&Item>, detail: Option<&ItemDetail>) -> Self {
         let mut r = Request::default();
-        if let Some(item) = item {
-            match &item.detail {
-                ItemDetail::Command { tool, command, .. } => {
-                    r.tool = Some(tool.clone());
-                    r.kind = Some(ToolKind::Shell);
-                    r.command = Some(command.clone()).filter(|c| !c.trim().is_empty());
-                }
-                ItemDetail::FileChange { tool, files } => {
-                    r.tool = Some(tool.clone());
-                    r.kind = Some(ToolKind::Edit);
-                    for f in files {
-                        push_path(&mut r.paths, &f.path);
-                    }
-                }
-                ItemDetail::Tool {
-                    tool,
-                    kind,
-                    input,
-                    paths,
-                    ..
-                } => {
-                    r.tool = Some(tool.clone());
-                    r.kind = Some(*kind);
-                    for p in paths {
-                        push_path(&mut r.paths, p);
-                    }
-                    read_input(input, &mut r);
-                }
-                ItemDetail::Subagent { tool, .. } => r.tool = Some(tool.clone()),
-                ItemDetail::Text => {}
-            }
+        for detail in item.map(|i| &i.detail).into_iter().chain(detail) {
+            r.read(detail);
         }
-        read_input(input, &mut r);
         if r.kind.is_none() {
             r.kind = r.tool.as_deref().map(ToolKind::of);
         }
@@ -116,6 +87,47 @@ impl Request {
             r.kind = Some(ToolKind::Shell);
         }
         r
+    }
+
+    /// Adds what `detail` says; what an earlier detail said stays.
+    fn read(&mut self, detail: &ItemDetail) {
+        let (tool, kind) = match detail {
+            ItemDetail::Command { tool, command, .. } => {
+                if self.command.is_none() {
+                    self.command = Some(command.clone()).filter(|c| !c.trim().is_empty());
+                }
+                (tool, Some(ToolKind::Shell))
+            }
+            ItemDetail::FileChange { tool, files } => {
+                for f in files {
+                    push_path(&mut self.paths, &f.path);
+                }
+                (tool, Some(ToolKind::Edit))
+            }
+            ItemDetail::Tool {
+                tool,
+                kind,
+                input,
+                paths,
+                ..
+            } => {
+                for p in paths {
+                    push_path(&mut self.paths, p);
+                }
+                if self.command.is_none() {
+                    self.command = command_arg(input);
+                }
+                (tool, Some(*kind))
+            }
+            ItemDetail::Subagent { tool, .. } => (tool, None),
+            ItemDetail::Text => return,
+        };
+        if self.tool.is_none() {
+            self.tool = Some(tool.clone());
+        }
+        if self.kind.is_none() {
+            self.kind = kind;
+        }
     }
 }
 
@@ -125,28 +137,23 @@ fn push_path(paths: &mut Vec<String>, p: &str) {
     }
 }
 
-fn read_input(input: &Value, r: &mut Request) {
-    for key in ["file_path", "path", "filePath", "notebook_path"] {
-        if let Some(p) = input.get(key).and_then(Value::as_str) {
-            push_path(&mut r.paths, p);
-        }
-    }
-    if r.command.is_none() {
-        r.command = match input.get("command") {
-            Some(Value::String(c)) if !c.trim().is_empty() => Some(c.clone()),
-            Some(Value::Array(parts)) => {
-                let words: Vec<&str> = parts.iter().filter_map(Value::as_str).collect();
-                // `["bash", "-lc", "<script>"]` is the script.
-                match words.as_slice() {
-                    [sh, flag, script] if sh.ends_with("sh") && flag.starts_with('-') => {
-                        Some((*script).to_owned())
-                    }
-                    _ if !words.is_empty() => Some(words.join(" ")),
-                    _ => None,
+/// The shell command among a tool's arguments, for tools ACC has no
+/// command shape for.
+fn command_arg(input: &Value) -> Option<String> {
+    match input.get("command") {
+        Some(Value::String(c)) if !c.trim().is_empty() => Some(c.clone()),
+        Some(Value::Array(parts)) => {
+            let words: Vec<&str> = parts.iter().filter_map(Value::as_str).collect();
+            // `["bash", "-lc", "<script>"]` is the script.
+            match words.as_slice() {
+                [sh, flag, script] if sh.ends_with("sh") && flag.starts_with('-') => {
+                    Some((*script).to_owned())
                 }
+                _ if !words.is_empty() => Some(words.join(" ")),
+                _ => None,
             }
-            _ => None,
-        };
+        }
+        _ => None,
     }
 }
 
@@ -564,16 +571,42 @@ mod tests {
     }
 
     #[test]
-    fn requests_read_codex_and_acp_inputs() {
-        let r = Request::new(None, &json!({"command": "cargo test", "cwd": "/w"}));
+    fn requests_read_the_request_detail() {
+        use crate::event::ItemKind;
+        use crate::item::ItemFeed;
+        let codex = ItemFeed::new(Harness::Codex).preview(
+            None,
+            ItemKind::CommandExecution,
+            &json!({"type": "commandExecution", "command": "cargo test", "cwd": "/w"}),
+        );
+        let r = Request::new(None, Some(&codex));
         assert_eq!(
             (r.kind, r.command.as_deref()),
             (Some(ToolKind::Shell), Some("cargo test"))
         );
-        let r = Request::new(None, &json!({"command": ["bash", "-lc", "ls -la"]}));
-        assert_eq!(r.command.as_deref(), Some("ls -la"));
-        let r = Request::new(None, &json!({"file_path": "/w/a.rs"}));
-        assert_eq!(r.paths, ["/w/a.rs"]);
+        let tool = ItemDetail::Tool {
+            tool: "exec".into(),
+            kind: ToolKind::Other,
+            title: String::new(),
+            input: json!({"command": ["bash", "-lc", "ls -la"]}),
+            output: None,
+            paths: vec![],
+        };
+        let r = Request::new(None, Some(&tool));
+        assert_eq!(
+            (r.kind, r.command.as_deref()),
+            (Some(ToolKind::Shell), Some("ls -la"))
+        );
+        let claude = ItemFeed::new(Harness::Claude).preview(
+            None,
+            ItemKind::ToolCall,
+            &json!({"name": "Read", "input": {"file_path": "/w/a.rs"}}),
+        );
+        let r = Request::new(None, Some(&claude));
+        assert_eq!(
+            (r.kind, r.paths.as_slice()),
+            (Some(ToolKind::Read), &["/w/a.rs".to_owned()][..])
+        );
     }
 
     #[test]
@@ -592,7 +625,7 @@ mod tests {
         for e in &out {
             t.apply(e);
         }
-        let r = Request::new(t.get("t1"), &Value::Null);
+        let r = Request::new(t.get("t1"), None);
         assert_eq!(r.tool.as_deref(), Some("read"));
         assert_eq!(r.kind, Some(ToolKind::Read));
         assert_eq!(r.paths, ["/w/a.rs"]);

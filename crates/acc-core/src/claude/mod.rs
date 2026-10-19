@@ -875,6 +875,13 @@ impl ClaudeDriver {
         };
         let is_question = question.is_some();
         let item_id = owned(req, "tool_use_id");
+        let detail = (!is_question).then(|| {
+            self.items.preview(
+                item_id.as_deref(),
+                tool_kind(tool),
+                &json!({"name": tool, "input": input}),
+            )
+        });
         let preview = input.clone();
         self.permissions.insert(
             id.clone(),
@@ -895,7 +902,8 @@ impl ClaudeDriver {
                 BlockKind::Permission
             },
             item_id,
-            input: preview,
+            detail,
+            native: preview,
         });
         if !self.native_state_events {
             let kind = if is_question {

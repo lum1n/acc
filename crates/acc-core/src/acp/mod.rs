@@ -754,18 +754,21 @@ impl AcpDriver {
                 option_ids: options.iter().map(|o| o.id.clone()).collect(),
             },
         );
-        let input = tool.get("rawInput").cloned().unwrap_or(Value::Null);
+        let native = tool.get("rawInput").cloned().unwrap_or(Value::Null);
         let item_id = self
             .permissions
             .get(&request_id)
             .and_then(|w| w.tool_call_id.clone());
+        // The tool call was started above when it wasn't open, so its kind is known.
+        let detail = Some(self.items.preview(item_id.as_deref(), ItemKind::ToolCall, tool));
         out.push(Event::PermissionRequested {
             request_id,
             title: title.clone(),
             options,
             kind: BlockKind::Permission,
             item_id,
-            input,
+            detail,
+            native,
         });
         self.set_state(
             RunState::Blocked {

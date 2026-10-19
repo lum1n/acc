@@ -2,7 +2,7 @@
 //! `requestUserInput` can ask several questions at once, some of them
 //! multiple-choice.
 //!
-//! A question request's [`Permission::input`](crate::session::Permission)
+//! A question request's [`Permission::native`](crate::session::Permission)
 //! holds them; [`parse`] reads them back. Answer them all with
 //! [`Command::AnswerPermission`](crate::command::Command) carrying
 //! [`encode`]d answers as its `option_id`. A plain option id still answers

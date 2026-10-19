@@ -838,7 +838,17 @@ impl CodexDriver {
         };
         let key = request_key(&id);
         let item_id = owned(&params, "itemId");
-        let input = params.clone();
+        let item = match method.as_str() {
+            "item/commandExecution/requestApproval" => Some(("commandExecution", ItemKind::CommandExecution)),
+            "item/fileChange/requestApproval" => Some(("fileChange", ItemKind::FileChange)),
+            _ => None,
+        };
+        let detail = item.map(|(ty, kind)| {
+            let mut native = json!({ "type": ty });
+            crate::item::merge(&mut native, &params);
+            self.items.preview(item_id.as_deref(), kind, &native)
+        });
+        let native = params.clone();
         self.requests
             .insert(key.clone(), ServerRequest { id, method, params });
         out.push(Event::PermissionRequested {
@@ -847,7 +857,8 @@ impl CodexDriver {
             options,
             kind,
             item_id,
-            input,
+            detail,
+            native,
         });
         self.set_state(RunState::Blocked { kind }, None, out);
     }

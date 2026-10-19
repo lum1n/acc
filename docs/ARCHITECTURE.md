@@ -265,7 +265,9 @@ session's directory), and by a command's start in whole words. Deny wins over al
 rule never matches a command that chains others (`;`, `&&`, `|`, `$(...)`, redirects); a deny rule
 matches any command in the chain. `Session::set_policy` checks every live approval (and those
 waiting when it is set or when a replay ends, never history) against the request's tool call in
-the transcript and its input, and answers a match with the option whose `PermissionOption::kind`
+the transcript and its typed `detail` (the drivers build it with `ItemFeed::preview`, the item's
+JSON with the request's merged over it; the harness's own parameters ride along as `native`, which
+policy never reads), and answers a match with the option whose `PermissionOption::kind`
 is `AllowOnce` (or `RejectOnce` / `RejectAlways`), followed by an `Event::Notice`. Drivers set
 `kind` from each harness's decisions (ACP's option kinds, Claude's allow/deny, Codex's
 accept/decline). Questions are always left to the user. One client per session should hold the

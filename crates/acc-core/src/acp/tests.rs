@@ -332,7 +332,8 @@ fn a_full_turn_with_a_permission_prompt() {
         |e| matches!(e, Event::ItemCompleted { id, status: ItemStatus::Completed, .. } if id == "item-2")
     ));
     assert!(events.iter().any(|e| matches!(e, Event::PermissionRequested {
-        request_id, title, options, kind: BlockKind::Permission, item_id, ..
+        request_id, title, options, kind: BlockKind::Permission, item_id,
+        detail: Some(crate::item::ItemDetail::Command { .. }), ..
     } if request_id == "7" && title == "cargo build" && item_id.is_some() && options == &vec![
             PermissionOption::new("allow-once", "Allow").with_kind(PermissionOptionKind::AllowOnce),
             PermissionOption::new("reject-once", "Reject").with_kind(PermissionOptionKind::RejectOnce),

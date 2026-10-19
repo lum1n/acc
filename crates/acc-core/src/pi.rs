@@ -630,7 +630,8 @@ impl PiDriver {
             options,
             kind,
             item_id: None,
-            input: v.clone(),
+            detail: None,
+            native: v.clone(),
         });
     }
 

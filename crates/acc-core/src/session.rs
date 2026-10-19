@@ -36,6 +36,7 @@ use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
 use crate::exec::Exec;
 use crate::harness::{Harness, LaunchSpec, Launcher};
+use crate::item::ItemDetail;
 use crate::pi::PiDriver;
 use crate::policy::{Decision, Policy, Request};
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
@@ -47,7 +48,7 @@ pub const SPEC_VERSION: u32 = 1;
 
 /// Version of [`Session::snapshot`]. Bump it whenever a driver's state
 /// changes meaning without changing shape; older snapshots are then refused.
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// After this long without news, a lower-fidelity state source may override.
 const STALE_MS: u64 = 30_000;
@@ -163,7 +164,10 @@ pub struct Permission {
     pub options: Vec<PermissionOption>,
     pub kind: BlockKind,
     pub item_id: Option<ItemId>,
-    pub input: Value,
+    /// The tool call to approve, typed (see [`Event::PermissionRequested`]).
+    pub detail: Option<ItemDetail>,
+    /// The harness's own tool input or request parameters.
+    pub native: Value,
 }
 
 /// One event with what it changed in the transcript.
@@ -906,7 +910,7 @@ impl Session {
                 continue;
             }
             let item = p.item_id.as_deref().and_then(|id| self.transcript.get(id));
-            let request = Request::new(item, &p.input);
+            let request = Request::new(item, p.detail.as_ref());
             let Some((decision, _)) = policy.decide(&request, &self.spec.cwd) else {
                 continue;
             };
@@ -1047,7 +1051,8 @@ impl Session {
                     options,
                     kind,
                     item_id,
-                    input,
+                    detail,
+                    native,
                 } => {
                     self.permissions.retain(|p| p.request_id != *request_id);
                     self.permissions.push(Permission {
@@ -1056,7 +1061,8 @@ impl Session {
                         options: options.clone(),
                         kind: *kind,
                         item_id: item_id.clone(),
-                        input: input.clone(),
+                        detail: detail.clone(),
+                        native: native.clone(),
                     });
                 }
                 Event::PermissionResolved { request_id } => {

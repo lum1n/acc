@@ -310,6 +310,9 @@ fn command_approval_round_trip() {
         .unwrap();
     assert_eq!(rid, "0");
     assert_eq!(title, "Run: cargo test");
+    assert!(events.iter().any(|e| matches!(e, Event::PermissionRequested {
+        detail: Some(crate::item::ItemDetail::Command { tool, command, .. }), ..
+    } if tool == "commandExecution" && command == "cargo test")));
     assert_eq!(
         options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
         ["accept", "decline"]
