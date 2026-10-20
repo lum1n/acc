@@ -52,4 +52,15 @@ mod tests {
         crate::Auth::key(&pair.private_key, None)?;
         Ok(())
     }
+
+    #[test]
+    fn every_key_is_new_and_debug_hides_the_private_half() -> Result<()> {
+        let (a, b) = (generate_key("a")?, generate_key("a")?);
+        assert_ne!(a.private_key, b.private_key);
+        assert_ne!(a.public_key, b.public_key);
+        let debug = format!("{a:?}");
+        assert!(debug.contains(&a.public_key));
+        assert!(!debug.contains("PRIVATE KEY"));
+        Ok(())
+    }
 }

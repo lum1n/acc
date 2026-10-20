@@ -641,6 +641,42 @@ mod tests {
     }
 
     #[test]
+    fn set_replaces_old_subtables_and_writes_new_ones() {
+        let mut d = Document::parse(CONFIG);
+        d.set_table(
+            "mcp_servers.a",
+            &[
+                ("command".into(), Toml::String("uvx".into())),
+                (
+                    "headers".into(),
+                    Toml::Table(vec![("X".into(), Toml::String("y".into()))]),
+                ),
+            ],
+        );
+        assert_eq!(
+            d.text(),
+            "model = \"o3\"\n\n[mcp_servers.a]\ncommand = \"uvx\"\n\n[mcp_servers.a.headers]\nX = \"y\"\n\n[other]\nx = 1\n"
+        );
+        let a = d.table("mcp_servers.a").unwrap();
+        assert!(a.get("env").is_none());
+        assert_eq!(
+            a.get("headers").unwrap().to_json().get("X").unwrap().as_str(),
+            Some("y")
+        );
+        d.remove_table("mcp_servers.a");
+        assert_eq!(d.text(), "model = \"o3\"\n\n[other]\nx = 1\n");
+        assert!(d.tables_under("mcp_servers").is_empty());
+    }
+
+    #[test]
+    fn removing_a_missing_table_changes_nothing() {
+        let mut d = Document::parse(CONFIG);
+        d.remove_table("mcp_servers.nope");
+        d.remove_table("mcp_server");
+        assert_eq!(d.text(), CONFIG);
+    }
+
+    #[test]
     fn values() {
         assert_eq!(
             parse_value("{ a = 1, b = \"s\" }"),
