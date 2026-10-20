@@ -352,11 +352,17 @@ export interface ExecOutput {
 /** Thrown errors carry acc-ffi's `AccError` variant name as `code`. */
 export type AccErrorCode =
   | "Timeout" | "Disconnected" | "AuthRejected" | "HostKeyRejected" | "Agent" | "NotRunning"
-  | "Remote" | "Driver" | "InvalidArgument" | "Ssh" | "Internal";
+  | "Remote" | "Driver" | "InvalidArgument" | "Ssh" | "Local" | "Internal";
 
 /** A host reachable over SSH. Connects on first use and redials whenever the connection dropped. */
 export declare class SshHost {
   constructor(config: SshConfig);
+  /**
+   * This machine, as the user this process runs as: its sessions, from any client, without a
+   * login. Scripts run with `sh` and a login's environment, not this process's.
+   */
+  static local(): SshHost;
+  isLocal(): boolean;
   /** Connects now, to surface login and host-key errors early. */
   connect(): Promise<void>;
   reconnect(): Promise<void>;

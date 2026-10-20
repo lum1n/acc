@@ -30,6 +30,9 @@ pub enum Error {
     Remote { code: Option<u32>, stderr: String },
     #[error(transparent)]
     Driver(#[from] DriverError),
+    /// A script on this machine couldn't be started ([`crate::Host::local`]).
+    #[error("couldn't run a script on this machine: {0}")]
+    Local(String),
 }
 
 impl Error {

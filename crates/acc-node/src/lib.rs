@@ -48,6 +48,7 @@ fn ssh_err(e: ssh::Error) -> Error {
         E::Driver(_) => "Driver",
         E::Key(_) | E::InvalidId(_) | E::Invalid(_) => "InvalidArgument",
         E::Ssh(_) => "Ssh",
+        E::Local(_) => "Local",
     };
     fail(kind, e)
 }
@@ -236,6 +237,21 @@ impl SshHost {
         Ok(Self {
             host: Arc::new(ssh::Host::new(c)),
         })
+    }
+
+    /// This machine, as the user this process runs as: sessions here, from any client, without
+    /// a login. Scripts run with `sh` and a login's environment, not this process's.
+    #[napi(factory)]
+    pub fn local() -> Self {
+        Self {
+            host: Arc::new(ssh::Host::local()),
+        }
+    }
+
+    /// Whether this is `SshHost.local()`.
+    #[napi]
+    pub fn is_local(&self) -> bool {
+        self.host.is_local()
     }
 
     /// Connects now, to surface login and host-key errors early.

@@ -105,3 +105,13 @@ test('logs in with its own key, checks the host key, runs scripts and lists sess
   const wrong = new SshHost(config({ fingerprints: ['SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'] }))
   await assert.rejects(wrong.connect(), (e) => e.code === 'HostKeyRejected')
 })
+
+test('reaches this machine without a login', T, async () => {
+  const host = SshHost.local()
+  assert.strictEqual(host.isLocal(), true)
+  await host.connect()
+  const out = await host.exec('echo "$HOME"')
+  assert.strictEqual(out.stdout.toString().trim(), os.homedir())
+  assert.strictEqual(out.exitCode, 0)
+  assert.ok(Array.isArray(await host.listSessions()))
+})
