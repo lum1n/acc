@@ -10,6 +10,10 @@ license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
+# Its tests are the Node ones (test/); a Rust test binary would need Node's symbols to link,
+# which macOS refuses.
+test = false
+doctest = false
 
 [dependencies]
 acc-core.workspace = true
