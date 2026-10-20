@@ -13,6 +13,8 @@ acc-core.workspace = true
 # Pure-Rust SSH; ring instead of the default aws-lc-rs so iOS and Android
 # builds need no CMake or extra C toolchain.
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
+# Randomness for `generate_key`; russh already depends on it.
+rand = "0.10"
 thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 

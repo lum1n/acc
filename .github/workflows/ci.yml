@@ -125,6 +125,25 @@ jobs:
           cp target/release/libacc_ffi.so bindings/python/
           python3 crates/acc-ffi/tests/smoke.py bindings/python
 
+  # The Node binding, against a real OpenSSH server.
+  node:
+    runs-on: ubuntu-latest
+    env:
+      ACC_REQUIRE_SSHD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install OpenSSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+      - run: node crates/acc-node/scripts/build.mjs
+      - run: node --test crates/acc-node/test/*.test.js
+
   wasm:
     runs-on: ubuntu-latest
     steps:

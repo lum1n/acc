@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/acc-core", "crates/acc-ssh", "crates/acc-ffi", "crates/acc-wasm", "crates/acc-cli"]
+members = ["crates/acc-core", "crates/acc-ssh", "crates/acc-ffi", "crates/acc-wasm", "crates/acc-node", "crates/acc-cli"]
 
 [workspace.package]
 version = "0.1.0"

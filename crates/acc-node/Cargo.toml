@@ -1,0 +1,29 @@
+[package]
+name = "acc-node"
+description = "Node bindings (napi) for acc-core and the acc-ssh transport"
+version.workspace = true
+edition.workspace = true
+# acc-ssh (russh) needs 1.89.
+rust-version = "1.89"
+publish.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+acc-core.workspace = true
+acc-ssh.workspace = true
+napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt", "serde-json"] }
+napi-derive = "3"
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+napi-build = "2"
+
+# Not the workspace lints: napi's macros expand to unsafe code.
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

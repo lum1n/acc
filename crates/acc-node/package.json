@@ -1,0 +1,16 @@
+{
+  "name": "@acc/node",
+  "version": "0.1.0",
+  "description": "Drive coding agents on hosts over SSH: acc-core and acc-ssh for Node",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "acc.*.node"],
+  "engines": { "node": ">=20" },
+  "os": ["linux", "darwin"],
+  "scripts": {
+    "build": "node scripts/build.mjs --release",
+    "build:debug": "node scripts/build.mjs",
+    "test": "node --test test/*.test.js"
+  }
+}
