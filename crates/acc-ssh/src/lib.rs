@@ -27,11 +27,13 @@ mod agent;
 mod detached;
 mod error;
 mod host;
+mod keys;
 mod session;
 
 pub use detached::{Detached, Read, Retry, list};
 pub use error::Error;
 pub use host::{AgentSocket, Auth, Host, HostKeyCheck, Output, SshConfig, Stream, StreamMsg};
+pub use keys::{KeyPair, generate_key};
 pub use session::Session;
 
 /// Re-exported so callers can name session listings, statuses and specs.

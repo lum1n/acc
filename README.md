@@ -4,7 +4,7 @@ One embeddable Rust core that **controls, observes and configures** the major CL
 Claude Code, Codex, Cursor Agent, Copilot CLI, pi and opencode.
 
 It ships as a native library for iOS and Android (UniFFI → Swift/Kotlin), the browser and Node
-(wasm-bindgen), and desktop (plain Rust). It needs **nothing installed on the hosts** it controls:
+(wasm-bindgen), Node servers with the SSH transport (napi), and desktop (plain Rust). It needs **nothing installed on the hosts** it controls:
 everything runs over an SSH exec channel using the harnesses' own headless protocols and standard
 POSIX tools.
 
@@ -26,6 +26,7 @@ into ordinary ACC sessions.
 | `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections |
 | `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`): the live `Session`, SSH sessions, and the detached-session byte pump (`AccSession`, `AccFanIn` and the host scripts) |
 | `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node: the same objects and functions as `acc-ffi` except the SSH transport (a test keeps them in step), records as plain JS objects in the core's serde shapes, bytes as `Uint8Array` |
+| `crates/acc-node` | napi bindings for Node servers: the SSH transport included (`SshHost`, `RemoteSession`), plus `generateKey` for a key of the server's own. Values in the core's serde shapes, as acc-wasm passes them; released as `acc-node-<version>-<platform>.tar.gz` |
 | `crates/acc-cli` | `acc` command-line tool for hosts and spikes |
 
 ## Quick start

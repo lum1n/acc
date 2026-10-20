@@ -2,3 +2,4 @@
 /bindings
 *.swp
 .DS_Store
+/crates/acc-node/*.node
