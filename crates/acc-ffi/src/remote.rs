@@ -32,7 +32,7 @@ impl From<ssh::Error> for AccError {
             e @ (E::Key(_) | E::InvalidId(_) | E::Invalid(_)) => Self::InvalidArgument {
                 reason: e.to_string(),
             },
-            e @ E::Ssh(_) => Self::Ssh {
+            e @ (E::Ssh(_) | E::Local(_)) => Self::Ssh {
                 reason: e.to_string(),
             },
         }

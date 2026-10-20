@@ -18,6 +18,10 @@ rand = "0.10"
 thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
+[features]
+# `Host::local`: this machine's sessions, with `sh` instead of SSH.
+local = ["tokio/process"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }
 

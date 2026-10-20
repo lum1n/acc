@@ -17,7 +17,7 @@ doctest = false
 
 [dependencies]
 acc-core.workspace = true
-acc-ssh.workspace = true
+acc-ssh = { workspace = true, features = ["local"] }
 napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt", "serde-json"] }
 napi-derive = "3"
 serde.workspace = true

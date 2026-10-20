@@ -134,6 +134,8 @@ type Conn = Arc<Handle<Client>>;
 /// `Arc`; channels are multiplexed over one connection.
 pub struct Host {
     config: SshConfig,
+    /// Scripts run on this machine with `sh` rather than over SSH (see [`Host::local`]).
+    local: bool,
     conn: Mutex<Option<Conn>>,
     fingerprint: Arc<StdMutex<Option<String>>>,
     dials: AtomicU64,
@@ -145,6 +147,7 @@ impl fmt::Debug for Host {
             .field("host", &self.config.host)
             .field("port", &self.config.port)
             .field("user", &self.config.user)
+            .field("local", &self.local)
             .finish_non_exhaustive()
     }
 }
@@ -180,10 +183,38 @@ impl Host {
     pub fn new(config: SshConfig) -> Self {
         Self {
             config,
+            local: false,
             conn: Mutex::new(None),
             fingerprint: Arc::new(StdMutex::new(None)),
             dials: AtomicU64::new(0),
         }
+    }
+
+    /// This machine, as the user running the process: the same scripts run with `sh` instead of
+    /// over SSH, so sessions started here, by this or any other client, can be listed, followed
+    /// and driven without a login. Scripts get a login's environment (`HOME`, `USER`, `PATH`,
+    /// the locale…), not the rest of this process's, which may hold its secrets.
+    /// [`Host::config`] describes it as `localhost` for display; nothing dials.
+    #[cfg(feature = "local")]
+    pub fn local() -> Self {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_default();
+        let config = SshConfig::new(
+            "localhost",
+            user,
+            Auth::Agent(AgentSocket::Env),
+            HostKeyCheck::AcceptAny,
+        );
+        Self {
+            local: true,
+            ..Self::new(config)
+        }
+    }
+
+    /// Whether this is [`Host::local`].
+    pub fn is_local(&self) -> bool {
+        self.local
     }
 
     pub fn config(&self) -> &SshConfig {
@@ -206,6 +237,9 @@ impl Host {
 
     /// Connects now if not connected, to surface auth and host-key errors early.
     pub async fn connect(&self) -> Result<()> {
+        if self.local {
+            return Ok(());
+        }
         self.conn().await.map(drop)
     }
 
@@ -335,6 +369,10 @@ impl Host {
     /// [`Error::Disconnected`] if the connection dropped before the script's
     /// exit status arrived (it may or may not have run).
     pub async fn exec(&self, script: &str, stdin: &[u8]) -> Result<Output> {
+        #[cfg(feature = "local")]
+        if self.local {
+            return local::exec(script, stdin).await;
+        }
         let mut ch = self.channel(script).await?;
         if !stdin.is_empty() {
             ch.data_bytes(stdin.to_vec())
@@ -361,27 +399,41 @@ impl Host {
 
     /// Starts a POSIX shell script and streams its stdout.
     pub async fn open(&self, script: &str) -> Result<Stream> {
+        #[cfg(feature = "local")]
+        if self.local {
+            return Ok(Stream {
+                inner: Inner::Local(Box::new(local::open(script)?)),
+            });
+        }
         let ch = self.channel(script).await?;
         Ok(Stream {
-            ch,
-            code: None,
-            signaled: false,
+            inner: Inner::Ssh {
+                ch,
+                code: None,
+                signaled: false,
+            },
         })
     }
 }
 
 /// A running script's output, from [`Host::open`].
 pub struct Stream {
-    ch: Channel<client::Msg>,
-    code: Option<u32>,
-    signaled: bool,
+    inner: Inner,
+}
+
+enum Inner {
+    Ssh {
+        ch: Channel<client::Msg>,
+        code: Option<u32>,
+        signaled: bool,
+    },
+    #[cfg(feature = "local")]
+    Local(Box<local::Process>),
 }
 
 impl fmt::Debug for Stream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Stream")
-            .field("code", &self.code)
-            .finish_non_exhaustive()
+        f.debug_struct("Stream").finish_non_exhaustive()
     }
 }
 
@@ -399,14 +451,19 @@ pub enum StreamMsg {
 
 impl Stream {
     pub async fn recv(&mut self) -> StreamMsg {
+        let (ch, code, signaled) = match &mut self.inner {
+            Inner::Ssh { ch, code, signaled } => (ch, code, signaled),
+            #[cfg(feature = "local")]
+            Inner::Local(process) => return process.recv().await,
+        };
         loop {
-            match self.ch.wait().await {
+            match ch.wait().await {
                 Some(ChannelMsg::Data { data }) => return StreamMsg::Stdout(data.to_vec()),
                 Some(ChannelMsg::ExtendedData { data, .. }) => return StreamMsg::Stderr(data.to_vec()),
-                Some(ChannelMsg::ExitStatus { exit_status }) => self.code = Some(exit_status),
-                Some(ChannelMsg::ExitSignal { .. }) => self.signaled = true,
+                Some(ChannelMsg::ExitStatus { exit_status }) => *code = Some(exit_status),
+                Some(ChannelMsg::ExitSignal { .. }) => *signaled = true,
                 Some(_) => {}
-                None if self.code.is_some() || self.signaled => return StreamMsg::Exited(self.code),
+                None if code.is_some() || *signaled => return StreamMsg::Exited(*code),
                 None => return StreamMsg::Lost,
             }
         }
@@ -414,14 +471,160 @@ impl Stream {
 
     /// Writes to the script's stdin.
     pub async fn write(&self, bytes: &[u8]) -> Result<()> {
-        self.ch
-            .data_bytes(bytes.to_vec())
-            .await
-            .map_err(|_| Error::Disconnected)
+        match &self.inner {
+            Inner::Ssh { ch, .. } => ch
+                .data_bytes(bytes.to_vec())
+                .await
+                .map_err(|_| Error::Disconnected),
+            #[cfg(feature = "local")]
+            Inner::Local(process) => process.write(bytes).await,
+        }
     }
 
     /// Closes the script's stdin.
     pub async fn finish(&self) -> Result<()> {
-        self.ch.eof().await.map_err(|_| Error::Disconnected)
+        match &self.inner {
+            Inner::Ssh { ch, .. } => ch.eof().await.map_err(|_| Error::Disconnected),
+            #[cfg(feature = "local")]
+            Inner::Local(process) => process.finish().await,
+        }
+    }
+}
+
+/// Scripts on this machine, for [`Host::local`].
+#[cfg(feature = "local")]
+mod local {
+    use std::process::Stdio;
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+    use tokio::sync::Mutex;
+
+    use super::{Output, StreamMsg};
+    use crate::{Error, Result};
+
+    /// What a login would have; the rest of this process's environment stays out.
+    const KEEP: &[&str] = &[
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PATH",
+        "LANG",
+        "LANGUAGE",
+        "TERM",
+        "TMPDIR",
+        "TZ",
+        "XDG_RUNTIME_DIR",
+        "SSH_AUTH_SOCK",
+    ];
+
+    fn command(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).env_clear();
+        for (name, value) in std::env::vars_os() {
+            let keep = name
+                .to_str()
+                .is_some_and(|n| KEEP.contains(&n) || n.starts_with("LC_"));
+            if keep {
+                command.env(name, value);
+            }
+        }
+        command.kill_on_drop(false);
+        command
+    }
+
+    fn spawn(script: &str) -> Result<Child> {
+        command(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Local(e.to_string()))
+    }
+
+    fn code(status: std::process::ExitStatus) -> Option<u32> {
+        status.code().and_then(|c| u32::try_from(c).ok())
+    }
+
+    pub(super) async fn exec(script: &str, stdin: &[u8]) -> Result<Output> {
+        let mut child = spawn(script)?;
+        if let Some(mut input) = child.stdin.take() {
+            // A script that doesn't read its input closes it early; that's no failure.
+            let _ = input.write_all(stdin).await;
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| Error::Local(e.to_string()))?;
+        Ok(Output {
+            stdout: out.stdout,
+            stderr: out.stderr,
+            code: code(out.status),
+        })
+    }
+
+    /// A running script: its stdout and stderr read as they come, and its stdin.
+    pub(super) struct Process {
+        child: Child,
+        stdout: Option<ChildStdout>,
+        stderr: Option<ChildStderr>,
+        stdin: Mutex<Option<ChildStdin>>,
+    }
+
+    pub(super) fn open(script: &str) -> Result<Process> {
+        let mut child = spawn(script)?;
+        Ok(Process {
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+            stdin: Mutex::new(child.stdin.take()),
+            child,
+        })
+    }
+
+    async fn chunk(pipe: &mut Option<impl AsyncRead + Unpin>) -> Option<Vec<u8>> {
+        let reader = pipe.as_mut()?;
+        let mut buf = vec![0; 32 * 1024];
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some(buf)
+            }
+        }
+    }
+
+    impl Process {
+        pub(super) async fn recv(&mut self) -> StreamMsg {
+            loop {
+                if self.stdout.is_none() && self.stderr.is_none() {
+                    return match self.child.wait().await {
+                        Ok(status) => StreamMsg::Exited(code(status)),
+                        Err(_) => StreamMsg::Lost,
+                    };
+                }
+                tokio::select! {
+                    got = chunk(&mut self.stdout), if self.stdout.is_some() => match got {
+                        Some(bytes) => return StreamMsg::Stdout(bytes),
+                        None => self.stdout = None,
+                    },
+                    got = chunk(&mut self.stderr), if self.stderr.is_some() => match got {
+                        Some(bytes) => return StreamMsg::Stderr(bytes),
+                        None => self.stderr = None,
+                    },
+                }
+            }
+        }
+
+        pub(super) async fn write(&self, bytes: &[u8]) -> Result<()> {
+            let mut stdin = self.stdin.lock().await;
+            let input = stdin.as_mut().ok_or(Error::Disconnected)?;
+            input.write_all(bytes).await.map_err(|_| Error::Disconnected)
+        }
+
+        pub(super) async fn finish(&self) -> Result<()> {
+            self.stdin.lock().await.take();
+            Ok(())
+        }
     }
 }
