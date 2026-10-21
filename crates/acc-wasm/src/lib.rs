@@ -248,7 +248,18 @@ export type Event =
   | { type: "item_delta"; id: string; text: string }
   | { type: "item_updated"; id: string; detail: ItemDetail; native?: unknown }
   | { type: "item_completed"; id: string; status: ItemStatus; detail: ItemDetail; native?: unknown }
-  | { type: "permission_requested"; request_id: string; title: string; options: PermissionOption[] }
+  | {
+      type: "permission_requested";
+      request_id: string;
+      title: string;
+      options: PermissionOption[];
+      kind: "permission" | "question" | "auth";
+      item_id?: string;
+      /** The tool call to approve, typed; absent for questions. */
+      detail?: ItemDetail;
+      /** The harness's own tool input or request parameters; a question's questions. */
+      native?: unknown;
+    }
   | { type: "permission_resolved"; request_id: string }
   | ({ type: "usage" } & Usage)
   | ({ type: "quota" } & Quota)

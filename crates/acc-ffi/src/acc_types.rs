@@ -150,8 +150,11 @@ pub struct AccPermission {
     pub kind: AccBlockKind,
     /// The tool item this request is about.
     pub item_id: Option<String>,
-    /// Tool input or request parameters as JSON (empty when none).
-    pub input_json: String,
+    /// The tool call to approve, typed; none for questions.
+    pub detail: Option<AccItemDetail>,
+    /// The harness's own tool input or request parameters as JSON (empty
+    /// when none); a question's questions.
+    pub native_json: String,
 }
 
 impl From<Permission> for AccPermission {
@@ -162,7 +165,8 @@ impl From<Permission> for AccPermission {
             options: p.options.into_iter().map(Into::into).collect(),
             kind: p.kind.into(),
             item_id: p.item_id,
-            input_json: json(&p.input),
+            detail: p.detail.map(Into::into),
+            native_json: json(&p.native),
         }
     }
 }
@@ -369,7 +373,8 @@ impl From<Event> for AccEvent {
                 options,
                 kind,
                 item_id,
-                input,
+                detail,
+                native,
             } => Self::PermissionRequested {
                 permission: Permission {
                     request_id,
@@ -377,7 +382,8 @@ impl From<Event> for AccEvent {
                     options,
                     kind,
                     item_id,
-                    input,
+                    detail,
+                    native,
                 }
                 .into(),
             },

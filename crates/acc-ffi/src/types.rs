@@ -406,8 +406,11 @@ pub enum Event {
         kind: RequestKind,
         /// The tool item the request is about, when the harness says.
         item_id: Option<String>,
-        /// The tool input or request parameters as JSON, for previews.
-        input_json: Option<String>,
+        /// The tool call to approve, typed; none for questions.
+        detail: Option<AccItemDetail>,
+        /// The harness's own tool input or request parameters as JSON; a
+        /// question's questions.
+        native_json: Option<String>,
     },
     PermissionResolved {
         request_id: String,
@@ -495,13 +498,15 @@ impl From<core_ev::Event> for Event {
                 options,
                 kind,
                 item_id,
-                input,
+                detail,
+                native,
             } => Self::PermissionRequested {
                 request_id,
                 title,
                 kind: kind.into(),
                 item_id,
-                input_json: json(&input),
+                detail: detail.map(Into::into),
+                native_json: json(&native),
                 options: options
                     .into_iter()
                     .map(|o| PermissionOption {

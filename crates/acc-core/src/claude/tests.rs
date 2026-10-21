@@ -205,6 +205,9 @@ fn permission_round_trip_matches_recording() {
         .expect("permission request");
     assert_eq!(request_id, "ef3cff2f-5523-4403-874b-dfeb45c76fb7");
     assert_eq!(title, "Bash: touch acc-probe.txt");
+    assert!(events.iter().any(|e| matches!(e, Event::PermissionRequested {
+        detail: Some(crate::item::ItemDetail::Command { tool, command, .. }), ..
+    } if tool == "Bash" && command == "touch acc-probe.txt")));
     let ids: Vec<_> = options.iter().map(|o| o.id.as_str()).collect();
     assert_eq!(ids, ["allow", "allow_always", "deny"]);
 

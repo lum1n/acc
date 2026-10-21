@@ -76,9 +76,16 @@ pub enum Event {
         /// The tool item this request is about, when the harness says.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<ItemId>,
-        /// The tool input or request parameters, for previews.
+        /// The tool call to approve, the same shape whatever the harness
+        /// (the item's detail with the request's own arguments merged over
+        /// it). `None` for questions and requests about no tool call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<ItemDetail>,
+        /// The harness's own tool input or request parameters, for
+        /// debugging and harness-specific UI, and the questions of a
+        /// question ([`crate::question::parse`]). Policy doesn't read it.
         #[serde(default, skip_serializing_if = "Value::is_null")]
-        input: Value,
+        native: Value,
     },
     /// A pending request was answered (possibly by another client) or withdrawn.
     PermissionResolved {
