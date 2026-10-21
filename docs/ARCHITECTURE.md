@@ -102,6 +102,11 @@ whether an item failed, and message text a harness sends only with the completio
 still rides along as `native`, for debugging and harness-specific UI. Anything else that reads a
 harness's items (a transcript file, say) uses the same feed.
 
+Beside items, the main conversation's to-do list arrives whole as `Event::Plan` (Codex's
+`turn/plan/updated`, ACP's `plan` update, Claude's `TodoWrite` call, which stays a tool item too),
+and Codex's aggregated diff of the turn as `Event::TurnDiff`; each replaces the one before.
+Subagents' plans stay theirs. What has no common shape yet passes through as `Event::Native`.
+
 ## Interactive commands
 
 A TUI's interactive slash commands (pickers, dialogs) don't work headless: harnesses refuse them

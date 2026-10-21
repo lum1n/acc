@@ -36,7 +36,7 @@ use crate::command::{
 use crate::driver::{Driver, DriverError};
 use crate::event::{
     Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
-    Quota, QuotaWindow, Usage,
+    Plan, Quota, QuotaWindow, Usage,
 };
 use crate::harness::{Harness, LaunchSpec};
 use crate::item::ItemFeed;
@@ -627,6 +627,13 @@ impl ClaudeDriver {
                     let ext =
                         json!({"name": name, "input": block.get("input").cloned().unwrap_or(Value::Null)});
                     let kind = tool_kind(name);
+                    // The main conversation's to-do list; subagents keep their own.
+                    if name == "TodoWrite" && top_level {
+                        out.push(Event::Plan(Plan::from_list(
+                            block.pointer("/input/todos"),
+                            "content",
+                        )));
+                    }
                     self.open_tools.insert(id.clone(), kind);
                     self.items.start(id, kind, parent_of(v), ext, out);
                 }

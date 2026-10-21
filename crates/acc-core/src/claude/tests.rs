@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::*;
-use crate::event::ItemStatus;
+use crate::event::{ItemStatus, PlanStatus};
 use crate::item::ItemDetail;
 
 const HI: &str = include_str!("../../tests/fixtures/claude/hi-and-controls.ndjson");
@@ -540,6 +540,47 @@ fn unstreamed_blocks_of_one_message_stay_apart() {
         .map(|i| (i.id.as_str(), i.text.as_str()))
         .collect();
     assert_eq!(items, [("m1:0", "hmm"), ("m1:1", "hello")]);
+}
+
+#[test]
+fn todo_write_is_the_plan_but_a_subagents_is_not() {
+    let todo = |parent: Value| {
+        json!({"type": "assistant", "parent_tool_use_id": parent, "message": {"id": "m1", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "TodoWrite", "input": {"todos": [
+                {"content": "Read the code", "status": "completed", "activeForm": "Reading the code"},
+                {"content": "Fix it", "status": "in_progress", "activeForm": "Fixing it"}]}}]}})
+    };
+    let mut d = ClaudeDriver::default();
+    let events = d.on_output(&wire::line(&todo(Value::Null)));
+    let plan = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Plan(p) => Some(p),
+            _ => None,
+        })
+        .expect("plan");
+    let entries: Vec<_> = plan
+        .entries
+        .iter()
+        .map(|e| (e.content.as_str(), e.status))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("Read the code", PlanStatus::Completed),
+            ("Fix it", PlanStatus::InProgress)
+        ]
+    );
+    // It is still a tool call item too.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ItemStarted { id, .. } if id == "toolu_1"))
+    );
+
+    let mut d = ClaudeDriver::default();
+    let events = d.on_output(&wire::line(&todo(json!("toolu_agent"))));
+    assert!(!events.iter().any(|e| matches!(e, Event::Plan(_))));
 }
 
 #[test]

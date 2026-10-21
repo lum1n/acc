@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::command::Apply;
-use crate::event::ItemStatus;
+use crate::event::{ItemStatus, PlanEntry, PlanPriority, PlanStatus};
 use crate::item::ItemDetail;
 
 fn driver(harness: Harness, start: Start) -> AcpDriver {
@@ -604,7 +604,12 @@ fn a_late_client_takes_prompts_from_copilots_history() {
 fn split_reads_give_the_same_events() {
     let msgs = [
         update("s1", text_chunk("agent_message_chunk", "héllo ✓")),
-        update("s1", json!({ "sessionUpdate": "plan", "entries": [] })),
+        update(
+            "s1",
+            json!({ "sessionUpdate": "plan", "entries": [
+                { "content": "Read the code", "priority": "high", "status": "in_progress" },
+                { "content": "Fix it", "priority": "low", "status": "pending" } ] }),
+        ),
         result("acc-1", json!({ "stopReason": "end_turn" })),
     ];
     let mut whole = ready_copilot();
@@ -622,10 +627,21 @@ fn split_reads_give_the_same_events() {
         let got: Vec<_> = bytes.chunks(size).flat_map(|c| d.on_output(c)).collect();
         assert_eq!(got, expected, "chunk size {size}");
     }
-    assert!(expected.contains(&Event::Native {
-        kind: "plan".into(),
-        payload: json!({ "entries": [] })
-    }));
+    assert!(expected.contains(&Event::Plan(Plan {
+        entries: vec![
+            PlanEntry {
+                content: "Read the code".into(),
+                status: PlanStatus::InProgress,
+                priority: Some(PlanPriority::High),
+            },
+            PlanEntry {
+                content: "Fix it".into(),
+                status: PlanStatus::Pending,
+                priority: Some(PlanPriority::Low),
+            },
+        ],
+        explanation: None,
+    })));
 }
 
 #[test]
@@ -880,7 +896,12 @@ fn options_route_to_config_options() {
         &mut d,
         &[json!({ "jsonrpc": "2.0", "id": set["id"], "error": { "code": -32602, "message": "bad model" } })],
     );
-    assert!(matches!(&events[0], Event::Native { kind, .. } if kind == "request_failed"));
+    assert_eq!(
+        events[0],
+        Event::Notice {
+            message: "Couldn't change the setting: bad model".into()
+        }
+    );
     assert!(matches!(
         d.command(Command::SetOption {
             id: OptionId::Effort,

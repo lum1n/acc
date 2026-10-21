@@ -39,7 +39,7 @@ use crate::command::{
 use crate::driver::{Driver, DriverError};
 use crate::event::{
     Event, ItemKind, Panel, PanelAction, PanelRow, PanelSection, PermissionOption, PermissionOptionKind,
-    Quota, QuotaWindow, Usage,
+    Plan, Quota, QuotaWindow, Usage,
 };
 use crate::harness::{Harness, LaunchSpec};
 use crate::item::ItemFeed;
@@ -597,16 +597,18 @@ impl CodexDriver {
                 let req = self.request("skills/list", self.skills_params(), Req::Skills);
                 self.transmit.extend(req);
             }
-            // The turn's aggregated unified diff, for clients that show one
-            // per turn rather than per file-change item.
             "turn/diff/updated" if ours => {
                 if let Some(diff) = owned(&p, "diff") {
-                    out.push(Event::Native {
-                        kind: "turn_diff".into(),
-                        payload: json!({"turnId": p.get("turnId"), "diff": diff}),
+                    out.push(Event::TurnDiff {
+                        turn_id: owned(&p, "turnId"),
+                        diff,
                     });
                 }
             }
+            "turn/plan/updated" if ours => out.push(Event::Plan(Plan {
+                explanation: owned(&p, "explanation").filter(|e| !e.is_empty()),
+                ..Plan::from_list(p.get("plan"), "step")
+            })),
             "thread/compacted" if ours => out.push(Event::Notice {
                 message: "Conversation compacted".into(),
             }),

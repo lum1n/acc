@@ -465,15 +465,15 @@ mod tests {
     #[test]
     fn events_keep_native_payloads_as_json() {
         let e: Event = acc_core::Event::Native {
-            kind: "plan".into(),
-            payload: serde_json::json!({"steps": 2}),
+            kind: "session_info_update".into(),
+            payload: serde_json::json!({"title": "x"}),
         }
         .into();
         assert_eq!(
             e,
             Event::Native {
-                kind: "plan".into(),
-                payload_json: Some(r#"{"steps":2}"#.into()),
+                kind: "session_info_update".into(),
+                payload_json: Some(r#"{"title":"x"}"#.into()),
             }
         );
     }
