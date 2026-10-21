@@ -91,3 +91,15 @@ async fn drives_a_detached_session_on_this_machine() {
     }
     pipe.remove().await.expect("remove");
 }
+
+#[tokio::test]
+async fn exec_feeds_large_input_to_a_script_that_writes_as_it_reads() {
+    // More than a pipe holds, both ways: input must be fed while output is drained.
+    let input = vec![b'x'; 1 << 20];
+    let out = timeout(Duration::from_secs(20), Host::local().exec("cat", &input))
+        .await
+        .expect("exec in time")
+        .expect("exec");
+    assert_eq!(out.stdout.len(), input.len());
+    assert_eq!(out.code, Some(0));
+}

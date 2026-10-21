@@ -549,14 +549,17 @@ mod local {
 
     pub(super) async fn exec(script: &str, stdin: &[u8]) -> Result<Output> {
         let mut child = spawn(script)?;
-        if let Some(mut input) = child.stdin.take() {
-            // A script that doesn't read its input closes it early; that's no failure.
-            let _ = input.write_all(stdin).await;
-        }
-        let out = child
-            .wait_with_output()
-            .await
-            .map_err(|e| Error::Local(e.to_string()))?;
+        let input = child.stdin.take();
+        // Fed while the output is drained: a script that writes as it reads would otherwise
+        // block on a full pipe while its input waits on it.
+        let feed = async move {
+            if let Some(mut input) = input {
+                // A script that doesn't read its input closes it early; that's no failure.
+                let _ = input.write_all(stdin).await;
+            }
+        };
+        let ((), out) = tokio::join!(feed, child.wait_with_output());
+        let out = out.map_err(|e| Error::Local(e.to_string()))?;
         Ok(Output {
             stdout: out.stdout,
             stderr: out.stderr,
