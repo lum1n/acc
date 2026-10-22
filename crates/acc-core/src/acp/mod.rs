@@ -34,6 +34,7 @@ use crate::harness::{Harness, LaunchSpec, Protocol};
 use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
+use crate::wire::title_at;
 
 /// The ACP protocol version this driver speaks.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -838,6 +839,10 @@ impl AcpDriver {
                     self.options_changed(out);
                 }
             }
+            "session_info_update" => match title_at(update, "title") {
+                Some(title) => out.push(Event::TitleChanged { title }),
+                None => out.push(native(kind, update)),
+            },
             "usage_update" => {
                 let n = |k: &str| update.get(k).and_then(Value::as_u64);
                 let cost = update.get("cost");

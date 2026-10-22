@@ -418,6 +418,11 @@ pub enum Event {
     QuotaUpdated {
         quota: Quota,
     },
+    /// The harness named or renamed the session; `SessionSpec::title` now
+    /// holds it.
+    TitleChanged {
+        title: String,
+    },
     CommandsChanged,
     OptionsChanged,
     Notice {
@@ -514,6 +519,7 @@ impl From<core_ev::Event> for Event {
             E::PermissionResolved { request_id } => Self::PermissionResolved { request_id },
             E::Usage(u) => Self::UsageUpdated { usage: u.into() },
             E::Quota(q) => Self::QuotaUpdated { quota: q.into() },
+            E::TitleChanged { title } => Self::TitleChanged { title },
             E::CommandsChanged => Self::CommandsChanged,
             E::OptionsChanged => Self::OptionsChanged,
             E::Notice { message } => Self::Notice { message },

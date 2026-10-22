@@ -45,7 +45,7 @@ use crate::harness::{Harness, LaunchSpec};
 use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
-use crate::wire::{self, owned, str_at, u64_at};
+use crate::wire::{self, owned, str_at, title_at, u64_at};
 
 /// Notifications ACC never uses; the server skips them for this connection.
 const OPT_OUT: [&str; 4] = [
@@ -394,6 +394,9 @@ impl CodexDriver {
             native_id: id,
             model: self.model.clone(),
         });
+        if let Some(title) = title_at(thread, "name") {
+            out.push(Event::TitleChanged { title });
+        }
         // History of a resumed thread, so a client that takes over sees it.
         for turn in list(thread, "turns") {
             for item in list(turn, "items") {
@@ -605,6 +608,11 @@ impl CodexDriver {
                         kind: "turn_diff".into(),
                         payload: json!({"turnId": p.get("turnId"), "diff": diff}),
                     });
+                }
+            }
+            "thread/name/updated" if ours => {
+                if let Some(title) = title_at(&p, "threadName") {
+                    out.push(Event::TitleChanged { title });
                 }
             }
             "thread/compacted" if ours => out.push(Event::Notice {

@@ -252,6 +252,7 @@ export type Event =
   | { type: "permission_resolved"; request_id: string }
   | ({ type: "usage" } & Usage)
   | ({ type: "quota" } & Quota)
+  | { type: "title_changed"; title: string }
   | { type: "commands_changed" }
   | { type: "options_changed" }
   | { type: "notice"; message: string }

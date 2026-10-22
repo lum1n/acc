@@ -122,6 +122,14 @@ fn check_turn(harness: Harness, out_log: &str, in_log: &str, approve: &str) -> V
     events
 }
 
+/// The last name the agent gave the session.
+fn title(events: &[Event]) -> Option<&str> {
+    events.iter().rev().find_map(|e| match e {
+        Event::TitleChanged { title } => Some(title.as_str()),
+        _ => None,
+    })
+}
+
 /// The mock model's reply and usage report.
 fn check_mock_reply(events: &[Event]) {
     assert!(
@@ -138,12 +146,9 @@ fn check_mock_reply(events: &[Event]) {
 
 #[test]
 fn copilot_turn_with_approval() {
-    check_mock_reply(&check_turn(
-        Harness::Copilot,
-        COPILOT_OUT,
-        COPILOT_IN,
-        "allow_once",
-    ));
+    let events = check_turn(Harness::Copilot, COPILOT_OUT, COPILOT_IN, "allow_once");
+    check_mock_reply(&events);
+    assert_eq!(title(&events), Some("Run echo acc-live-test"));
 }
 
 #[test]
@@ -164,6 +169,7 @@ fn cursor_turn_with_approval() {
     assert_eq!(reply, "`acc-live-test`");
     // Cursor reports no usage in ACP.
     assert!(!events.iter().any(|e| matches!(e, Event::Usage(_))));
+    assert_eq!(title(&events), Some("Echo Live Test"));
 }
 
 #[test]

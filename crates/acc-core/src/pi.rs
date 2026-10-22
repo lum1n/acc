@@ -33,6 +33,7 @@ use crate::harness::{Harness, LaunchSpec};
 use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
+use crate::wire::title_at;
 
 /// Longest RPC record accepted. `agent_end` repeats the run's messages, so
 /// records with large tool outputs can be several megabytes.
@@ -76,6 +77,9 @@ pub struct PiDriver {
     answered: Vec<String>,
     outgoing: Vec<u8>,
     native_id: Option<String>,
+    /// The session name pi last reported, from `/name`.
+    #[serde(default)]
+    title: Option<String>,
     streaming: bool,
     blocked: bool,
     last_error: Option<String>,
@@ -109,6 +113,7 @@ impl PiDriver {
             answered: Vec::new(),
             outgoing: Vec::new(),
             native_id: None,
+            title: None,
             streaming: false,
             blocked: false,
             last_error: None,
@@ -392,6 +397,10 @@ impl PiDriver {
                 let level = data.get("level").and_then(Value::as_str).map(str::to_owned);
                 self.set_current(OptionId::Effort, level);
             }
+            "set_session_name" => {
+                let req = self.simple("get_state");
+                self.outgoing.extend(req);
+            }
             "new_session" | "switch_session" | "clone" | "fork" => {
                 if data.get("cancelled").and_then(Value::as_bool) != Some(true) {
                     self.usage = Usage {
@@ -449,6 +458,7 @@ impl PiDriver {
             .map(str::to_owned);
         self.set_current(OptionId::Effort, level);
         let streaming = data.get("isStreaming").and_then(Value::as_bool).unwrap_or(false);
+        let title = title_at(data, "sessionName");
         if let Some(native) = native
             && self.native_id.as_deref() != Some(native.as_str())
         {
@@ -464,6 +474,12 @@ impl PiDriver {
             } else {
                 self.state(RunState::Idle, None)
             });
+        }
+        if title != self.title {
+            self.title.clone_from(&title);
+            if let Some(title) = title {
+                out.push(Event::TitleChanged { title });
+            }
         }
     }
 
@@ -1498,6 +1514,29 @@ mod tests {
         );
         // Manual compaction outside a run returns to idle.
         assert!(states(&events).contains(&RunState::Idle));
+    }
+
+    #[test]
+    fn session_name_is_the_title() {
+        let mut d = PiDriver::new();
+        let _ = d
+            .command(Command::Rename {
+                name: "auth fix".into(),
+            })
+            .unwrap();
+        assert!(d
+            .on_output(b"{\"id\":\"acc-1\",\"type\":\"response\",\"command\":\"set_session_name\",\"success\":true}\n")
+            .is_empty());
+        let next = sent(&d.poll_transmit());
+        assert_eq!(next[0]["type"], "get_state");
+        let state = "{\"id\":\"acc-2\",\"type\":\"response\",\"command\":\"get_state\",\"success\":true,\"data\":{\"sessionId\":\"s1\",\"sessionName\":\"auth fix\",\"isStreaming\":false}}\n";
+        let events = d.on_output(state.as_bytes());
+        assert!(events.contains(&Event::TitleChanged {
+            title: "auth fix".into()
+        }));
+        // Reported once, not on every state refresh.
+        let events = d.on_output(state.replace("acc-2", "acc-3").as_bytes());
+        assert!(!events.iter().any(|e| matches!(e, Event::TitleChanged { .. })));
     }
 
     #[test]

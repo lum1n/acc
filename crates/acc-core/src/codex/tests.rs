@@ -82,6 +82,36 @@ fn resume_uses_thread_resume() {
 }
 
 #[test]
+fn thread_name_is_the_title() {
+    let mut d = CodexDriver::new(CodexConfig {
+        resume: Some(THREAD.into()),
+        ..CodexConfig::default()
+    });
+    let msgs = sent(&d.handshake());
+    let events = feed(
+        &mut d,
+        json!({"id": msgs[2]["id"], "result": {"thread": {"id": THREAD, "name": "auth fix", "turns": []}}}),
+    );
+    assert!(events.contains(&Event::TitleChanged {
+        title: "auth fix".into()
+    }));
+    let renamed = |d: &mut CodexDriver, thread: &str| {
+        feed(
+            d,
+            json!({"method": "thread/name/updated", "params": {"threadId": thread, "threadName": "login fix"}}),
+        )
+    };
+    assert_eq!(
+        renamed(&mut d, THREAD),
+        [Event::TitleChanged {
+            title: "login fix".into()
+        }]
+    );
+    // A subagent's thread is named on its own.
+    assert_eq!(renamed(&mut d, "other"), []);
+}
+
+#[test]
 fn recorded_handshake_starts_session_and_fills_options() {
     let mut d = CodexDriver::default();
     d.handshake();

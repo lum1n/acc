@@ -21,6 +21,14 @@ pub(crate) fn owned(v: &Value, key: &str) -> Option<String> {
     str_at(v, key).map(str::to_owned)
 }
 
+/// A session name the harness reported: `None` when missing or blank.
+pub(crate) fn title_at(v: &Value, key: &str) -> Option<String> {
+    str_at(v, key)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+}
+
 pub(crate) fn u64_at(v: &Value, key: &str) -> Option<u64> {
     let x = v.get(key)?;
     x.as_u64()

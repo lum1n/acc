@@ -106,6 +106,7 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
         Harness::Claude => {
             let d = ClaudeDriver::new(ClaudeConfig {
                 model: model.take(),
+                auto_title: resume.is_none() && attach.is_none(),
                 ..ClaudeConfig::default()
             });
             let spec = d.launch(resume.as_deref());
@@ -600,6 +601,7 @@ impl Printer {
             }
             Event::Notice { message } => self.line(&format!("! {message}")),
             Event::TurnCompleted => self.line("✓ turn completed"),
+            Event::TitleChanged { title } => self.line(&format!("[title {title}]")),
             Event::Panel(panel) => {
                 self.line(&format!("▤ {}", panel.title));
                 for section in &panel.sections {

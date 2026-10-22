@@ -87,6 +87,11 @@ pub enum Event {
     Usage(Usage),
     /// Quota or rate-limit state, only where the harness reports it itself.
     Quota(Quota),
+    /// The harness named or renamed the session. Becomes the session's
+    /// title, over the first-prompt fallback and the title it launched with.
+    TitleChanged {
+        title: String,
+    },
     /// The command palette changed; read it again with `Driver::commands`.
     CommandsChanged,
     /// Options or their current values changed; read them with `Driver::options`.
@@ -109,8 +114,8 @@ pub enum Event {
     Unrecognized {
         raw: String,
     },
-    /// A harness-native update with no common shape yet (plans, session
-    /// titles, extension notifications), passed through for UIs.
+    /// A harness-native update with no common shape yet (plans, extension
+    /// notifications), passed through for UIs.
     Native {
         kind: String,
         #[serde(default, skip_serializing_if = "Value::is_null")]

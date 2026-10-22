@@ -42,7 +42,7 @@ use crate::harness::{Harness, LaunchSpec};
 use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
-use crate::wire::{self, f64_at, owned, str_at, u64_at};
+use crate::wire::{self, f64_at, owned, str_at, title_at, u64_at};
 
 /// Permission modes Claude accepts at runtime. `bypassPermissions` only works
 /// when the process was started with a bypass flag, so it is offered only
@@ -98,6 +98,10 @@ pub struct ClaudeConfig {
     /// detached session see each other's responses in the shared log, so
     /// each needs its own (`[A-Za-z0-9_-]`). Defaults to `acc`.
     pub client_tag: Option<String>,
+    /// Have Claude name the session from the first prompt, as its TUI does
+    /// (headless Claude doesn't on its own).
+    #[serde(default)]
+    pub auto_title: bool,
 }
 
 /// What a control request ACC sent was for, so its reply can be applied.
@@ -107,6 +111,11 @@ enum Pending {
     SetModel(String),
     SetEffort(String),
     SetPermission(String),
+    /// `rename_session`. Claude reports names nowhere in stream-json, so
+    /// the one it accepted is the one ACC knows.
+    Rename(String),
+    /// `generate_session_title`, which answers with the name it saved.
+    Title,
     /// `/plan`: entering plan mode. Once Claude confirms, `prompt` goes out
     /// as the first planning turn and `view` fetches the plan panel.
     Plan {
@@ -179,6 +188,9 @@ pub struct ClaudeDriver {
     commands: Vec<CommandEntry>,
     options: Vec<OptionDef>,
     transmit: Vec<u8>,
+    /// `generate_session_title` went out (see [`ClaudeConfig::auto_title`]).
+    #[serde(default)]
+    title_requested: bool,
 }
 
 impl Default for ClaudeDriver {
@@ -215,6 +227,7 @@ impl ClaudeDriver {
             commands: Vec::new(),
             options: Vec::new(),
             transmit: Vec::new(),
+            title_requested: false,
         };
         d.rebuild_options(None, None);
         d.set_commands(&[]);
@@ -912,7 +925,8 @@ impl ClaudeDriver {
         let id = str_at(resp, "request_id").unwrap_or_default();
         let kind = self.pending.remove(id).unwrap_or(Pending::Other);
         if str_at(resp, "subtype") == Some("error") {
-            if !self.is_ours(id) {
+            // A session without a generated name keeps its first-prompt title.
+            if !self.is_ours(id) || matches!(kind, Pending::Title) {
                 return;
             }
             let error = str_at(resp, "error").unwrap_or("request failed");
@@ -922,11 +936,19 @@ impl ClaudeDriver {
             return;
         }
         let body = resp.get("response").cloned().unwrap_or(Value::Null);
-        // Another client's (or an earlier connection's) `initialize` reply,
-        // read from a shared log: adopt the palette and options it carries.
+        // Another client's (or an earlier connection's) `initialize` or
+        // `generate_session_title` reply, read from a shared log: adopt the
+        // palette and options, or the name, it carries.
         let kind = match kind {
             Pending::Other if body.get("commands").is_some() && body.get("models").is_some() => {
                 Pending::Initialize
+            }
+            Pending::Other
+                if body
+                    .as_object()
+                    .is_some_and(|b| b.len() == 1 && b.contains_key("title")) =>
+            {
+                Pending::Title
             }
             k => k,
         };
@@ -972,6 +994,16 @@ impl ClaudeDriver {
             Pending::SetPermission(mode) => {
                 self.set_option_current(OptionId::Permission, mode);
                 out.push(Event::OptionsChanged);
+            }
+            Pending::Rename(name) => {
+                if !name.is_empty() {
+                    out.push(Event::TitleChanged { title: name });
+                }
+            }
+            Pending::Title => {
+                if let Some(title) = title_at(&body, "title") {
+                    out.push(Event::TitleChanged { title });
+                }
             }
             Pending::Plan { prompt, view } => {
                 self.set_option_current(OptionId::Permission, "plan".into());
@@ -1445,21 +1477,39 @@ impl Driver for ClaudeDriver {
         Ok(match cmd {
             Command::Prompt { text, attachments } => {
                 validate_attachments(&attachments)?;
-                if attachments.is_empty() {
+                let mut bytes = if attachments.is_empty() {
                     Self::user_text(&text)
                 } else {
                     Self::user_blocks(&text, &attachments)
+                };
+                // Like the TUI: the first prompt that isn't a slash command.
+                // Sent after it, so the transcript it's saved to exists.
+                let text = text.trim();
+                if self.config.auto_title
+                    && !self.title_requested
+                    && !text.is_empty()
+                    && !text.starts_with('/')
+                {
+                    self.title_requested = true;
+                    bytes.extend(self.control(
+                        json!({"subtype": "generate_session_title", "description": text, "persist": true}),
+                        Pending::Title,
+                    ));
                 }
+                bytes
             }
             Command::Interrupt => self.control(json!({"subtype": "interrupt"}), Pending::Other),
             Command::Compact { hint } => Self::user_text(&slash("compact", hint.as_deref().unwrap_or(""))),
             Command::New => Self::user_text("/clear"),
             Command::Review => Self::user_text("/review"),
             Command::Invoke { name, args } => return self.invoke(&name, &args),
-            Command::Rename { name } => self.control(
-                json!({"subtype": "rename_session", "title": name}),
-                Pending::Other,
-            ),
+            Command::Rename { name } => {
+                let title = name.trim().to_owned();
+                self.control(
+                    json!({"subtype": "rename_session", "title": name}),
+                    Pending::Rename(title),
+                )
+            }
             // A fork is a relaunch with `ClaudeConfig::fork` and the session id.
             Command::Fork => return Err(unsupported("fork without a relaunch")),
             Command::Shell { .. } => return Err(unsupported("shell commands")),
