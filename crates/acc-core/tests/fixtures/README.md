@@ -18,7 +18,9 @@ replayed by the driver tests.
 Edits made when recording: home paths and the Claude session id were replaced, very long lists
 (tools, commands, skills, models, context grid) were cut down (Cursor's commands to its own, without the recording machine's skills), environment-specific bookkeeping
 lines were dropped, and Codex response ids were renumbered to match the
-order `CodexDriver::handshake` sends its requests in.
+order `CodexDriver::handshake` sends its requests in. The last line of
+`acp/opencode-1.18.35.in.ndjson`, the `session/list` ACC sends after a turn to learn opencode's
+name for the session, was added by hand when the driver started sending it (2026-10-23).
 
 Codex 0.162 recordings: `skills/list` was cut to two system skills and MCP startup lines were
 dropped. The older Codex collab test (`spawnAgent` with

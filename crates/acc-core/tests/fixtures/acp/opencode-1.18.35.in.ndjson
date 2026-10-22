@@ -2,3 +2,4 @@
 {"id":"acc-1","jsonrpc":"2.0","method":"session/new","params":{"cwd":"/home/v/proj","mcpServers":[]}}
 {"id":"acc-2","jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"Run echo acc-live-test","type":"text"}],"sessionId":"ses_eda377c92ffeyTYMrgnCanF025"}}
 {"id":0,"jsonrpc":"2.0","result":{"outcome":{"optionId":"once","outcome":"selected"}}}
+{"id":"acc-3","jsonrpc":"2.0","method":"session/list","params":{"cwd":"/home/v/proj"}}

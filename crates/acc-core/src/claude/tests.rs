@@ -461,6 +461,31 @@ fn accepted_rename_names_the_session() {
             title: "auth fix".into()
         }]
     );
+
+    // The reply names nothing, so `get_status` follows: its reply, in the
+    // shared log, names the session for every other client (Claude 2.1.280).
+    let status = sent(&d.poll_transmit());
+    assert_eq!(status[0]["request"], json!({"subtype": "get_status"}));
+    let mut phone = ClaudeDriver::new(ClaudeConfig {
+        client_tag: Some("phone".into()),
+        ..ClaudeConfig::default()
+    });
+    replay(&mut phone, HI);
+    let status_reply = wire::line(&json!({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": status[0]["request_id"], "response": {"sections": [
+            {"title": "Session", "rows": [
+                {"label": "Version", "value": "2.1.280"},
+                {"label": "Session name", "value": "auth fix"},
+                {"label": "Session ID", "value": "eeb35914-2855-4c95-a7a4-3d799f2a4e91"}]},
+            {"title": "Environment", "rows": [{"label": "Model", "value": "claude-opus-5-5[1m]"}]}]}},
+    }));
+    let named = [Event::TitleChanged {
+        title: "auth fix".into(),
+    }];
+    assert_eq!(phone.on_output(&status_reply), named);
+    assert_eq!(d.on_output(&status_reply), named);
+    assert!(d.poll_transmit().is_empty());
 }
 
 #[test]

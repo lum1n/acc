@@ -264,6 +264,104 @@ fn startup_model_is_applied_as_a_config_option_for_opencode() {
     assert_eq!(set2["params"]["value"], "github-copilot/claude-sonnet-5");
 }
 
+fn listed(session: &str, title: &str) -> Value {
+    json!({ "sessions": [
+        { "sessionId": "other", "cwd": "/home/v/proj", "title": "Someone else's" },
+        { "sessionId": session, "cwd": "/home/v/proj", "title": title } ] })
+}
+
+#[test]
+fn opencode_names_are_read_from_session_list_after_a_turn() {
+    // opencode 2.0.14 names sessions but sends no `session_info_update`.
+    let mut d = driver(Harness::Opencode, Start::New);
+    let init = one(&d.handshake());
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(json!({ "sessionCapabilities": { "list": {} } })),
+        )],
+    );
+    let new = one(&d.poll_transmit());
+    feed(
+        &mut d,
+        &[result(new["id"].clone(), opencode_session("s1", "mock/mock-1"))],
+    );
+    let _ = d.poll_transmit();
+
+    // Still the placeholder (a turn cancelled before opencode titled it):
+    // asked again after the next turn.
+    for title in [
+        "New session - 2026-10-22T22:42:19.221Z",
+        "Norway capital question",
+    ] {
+        let prompt = one(&d.command(Command::prompt("Capital of Norway?")).expect("prompt"));
+        feed(
+            &mut d,
+            &[result(prompt["id"].clone(), json!({ "stopReason": "end_turn" }))],
+        );
+        let list = one(&d.poll_transmit());
+        assert_eq!(list["method"], "session/list");
+        assert_eq!(list["params"], json!({ "cwd": "/home/v/proj" }));
+        let events = feed(&mut d, &[result(list["id"].clone(), listed("s1", title))]);
+        let named = events.contains(&Event::TitleChanged { title: title.into() });
+        assert_eq!(named, !title.starts_with("New session"), "{events:?}");
+    }
+
+    // Named: no more asking.
+    let prompt = one(&d.command(Command::prompt("And Sweden?")).expect("prompt"));
+    feed(
+        &mut d,
+        &[result(prompt["id"].clone(), json!({ "stopReason": "end_turn" }))],
+    );
+    assert!(d.poll_transmit().is_empty());
+
+    // Another client sharing the agent reads the name from the same reply.
+    let mut late = driver(Harness::Opencode, Start::Attach);
+    feed(
+        &mut late,
+        &[
+            result("phone-1", opencode_session("s1", "mock/mock-1")),
+            result("phone-2", listed("s1", "Norway capital question")),
+        ],
+    );
+    let events = feed(&mut late, &[result("phone-3", listed("s1", "Renamed"))]);
+    assert!(events.contains(&Event::TitleChanged {
+        title: "Renamed".into()
+    }));
+}
+
+#[test]
+fn agents_that_push_names_are_not_asked() {
+    let mut d = driver(Harness::Copilot, Start::New);
+    let init = one(&d.handshake());
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(json!({ "sessionCapabilities": { "list": {} } })),
+        )],
+    );
+    let new = one(&d.poll_transmit());
+    feed(&mut d, &[result(new["id"].clone(), copilot_session("s1"))]);
+    let _ = d.poll_transmit();
+    let prompt = one(&d.command(Command::prompt("hi")).expect("prompt"));
+    let events = feed(
+        &mut d,
+        &[
+            update(
+                "s1",
+                json!({ "sessionUpdate": "session_info_update", "title": "Greeting" }),
+            ),
+            result(prompt["id"].clone(), json!({ "stopReason": "end_turn" })),
+        ],
+    );
+    assert!(events.contains(&Event::TitleChanged {
+        title: "Greeting".into()
+    }));
+    assert!(d.poll_transmit().is_empty());
+}
+
 #[test]
 fn a_full_turn_with_a_permission_prompt() {
     let mut d = ready_copilot();

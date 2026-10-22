@@ -111,8 +111,9 @@ enum Pending {
     SetModel(String),
     SetEffort(String),
     SetPermission(String),
-    /// `rename_session`. Claude reports names nowhere in stream-json, so
-    /// the one it accepted is the one ACC knows.
+    /// `rename_session`. Claude's reply doesn't carry the name, so the one
+    /// it accepted is the one ACC knows; `get_status` follows so clients
+    /// sharing the log learn it too.
     Rename(String),
     /// `generate_session_title`, which answers with the name it saved.
     Title,
@@ -1013,6 +1014,8 @@ impl ClaudeDriver {
             Pending::Rename(name) => {
                 if !name.is_empty() {
                     out.push(Event::TitleChanged { title: name });
+                    let bytes = self.control(json!({"subtype": "get_status"}), Pending::Other);
+                    self.transmit.extend(bytes);
                 }
             }
             Pending::Title => {
@@ -1034,7 +1037,12 @@ impl ClaudeDriver {
                     self.transmit.extend(bytes);
                 }
             }
-            Pending::Panel(id) => out.push(Event::Panel(panel(id, &body))),
+            Pending::Panel(id) => {
+                if let Some(title) = status_title(&body) {
+                    out.push(Event::TitleChanged { title });
+                }
+                out.push(Event::Panel(panel(id, &body)));
+            }
             Pending::PanelAction(id) => {
                 let bytes = self.open_panel(id);
                 self.transmit.extend(bytes);
@@ -1062,6 +1070,10 @@ impl ClaudeDriver {
                     self.models.clone_from(models);
                     self.rebuild_options(None, None);
                     out.push(Event::OptionsChanged);
+                }
+                // Any client's `get_status`, such as the one after a rename.
+                if let Some(title) = status_title(&body) {
+                    out.push(Event::TitleChanged { title });
                 }
             }
         }
@@ -1580,6 +1592,18 @@ impl Driver for ClaudeDriver {
     fn poll_transmit(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.transmit)
     }
+}
+
+/// The session's name in a `get_status` reply: its `Session name` row, which
+/// Claude leaves out while the session is unnamed.
+fn status_title(body: &Value) -> Option<String> {
+    body.get("sections")?
+        .as_array()?
+        .iter()
+        .filter_map(|sec| sec.get("rows")?.as_array())
+        .flatten()
+        .find(|row| str_at(row, "label") == Some("Session name"))
+        .and_then(|row| title_at(row, "value"))
 }
 
 /// Draws a control response as panel `id`.
