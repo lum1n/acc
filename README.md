@@ -23,10 +23,10 @@ into ordinary ACC sessions.
 | Crate | What it is |
 |---|---|
 | `crates/acc-core` | Sans-IO core: harness catalogue, drivers, event stream, commands/options, live sessions (`live`) and detached sessions (`session`: launch, attach with replay, transcript, permissions, snapshots), typed items and diffs, detached-session and fan-in scripts, and across harnesses: one permission policy, a git worktree per session, handoff to another harness, usage added up per account and day, skills and MCP servers in every harness's own places, and host-side events while no client is connected |
-| `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections |
+| `crates/acc-ssh` | Daemonless SSH transport (pure-Rust russh): run any driver on a host over plain SSH, surviving dropped connections; `generate_key` for a key of the embedder's own, and `Host::local` (feature `local`) for this machine's sessions with `sh` instead of SSH |
 | `crates/acc-ffi` | UniFFI bindings for Swift and Kotlin (`staticlib` + `cdylib`): the live `Session`, SSH sessions, and the detached-session byte pump (`AccSession`, `AccFanIn` and the host scripts) |
 | `crates/acc-wasm` | wasm-bindgen bindings for browsers and Node: the same objects and functions as `acc-ffi` except the SSH transport (a test keeps them in step), records as plain JS objects in the core's serde shapes, bytes as `Uint8Array` |
-| `crates/acc-node` | napi bindings for Node servers: the SSH transport included (`SshHost`, `RemoteSession`), plus `generateKey` for a key of the server's own. Values in the core's serde shapes, as acc-wasm passes them; released as `acc-node-<version>-<platform>.tar.gz` |
+| `crates/acc-node` | napi bindings for Node servers: the SSH transport included (`SshHost`, `RemoteSession`, and `SshHost.local()` for this machine without a login), plus `generateKey` for a key of the server's own. Values in the core's serde shapes, as acc-wasm passes them; released as `acc-node-<version>-<platform>.tar.gz` |
 | `crates/acc-cli` | `acc` command-line tool for hosts and spikes |
 
 ## Quick start
@@ -53,6 +53,9 @@ cargo run -p acc-ffi --features bindgen --bin uniffi-bindgen -- \
 # JS bindings (browser: --target web)
 cargo build -p acc-wasm --release --target wasm32-unknown-unknown
 wasm-bindgen --target nodejs --out-dir bindings/node target/wasm32-unknown-unknown/release/acc_wasm.wasm
+
+# Node addon with the SSH transport (Linux, macOS; Node 20+)
+(cd crates/acc-node && npm run build)    # acc.<platform>-<arch>.node next to index.js
 ```
 
 From Swift, a session is a few calls; the app moves the bytes (see `docs/ARCHITECTURE.md`, Bindings):

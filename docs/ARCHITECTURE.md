@@ -25,9 +25,9 @@
  └──────────────┬──────────────────────────────┬────────────────────┘
                 │ bytes                        │ bytes
    transports (outside the core): local process · acc-ssh (SSH exec channel
-   to a detached FIFO/log)
+   to a detached FIFO/log, or `sh` on this machine)
                 │
-   bindings: acc-ffi (Swift, Kotlin) · acc-wasm (JS) · acc-cli
+   bindings: acc-ffi (Swift, Kotlin) · acc-wasm (JS) · acc-node (Node) · acc-cli
 ```
 
 **Sans-IO.** Drivers are pure state machines: harness bytes in, `Event`s out; `Command`s in, bytes
@@ -154,9 +154,10 @@ on EOF:               exited(code, now_ms)
 |---|---|---|
 | Swift, Kotlin | `acc-ffi` (UniFFI 0.32) | Typed records and enums mirroring the core, items with their typed `AccItemDetail`; free-form JSON as strings (`input_json`, `native_json`, `payload_json`). `Event.UsageUpdated` / `QuotaUpdated` are the core's `Usage` / `Quota` events. |
 | JS (browser, Node) | `acc-wasm` (wasm-bindgen) | Plain objects in the core's serde shape (snake_case, `type`-tagged), so they match `acc run --json`; bytes are `Uint8Array`; TypeScript declarations ship in the generated `.d.ts`. |
+| Node servers | `acc-node` (napi) | The SSH transport only (`SshHost`, `RemoteSession`, `generateKey`); options are camelCase objects, the core's values plain objects in its serde shape as in `acc-wasm`; errors carry the `AccError` variant as `code`; declarations in `index.d.ts`. |
 
-Both also expose `DetachedSession` (the daemonless scripts below), `tui_command` (opening a
-harness's own TUI for `Exec::Terminal` entries) and `shell_quote`. CI replays a recorded Claude
+`acc-ffi` and `acc-wasm` also expose `DetachedSession` (the daemonless scripts below),
+`tui_command` (opening a harness's own TUI for `Exec::Terminal` entries) and `shell_quote`. CI replays a recorded Claude
 session through the real library from Swift (macOS), Kotlin (JVM), Python and Node.
 
 The second layer is the detached-session byte pump over `acc_core::session::Session` (see
@@ -181,6 +182,11 @@ Errors are typed (`Timeout` and `Disconnected` mean calling again retries; `Host
 the fingerprint to show). Kotlin needs `kotlinx-coroutines-core` for the suspend calls. A Rust test
 drives this surface against a real sshd; the Swift, Kotlin and Python smoke tests call it
 through the generated bindings.
+
+`acc-node` carries the same `SshHost` and `RemoteSession` for Node servers (its calls return
+promises), plus `SshHost.local()` (see `Host::local` below) and `generateKey`, an ed25519 key for
+the server to log in with. It is released per platform as `acc-node-<version>-<platform>.tar.gz`;
+CI runs its tests against a real sshd.
 
 ## Daemonless sessions
 
@@ -239,6 +245,13 @@ it builds for iOS and Android without OpenSSH or CMake; CI builds it for both). 
   session id) on a `Detached`: `send(Command)` and `next_events()`, writing the driver's replies
   itself and stamping state with the clock. A second client attaches from offset 0 and replays the
   session into a fresh core.
+
+`Host::local()` (feature `local`) is this machine as the user running the process: the same
+scripts run with `sh` instead of over SSH, so an embedder running where the agents do can list,
+follow and drive sessions any client started there, without a login. Scripts get a login's
+environment (`HOME`, `USER`, `PATH`, the locale), not the rest of the process's. `generate_key`
+makes an ed25519 key pair (OpenSSH private key, `authorized_keys` line) for an embedder that logs
+in with a key of its own.
 
 CI drives a real OpenSSH server through a proxy that cuts and freezes connections mid-session.
 
