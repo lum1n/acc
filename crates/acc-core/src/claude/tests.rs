@@ -56,7 +56,7 @@ fn launch_spec_requests_control_protocol() {
         model: Some("opus".into()),
         permission_mode: None,
         fork: true,
-        client_tag: None,
+        ..ClaudeConfig::default()
     });
     let spec = d.launch(Some("abc"));
     for flag in [
@@ -438,6 +438,86 @@ fn set_model_reply_updates_current_option() {
     assert!(events.contains(&Event::OptionsChanged));
     let model = d.options().iter().find(|o| o.id == OptionId::Model).unwrap();
     assert_eq!(model.current.as_deref(), Some("haiku"));
+}
+
+#[test]
+fn accepted_rename_names_the_session() {
+    let mut d = ClaudeDriver::default();
+    replay(&mut d, HI);
+    let req = sent(
+        &d.command(Command::Rename {
+            name: " auth fix ".into(),
+        })
+        .unwrap(),
+    );
+    let id = req[0]["request_id"].as_str().unwrap().to_owned();
+    let events = d.on_output(&wire::line(&json!({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": id},
+    })));
+    assert_eq!(
+        events,
+        [Event::TitleChanged {
+            title: "auth fix".into()
+        }]
+    );
+}
+
+#[test]
+fn first_prompt_asks_claude_to_name_the_session() {
+    let mut d = ClaudeDriver::new(ClaudeConfig {
+        auto_title: true,
+        ..ClaudeConfig::default()
+    });
+    replay(&mut d, HI);
+    assert_eq!(sent(&d.command(Command::prompt("/compact")).unwrap()).len(), 1);
+    let first = sent(&d.command(Command::prompt(" fix the login test ")).unwrap());
+    assert_eq!(first[0]["type"], "user");
+    assert_eq!(
+        first[1]["request"],
+        json!({"subtype": "generate_session_title", "description": "fix the login test", "persist": true})
+    );
+    assert_eq!(
+        sent(&d.command(Command::prompt("and the rest")).unwrap()).len(),
+        1
+    );
+    let reply = |id: &Value, response: Value| {
+        wire::line(
+            &json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": response}}),
+        )
+    };
+    let events = d.on_output(&reply(
+        &first[1]["request_id"],
+        json!({"title": "Login test fix"}),
+    ));
+    assert_eq!(
+        events,
+        [Event::TitleChanged {
+            title: "Login test fix".into()
+        }]
+    );
+    // Another client's request, read from the shared log.
+    let events = d.on_output(&reply(&json!("other-3"), json!({"title": "Renamed"})));
+    assert_eq!(
+        events,
+        [Event::TitleChanged {
+            title: "Renamed".into()
+        }]
+    );
+}
+
+#[test]
+fn failed_title_request_is_quiet() {
+    let mut d = ClaudeDriver::new(ClaudeConfig {
+        auto_title: true,
+        ..ClaudeConfig::default()
+    });
+    let sent = sent(&d.command(Command::prompt("hi")).unwrap());
+    let events = d.on_output(&wire::line(&json!({
+        "type": "control_response",
+        "response": {"subtype": "error", "request_id": sent[1]["request_id"], "error": "no model"},
+    })));
+    assert_eq!(events, []);
 }
 
 #[test]

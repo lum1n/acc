@@ -109,6 +109,8 @@ pub struct SessionSpec {
     pub fork: bool,
     /// The harness's own session id, once known.
     pub native_id: Option<String>,
+    /// The harness's name for the session ([`Event::TitleChanged`]), else
+    /// the launch title, else the first prompt.
     pub title: Option<String>,
     pub created_ms: u64,
     pub parent: Option<String>,
@@ -292,6 +294,9 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
             permission_mode: spec.permission.clone(),
             fork: spec.fork,
             client_tag: Some(tag.to_owned()),
+            // Only the client that launches a fresh session asks, and not
+            // when the embedder named it.
+            auto_title: !attach && spec.resume.is_none() && spec.title.is_none(),
         })),
         Harness::Codex => Box::new(CodexDriver::new(CodexConfig {
             resume,
@@ -1068,6 +1073,10 @@ impl Session {
                 Event::PermissionResolved { request_id } => {
                     self.permissions.retain(|p| p.request_id != *request_id);
                 }
+                Event::TitleChanged { title } if self.spec.title.as_deref() != Some(title.as_str()) => {
+                    self.spec.title = Some(title.clone());
+                    self.spec_dirty = !replay;
+                }
                 _ => {}
             }
             let closed = self.transcript.settle(&event);
@@ -1154,6 +1163,7 @@ mod tests {
     const CLAUDE_HI: &str = include_str!("../tests/fixtures/claude/hi-and-controls.ndjson");
     const CODEX_HANDSHAKE: &str = include_str!("../tests/fixtures/codex/handshake.ndjson");
     const PI_TURN: &str = include_str!("../tests/fixtures/pi/rpc-turn-with-dialog.jsonl");
+    const CURSOR: &str = include_str!("../tests/fixtures/acp/cursor-2026.10.01.out.ndjson");
 
     fn req(h: Harness) -> LaunchRequest {
         LaunchRequest {
@@ -1392,6 +1402,38 @@ mod tests {
         let exec = s.take_spec_write().expect("spec write");
         assert!(exec.script.contains("spec.json"));
         assert!(s.take_spec_write().is_none());
+    }
+
+    #[test]
+    fn claude_names_fresh_untitled_sessions_only() {
+        let asks = |r: LaunchRequest| {
+            let (mut s, _) = Session::launch(r, "s1", "a", 1).unwrap();
+            s.feed(CLAUDE_HI.as_bytes(), 2);
+            String::from_utf8(s.take_transmit())
+                .unwrap()
+                .contains("generate_session_title")
+        };
+        let mut r = req(Harness::Claude);
+        r.prompt = Some("fix the login test".into());
+        assert!(asks(r.clone()));
+        assert!(!asks(LaunchRequest {
+            title: Some("mine".into()),
+            ..r.clone()
+        }));
+        assert!(!asks(LaunchRequest {
+            resume: Some("abc".into()),
+            ..r
+        }));
+    }
+
+    #[test]
+    fn the_harness_names_the_session() {
+        let mut r = req(Harness::Cursor);
+        r.title = Some("mine".into());
+        let (mut s, _) = Session::launch(r, "s1", "a", 1).unwrap();
+        s.feed(CURSOR.as_bytes(), 2);
+        assert_eq!(s.spec().title.as_deref(), Some("Echo Live Test"));
+        assert!(s.take_spec_write().is_some());
     }
 
     /// Reads the first half of `log` (at a line boundary), saves a

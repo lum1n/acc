@@ -304,6 +304,10 @@ pub enum AccEvent {
     Quota {
         quota: AccQuota,
     },
+    /// The harness named or renamed the session.
+    TitleChanged {
+        title: String,
+    },
     CommandsChanged,
     OptionsChanged,
     Notice {
@@ -401,6 +405,7 @@ impl From<Event> for AccEvent {
             Event::PermissionResolved { request_id } => Self::PermissionResolved { request_id },
             Event::Usage(u) => Self::Usage { usage: u.into() },
             Event::Quota(q) => Self::Quota { quota: q.into() },
+            Event::TitleChanged { title } => Self::TitleChanged { title },
             Event::CommandsChanged => Self::CommandsChanged,
             Event::OptionsChanged => Self::OptionsChanged,
             Event::Notice { message } => Self::Notice { message },

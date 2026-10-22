@@ -102,6 +102,7 @@ impl Session {
             Harness::Claude => {
                 let d = ClaudeDriver::new(ClaudeConfig {
                     model,
+                    auto_title: opening == Opening::New,
                     ..ClaudeConfig::default()
                 });
                 let spec = d.launch(resume.as_deref());

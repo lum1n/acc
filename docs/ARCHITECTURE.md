@@ -52,6 +52,14 @@ probably fine, older can lack a flag ACC passes. Unknown events are kept as `Eve
 never fatal. `Event::TurnCompleted` is the last event of a turn on every harness, after the state
 the turn ended in.
 
+**Session names.** `Event::TitleChanged` carries the harness's name for the session, and
+`Session` keeps `SessionSpec::title` in step with it, over the launch title and the first-prompt
+fallback. Copilot and Cursor name sessions themselves (ACP `session_info_update`). Codex and pi
+report only names given with rename (`thread.name`, `sessionName`). Headless Claude names nothing
+on its own, so with `ClaudeConfig::auto_title` (on for fresh untitled sessions) the driver sends
+`generate_session_title` after the first prompt, as Claude's TUI does, and Claude saves the result
+to its transcript.
+
 **Images.** `Command::Prompt` and `LaunchRequest` carry `Attachment`s: images inline as base64, so
 nothing is copied to the host first and the bytes ride the same stdin path as text. Every
 harness takes them in its prompt: Claude as Anthropic `image` content blocks, Codex as
