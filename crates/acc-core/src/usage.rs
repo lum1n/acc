@@ -265,7 +265,7 @@ pub fn roll_up(records: &[UsageRecord], utc_offset_minutes: i32) -> UsageRollup 
                 a.plan_at = at;
             }
             for w in &q.windows {
-                if a.windows.get(&w.id).is_none_or(|(seen, _)| *seen <= at) {
+                if a.windows.get(&w.id).is_none_or(|seen| later(w, at, seen)) {
                     a.windows.insert(w.id.clone(), (at, w.clone()));
                 }
             }
@@ -299,6 +299,25 @@ struct Account {
     usage: AccountUsage,
     windows: BTreeMap<String, (u64, QuotaWindow)>,
     plan_at: u64,
+}
+
+/// Whether window reading `w`, taken at `at`, is newer than `seen`.
+/// Sessions replayed on attach date their readings to when they started,
+/// so the readings themselves come first: a later reset is a later window,
+/// and within one window usage only grows.
+fn later(w: &QuotaWindow, at: u64, (seen_at, seen): &(u64, QuotaWindow)) -> bool {
+    match (w.resets_at, seen.resets_at) {
+        (Some(r), Some(s)) if r != s => return r > s,
+        (Some(_), Some(_)) => {
+            if let (Some(u), Some(s)) = (w.used_percent, seen.used_percent)
+                && u != s
+            {
+                return u > s;
+            }
+        }
+        _ => {}
+    }
+    at >= *seen_at
 }
 
 fn harness_order(h: Harness) -> u8 {
@@ -455,6 +474,38 @@ mod tests {
         assert_eq!(q.plan.as_deref(), Some("pro"));
         assert_eq!(q.windows[0].used_percent, Some(40.0));
         assert!(utc.accounts[1].quota.is_none());
+    }
+
+    #[test]
+    fn the_newest_reading_wins_whatever_it_was_dated() {
+        let window = |pct: f64, resets: u64| QuotaWindow {
+            id: "five_hour".into(),
+            used_percent: Some(pct),
+            resets_at: Some(resets),
+            ..QuotaWindow::default()
+        };
+        let record = |id: &str, w: QuotaWindow, at: u64| UsageRecord {
+            session_id: id.into(),
+            harness: Harness::Claude,
+            buckets: Vec::new(),
+            quota: Some(Quota {
+                windows: vec![w],
+                ..Quota::default()
+            }),
+            quota_at_ms: Some(at),
+        };
+        let used = |records: &[UsageRecord]| {
+            roll_up(records, 0).accounts[0].quota.as_ref().unwrap().windows[0].used_percent
+        };
+        // An old session replayed on attach, dated to its start, read 80%
+        // after a younger one read 40% in the same window.
+        let replayed = record("old", window(80.0, 5_000), 1_000);
+        let younger = record("young", window(40.0, 5_000), 2_000);
+        assert_eq!(used(&[replayed.clone(), younger.clone()]), Some(80.0));
+        assert_eq!(used(&[younger, replayed.clone()]), Some(80.0));
+        // A later window is newer even with less used.
+        let next = record("next", window(5.0, 9_000), 500);
+        assert_eq!(used(&[next, replayed]), Some(5.0));
     }
 
     #[test]

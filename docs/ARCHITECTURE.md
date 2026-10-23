@@ -329,6 +329,9 @@ adds records up per account (or plan, when the harness names no account), keepin
 window's newest reading, and per local day in the time zone the client gives. Clients keep records
 of removed sessions to count them. The log has no times, so usage replayed on attach is dated to the
 session's start; usage read live is dated by the client's clock, and snapshots keep the dates.
+Those dates can't order quota readings across sessions, so `roll_up` orders them by the readings
+first: a later `resets_at` is a later window, and within one window the higher `used_percent` is
+newer. Only readings that tie fall back to the dates.
 
 **Handoff.** `Command::Handoff { harness, prompt }` continues a conversation in another harness
 (Claude is out of quota: go on in Codex). The detached session answers with `Outbound::Relaunch`: a
