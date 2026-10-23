@@ -12,6 +12,10 @@
 //! same FIFO and log, see [`crate::detached`]). For that, request ids carry a
 //! per-client tag and responses to other clients' requests are read by shape:
 //! a `stopReason` ends the turn, `configOptions` update the options, and so on.
+//!
+//! Copilot and Cursor push the session's name (`session_info_update`).
+//! opencode names it too but only reports the name in `session/list`, so
+//! after a turn the driver asks there until a name arrives.
 //! A client joining a running agent uses [`Start::Attach`], which skips the
 //! handshake and adopts the session it sees in the log.
 
@@ -49,6 +53,8 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const MAX_EARLY: usize = 1024;
 /// ACP "authentication required".
 const AUTH_REQUIRED: i64 = -32000;
+/// How opencode titles a session it hasn't named yet (`New session - <ISO time>`).
+const PLACEHOLDER_TITLE: &str = "New session - ";
 
 /// How the driver gets a session once the agent is up.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -103,6 +109,8 @@ enum Pending {
     SetConfig,
     SetMode { mode: String },
     SetModel { model: String },
+    // `session/list`, for the active session's name.
+    ListSessions,
 }
 
 /// Where the connection is in its lifecycle.
@@ -143,9 +151,15 @@ pub struct AcpDriver {
     prompt_images: bool,
     resume_session: bool,
     fork_session: bool,
+    /// `sessionCapabilities.list`: whether `session/list` can name the session.
+    #[serde(default)]
+    list_sessions: bool,
     auth_methods: Vec<(String, String)>,
 
     session_id: Option<String>,
+    /// The agent has named the active session.
+    #[serde(default)]
+    titled: bool,
     /// `session/load` is replaying history; don't treat it as live activity.
     replaying: bool,
     opts: OptionState,
@@ -212,8 +226,10 @@ impl AcpDriver {
             prompt_images: false,
             resume_session: false,
             fork_session: false,
+            list_sessions: false,
             auth_methods: Vec::new(),
             session_id: None,
+            titled: false,
             replaying: false,
             opts,
             harness_commands: Vec::new(),
@@ -466,7 +482,9 @@ impl AcpDriver {
             Pending::Prompt => {
                 self.echoed_turns = self.echoed_turns.saturating_sub(1);
                 self.on_turn_end(&r, out);
+                self.ask_title();
             }
+            Pending::ListSessions => self.listed_sessions(&r, out),
             Pending::SetConfig => {
                 if r.get("configOptions").is_some() {
                     self.opts.absorb_response(&r);
@@ -543,6 +561,8 @@ impl AcpDriver {
                     message: format!("Couldn't {what}: {message}"),
                 });
             }
+            // The session keeps the name it has.
+            Pending::ListSessions => {}
         }
     }
 
@@ -583,6 +603,7 @@ impl AcpDriver {
             .unwrap_or(false);
         self.resume_session = has("resume");
         self.fork_session = has("fork");
+        self.list_sessions = has("list");
         self.auth_methods = r
             .get("authMethods")
             .and_then(Value::as_array)
@@ -631,6 +652,7 @@ impl AcpDriver {
     }
 
     fn reset_session(&mut self) {
+        self.titled = false;
         self.permissions.clear();
         self.open_item = None;
         self.open_tools.clear();
@@ -682,12 +704,46 @@ impl AcpDriver {
         out.push(Event::TurnCompleted);
     }
 
+    /// Asks `session/list` for the session's name after a turn, for agents
+    /// that name sessions without saying so (opencode titles it from the
+    /// first prompt while the turn runs). The reply lands in the shared log,
+    /// so attached clients learn the name too.
+    fn ask_title(&mut self) {
+        if !self.list_sessions || self.titled || self.session_id.is_none() {
+            return;
+        }
+        let params = json!({ "cwd": self.cfg.cwd });
+        let bytes = self.request("session/list", params, Pending::ListSessions);
+        self.outgoing.extend(bytes);
+    }
+
+    /// Adopts the active session's name from a `session/list` result.
+    fn listed_sessions(&mut self, r: &Value, out: &mut Vec<Event>) {
+        let Some(sid) = self.session_id.as_deref() else {
+            return;
+        };
+        let title = r
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|s| s.get("sessionId").and_then(Value::as_str) == Some(sid))
+            .and_then(|s| title_at(s, "title"))
+            .filter(|t| !t.starts_with(PLACEHOLDER_TITLE));
+        if let Some(title) = title {
+            self.titled = true;
+            out.push(Event::TitleChanged { title });
+        }
+    }
+
     /// A response to a request this client didn't send.
     fn observe_foreign_result(&mut self, r: &Value, out: &mut Vec<Event>) {
         if r.get("agentCapabilities").is_some() {
             self.absorb_capabilities(r);
         } else if r.get("stopReason").is_some() {
             self.on_turn_end(r, out);
+        } else if r.get("sessions").is_some() {
+            self.listed_sessions(r, out);
         } else if let Some(sid) = r.get("sessionId").and_then(Value::as_str) {
             // Another client opened or forked a session; follow it.
             self.on_session_open(sid.to_owned(), r, out);
@@ -848,7 +904,10 @@ impl AcpDriver {
                 }
             }
             "session_info_update" => match title_at(update, "title") {
-                Some(title) => out.push(Event::TitleChanged { title }),
+                Some(title) => {
+                    self.titled = true;
+                    out.push(Event::TitleChanged { title });
+                }
                 None => out.push(native(kind, update)),
             },
             "usage_update" => {

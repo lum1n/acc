@@ -45,7 +45,7 @@ pub struct SessionConfig {
     /// Model to start with, where the harness takes one at launch.
     pub model: Option<String>,
     /// Tag for this client's request ids, unique among clients sharing one
-    /// harness process (`[A-Za-z0-9_-]`). Used by ACP and pi.
+    /// harness process (`[A-Za-z0-9_-]`). Used by Claude, ACP and pi.
     pub client_tag: String,
 }
 
@@ -102,6 +102,7 @@ impl Session {
             Harness::Claude => {
                 let d = ClaudeDriver::new(ClaudeConfig {
                     model,
+                    client_tag: Some(client_tag),
                     auto_title: opening == Opening::New,
                     ..ClaudeConfig::default()
                 });
@@ -330,6 +331,14 @@ mod tests {
                 .start()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn claude_request_ids_carry_the_client_tag() {
+        let mut cfg = SessionConfig::new(Harness::Claude, "/tmp");
+        cfg.client_tag = "phone-3f2a".into();
+        let start = String::from_utf8(Session::new(cfg).start()).expect("utf8");
+        assert!(start.contains(r#""request_id":"phone-3f2a-1""#), "{start}");
     }
 
     #[test]

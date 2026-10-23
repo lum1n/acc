@@ -54,11 +54,15 @@ the turn ended in.
 
 **Session names.** `Event::TitleChanged` carries the harness's name for the session, and
 `Session` keeps `SessionSpec::title` in step with it, over the launch title and the first-prompt
-fallback. Copilot and Cursor name sessions themselves (ACP `session_info_update`). Codex and pi
-report only names given with rename (`thread.name`, `sessionName`). Headless Claude names nothing
-on its own, so with `ClaudeConfig::auto_title` (on for fresh untitled sessions) the driver sends
+fallback. Copilot and Cursor name sessions themselves (ACP `session_info_update`). opencode
+(2.0.14) names them too but never says so, so after a turn the ACP driver asks `session/list`
+until it reports a name other than its `New session - <time>` placeholder. Codex and pi report
+only names given with rename (`thread.name`, `sessionName`). Headless Claude names nothing on its
+own, so with `ClaudeConfig::auto_title` (on for fresh untitled sessions) the driver sends
 `generate_session_title` after the first prompt, as Claude's TUI does, and Claude saves the result
-to its transcript.
+to its transcript. Claude's reply to `rename_session` doesn't carry the name, so the renaming
+client follows it with `get_status`, whose `Session name` row every client reading the log adopts.
+A rename made outside ACC (claude.ai, an IDE) still shows only at the next `get_status`.
 
 **Images.** `Command::Prompt` and `LaunchRequest` carry `Attachment`s: images inline as base64, so
 nothing is copied to the host first and the bytes ride the same stdin path as text. Every
