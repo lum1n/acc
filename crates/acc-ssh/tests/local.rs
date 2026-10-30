@@ -120,6 +120,7 @@ async fn drives_a_detached_session_on_this_machine() {
         args: vec![],
         env: vec![],
         protocol: Protocol::Acp,
+        sandbox: None,
     };
     let pipe = Detached::launch(host.clone(), &id, &spec, "/tmp", None)
         .await

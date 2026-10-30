@@ -9,7 +9,8 @@
 //! [`Exec`]s to run on the host and takes the bytes they print.
 //!
 //! A typical client:
-//! 1. `Session::launch` (run the returned exec; its stdout is the PID), or
+//! 1. `Session::launch` (run the returned exec; its stdout is the PID, and
+//!    goes to [`Session::on_launched`]), or
 //!    `Session::attach` with a spec from [`crate::detached::list_script`]
 //!    and then [`Session::status_exec`] → [`Session::on_status`].
 //! 2. Follow the log from [`Session::offset`] (with
@@ -31,7 +32,7 @@ use crate::acp::{AcpConfig, AcpDriver, Start, launch_spec as acp_launch};
 use crate::claude::{ClaudeConfig, ClaudeDriver};
 use crate::codex::{CodexConfig, CodexDriver};
 use crate::command::{Apply, Attachment, Command, CommandEntry, OptionDef, OptionId};
-use crate::detached::{SessionDir, Status, parse_status};
+use crate::detached::{SessionDir, Status, parse_sandbox, parse_status};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
 use crate::exec::Exec;
@@ -39,6 +40,7 @@ use crate::harness::{Harness, LaunchSpec, Launcher};
 use crate::item::ItemDetail;
 use crate::pi::PiDriver;
 use crate::policy::{Decision, Policy, Request};
+use crate::sandbox::{Applied, Sandbox};
 use crate::state::{BlockKind, RunState, SessionState, StateSource, StateTracker};
 use crate::transcript::{ItemChange, Transcript};
 use crate::usage::{Spending, UsageRecord};
@@ -92,6 +94,10 @@ pub struct LaunchRequest {
     /// discard its changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Confine the harness (see [`crate::sandbox`]). `Some(Sandbox::default())`
+    /// is the opinionated preset; `None` runs it unconfined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Sandbox>,
 }
 
 /// Everything another client needs to attach; stored as `spec.json`.
@@ -123,6 +129,10 @@ pub struct SessionSpec {
     /// The session's git worktree (see [`LaunchRequest::worktree`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// The sandbox asked for (see [`LaunchRequest::sandbox`]); its rules
+    /// for this harness are in `launch.sandbox`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Sandbox>,
 }
 
 impl SessionSpec {
@@ -146,6 +156,7 @@ impl SessionSpec {
             labels: BTreeMap::new(),
             launcher: None,
             worktree: None,
+            sandbox: None,
         }
     }
 
@@ -246,6 +257,8 @@ pub struct Session {
     /// by this client. They aren't repeated on a reconnect or a restore:
     /// every query's answer lands in the log, which would grow per attach.
     handshaken: bool,
+    /// What the host's sandbox applied, once a launch or status said.
+    sandbox: Option<Applied>,
 }
 
 /// What [`Session::snapshot`] writes; borrowed on the way out.
@@ -369,6 +382,7 @@ impl Session {
                 args: Vec::new(),
                 env: Vec::new(),
                 protocol: harness.preferred_protocol(),
+                sandbox: None,
             },
             model: req.model.clone(),
             permission: req.permission.clone(),
@@ -381,6 +395,7 @@ impl Session {
             labels: req.labels.clone(),
             launcher: req.launcher.clone(),
             worktree: req.worktree.clone(),
+            sandbox: req.sandbox.clone(),
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
@@ -391,6 +406,8 @@ impl Session {
         if let Some(launcher) = &spec.launcher {
             spec.launch = launcher.wrap(spec.launch);
         }
+        // Outermost, so a launcher's prefix (`nice`, `env`) runs inside it.
+        spec.launch.sandbox = spec.sandbox.as_ref().map(|s| crate::sandbox::rules(harness, s));
         let exec = Exec::new(dir.launch_script_with_spec(&spec.launch, &spec.cwd, Some(&spec.to_json())));
         let mut transmit = driver.handshake();
         let has_text = req.prompt.as_deref().is_some_and(|p| !p.trim().is_empty());
@@ -432,6 +449,7 @@ impl Session {
             spec_dirty: false,
             exited: false,
             handshaken: true,
+            sandbox: None,
             spec,
         };
         Ok((session, exec))
@@ -464,6 +482,7 @@ impl Session {
             spec_dirty: false,
             exited: false,
             handshaken: false,
+            sandbox: None,
             spec,
         })
     }
@@ -545,6 +564,7 @@ impl Session {
             spec_dirty: snap.spec_dirty,
             exited: snap.exited,
             handshaken: snap.handshaken,
+            sandbox: None,
             spec,
         })
     }
@@ -662,13 +682,14 @@ impl Session {
         if let Some(history) = history {
             self.driver.on_history(history);
         }
+        let mut out = Vec::new();
+        self.on_sandbox(stdout, &mut out);
         let Some(status) = status else {
-            return Vec::new();
+            return out;
         };
         if self.replay_until.is_none() {
             self.replay_until = Some(status.size());
         }
-        let mut out = Vec::new();
         match status {
             Status::Alive { .. } => {
                 self.alive = true;
@@ -681,6 +702,39 @@ impl Session {
         }
         self.police(&mut out);
         out
+    }
+
+    /// Applies the output of the launch exec (the PID, then for a
+    /// sandboxed session what the host applied). A session that asked for a
+    /// sandbox but runs unconfined gets an [`Event::Notice`].
+    pub fn on_launched(&mut self, stdout: &str) -> Vec<Update> {
+        let mut out = Vec::new();
+        self.on_sandbox(stdout, &mut out);
+        out
+    }
+
+    /// What the host's sandbox applied: `None` until a launch or status
+    /// output said, and for sessions that didn't ask for one.
+    pub fn sandbox(&self) -> Option<&Applied> {
+        self.sandbox.as_ref()
+    }
+
+    /// Records the sandbox line of a launch or status output, with a notice
+    /// the first time it says the harness runs unconfined.
+    fn on_sandbox(&mut self, stdout: &str, out: &mut Vec<Update>) {
+        let Some(applied) = parse_sandbox(stdout) else {
+            return;
+        };
+        if self.sandbox.is_none()
+            && let Some(message) = applied.notice()
+        {
+            out.push(Update {
+                event: Event::Notice { message },
+                item: None,
+                replay: false,
+            });
+        }
+        self.sandbox = Some(applied);
     }
 
     /// Applies the content of the session's exit file (from a fan-in entry).
@@ -779,6 +833,7 @@ impl Session {
             labels: self.spec.labels.clone(),
             launcher: self.spec.launcher.clone(),
             worktree: self.spec.worktree.clone(),
+            sandbox: self.spec.sandbox.clone(),
         }
     }
 
@@ -806,6 +861,10 @@ impl Session {
             prompt: Some(prompt),
             parent: Some(self.spec.id.clone()),
             worktree: self.spec.worktree.clone(),
+            // Same wrapper and confinement; `launch` resolves the sandbox's
+            // rules for the new harness.
+            launcher: self.spec.launcher.clone(),
+            sandbox: self.spec.sandbox.clone(),
             ..LaunchRequest::default()
         })
     }
@@ -1563,6 +1622,75 @@ mod tests {
             panic!("fork relaunches")
         };
         assert_eq!(again.worktree.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn sandboxed_sessions_keep_it_through_relaunches_and_handoffs() {
+        let mut r = req(Harness::Claude);
+        r.sandbox = Some(Sandbox::default());
+        r.launcher = Some(Launcher {
+            prefix: vec!["nice".into()],
+            ..Launcher::default()
+        });
+        let (mut s, exec) = Session::launch(r, "s1", "t", 1).unwrap();
+        assert!(exec.script.contains("bwrap") && exec.script.contains("sandbox-exec"));
+        let spec = SessionSpec::from_json(&s.spec().to_json()).unwrap();
+        let rules = spec.launch.sandbox.clone().unwrap();
+        assert!(rules.write.iter().any(|p| p == "~/.claude"));
+        assert_eq!(
+            spec.launch.program, "nice",
+            "the launcher runs inside the sandbox"
+        );
+
+        let Ok(Outbound::Relaunch(fork)) = s.command(Command::Fork) else {
+            panic!("fork relaunches")
+        };
+        assert_eq!(fork.sandbox, Some(Sandbox::default()));
+
+        let Ok(Outbound::Relaunch(h)) = s.command(Command::Handoff {
+            harness: Harness::Codex,
+            prompt: None,
+        }) else {
+            panic!("handoff relaunches")
+        };
+        assert_eq!(
+            (h.sandbox.clone(), h.launcher.clone()),
+            (Some(Sandbox::default()), s.spec().launcher.clone())
+        );
+        let (codex, _) = Session::launch(h, "s2", "t", 2).unwrap();
+        let rules = codex.spec().launch.sandbox.clone().unwrap();
+        assert!(
+            rules.write.iter().any(|p| p == "~/.codex"),
+            "re-resolved for Codex"
+        );
+        assert!(!rules.write.iter().any(|p| p == "~/.claude"));
+    }
+
+    #[test]
+    fn unconfined_sandbox_is_noticed_once() {
+        let mut r = req(Harness::Pi);
+        r.sandbox = Some(Sandbox::default());
+        let (mut s, _) = Session::launch(r, "s1", "t", 1).unwrap();
+        assert_eq!(s.sandbox(), None);
+        let ups = s.on_launched("4242\nB none bwrap not found\n");
+        assert!(
+            matches!(&ups[..], [Update { event: Event::Notice { message }, .. }] if message.contains("bwrap not found"))
+        );
+        assert!(
+            s.on_status("alive 4242 0\nB none bwrap not found\n", 2)
+                .is_empty()
+        );
+        assert!(matches!(s.sandbox(), Some(Applied::None { .. })));
+
+        let mut a = Session::attach(s.spec().clone(), "b").unwrap();
+        let ups = a.on_status("alive 4242 0\nB none bwrap not found\n", 2);
+        assert!(
+            ups.iter().any(|u| matches!(&u.event, Event::Notice { .. })),
+            "attaching clients see it"
+        );
+        let mut b = Session::attach(s.spec().clone(), "c").unwrap();
+        assert!(b.on_status("alive 4242 0\nB bwrap\n", 2).is_empty());
+        assert_eq!(b.sandbox(), Some(&Applied::Bwrap));
     }
 
     #[test]

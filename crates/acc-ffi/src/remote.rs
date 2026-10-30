@@ -292,6 +292,13 @@ impl RemoteSession {
     }
 
     /// Log bytes delivered so far.
+    /// What the host's sandbox applied, for a session launched with
+    /// `SessionConfig::sandbox`. When it couldn't, the first `next_events`
+    /// also brings a notice.
+    pub fn sandbox(&self) -> Option<crate::acc_types::AccSandboxApplied> {
+        self.inner.sandbox().map(Into::into)
+    }
+
     pub fn offset(&self) -> u64 {
         self.inner.pipe().offset()
     }

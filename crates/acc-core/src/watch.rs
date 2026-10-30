@@ -313,6 +313,7 @@ mod sh_tests {
             args: vec![],
             env: vec![],
             protocol: Protocol::Acp,
+            sandbox: None,
         };
         sh(&home, &dir.launch_script(&spec, "/"));
         assert_eq!(sh(&home, &watch_script(&dir, harness, hook.as_ref())).1, Some(0));

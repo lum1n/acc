@@ -106,6 +106,7 @@ fn cat_spec() -> LaunchSpec {
         args: vec![],
         env: vec![],
         protocol: Protocol::Acp,
+        sandbox: None,
     }
 }
 
@@ -338,6 +339,7 @@ exec cat >> "$2""#;
         ],
         env: vec![],
         protocol: Protocol::ClaudeStreamJson,
+        sandbox: None,
     }
 }
 

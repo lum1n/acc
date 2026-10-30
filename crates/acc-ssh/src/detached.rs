@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use acc_core::detached::{self as scripts, EXIT_INCOMPLETE, EXIT_NOT_RUNNING, Listing, SessionDir, Status};
 use acc_core::harness::LaunchSpec;
+use acc_core::sandbox::Applied as Sandboxed;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
@@ -83,6 +84,8 @@ pub struct Detached {
     /// Serializes writes so they reach the harness in call order.
     writes: Mutex<u64>,
     write_tag: String,
+    /// What a sandboxed launch applied on the host.
+    sandbox: Option<Sandboxed>,
 }
 
 /// Lists the detached sessions on a host.
@@ -118,10 +121,12 @@ impl Detached {
                 stderr: format!("session {id} is already running"),
             });
         }
-        host.exec(&dir.launch_script_with_spec(spec, cwd, spec_json), b"")
+        let out = host
+            .exec(&dir.launch_script_with_spec(spec, cwd, spec_json), b"")
             .await?
             .ok()?;
-        let me = Self::attach(host, id, offset)?;
+        let mut me = Self::attach(host, id, offset)?;
+        me.sandbox = scripts::parse_sandbox(&out.stdout_str());
         Ok(me)
     }
 
@@ -138,6 +143,7 @@ impl Detached {
             follow: Mutex::new(Follow::default()),
             writes: Mutex::new(0),
             write_tag: write_tag(),
+            sandbox: None,
         })
     }
 
@@ -148,6 +154,12 @@ impl Detached {
 
     pub fn id(&self) -> &str {
         self.dir.id()
+    }
+
+    /// What the host's sandbox applied, for a session this handle launched
+    /// with [`LaunchSpec::sandbox`] set.
+    pub fn sandbox(&self) -> Option<&Sandboxed> {
+        self.sandbox.as_ref()
     }
 
     pub fn host(&self) -> &Arc<Host> {

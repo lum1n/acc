@@ -47,6 +47,8 @@ pub struct SessionConfig {
     /// Tag for this client's request ids, unique among clients sharing one
     /// harness process (`[A-Za-z0-9_-]`). Used by Claude, ACP and pi.
     pub client_tag: String,
+    /// Confine the harness; [`Session::launch_spec`] carries the rules.
+    pub sandbox: Option<crate::sandbox::Sandbox>,
 }
 
 impl SessionConfig {
@@ -57,6 +59,7 @@ impl SessionConfig {
             opening: Opening::New,
             model: None,
             client_tag: "acc".into(),
+            sandbox: None,
         }
     }
 }
@@ -92,13 +95,14 @@ impl Session {
             opening,
             model,
             client_tag,
+            sandbox,
         } = config;
         let resume = match &opening {
             Opening::Resume { native_id } => Some(native_id.clone()),
             _ => None,
         };
         let mut start_model = None;
-        let (driver, launch) = match harness {
+        let (driver, mut launch) = match harness {
             Harness::Claude => {
                 let d = ClaudeDriver::new(ClaudeConfig {
                     model,
@@ -141,6 +145,7 @@ impl Session {
                 (AnyDriver::Acp(d), spec)
             }
         };
+        launch.sandbox = sandbox.map(|s| crate::sandbox::rules(harness, &s));
         Self {
             driver,
             native_id: resume,

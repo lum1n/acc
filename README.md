@@ -118,6 +118,21 @@ acc run claude --ssh me@devbox --attach <id>        # rejoin, from the laptop or
 acc ssh-sessions me@devbox --stop <id> --prune      # stop one, clean up ended ones
 ```
 
+**Sandbox it.** `--sandbox` confines the harness with Seatbelt on macOS and bubblewrap on Linux,
+chosen on the host at launch, locally and with `--ssh`. The agent can then write only its
+directory (and the repository's git directory, so commits work), temporary directories, package
+caches and the harness's own state, and can't read `~/.ssh` keys, `~/.aws` and other credentials;
+`ssh-agent`, `gh` and the network keep working. `--sandbox read-only` makes the directory
+read-only too, `--sandbox-write PATH` and `--sandbox-hide PATH` add paths, and
+`--sandbox-show-credentials` leaves credentials readable. A host that can't sandbox (no `bwrap`,
+or user namespaces blocked) still runs the harness, unconfined, and says so; `acc doctor` tells
+you beforehand.
+
+```sh
+acc run claude ~/project --sandbox
+acc run codex . --sandbox read-only --sandbox-write ~/scratch
+```
+
 **Resume a session.** `--resume <id>` continues a harness's own session headlessly (Claude
 resumes per project, so run it from the session's directory). Quit the harness's TUI first if it
 has the session open; observer lists the sessions on a machine and takes over a

@@ -30,6 +30,7 @@
 //! - [`handoff`]: priming another harness with a conversation so far.
 //! - [`usage`]: what sessions spent, added up per account and per day.
 //! - [`worktree`]: a git worktree per session, its diff, merge and discard.
+//! - [`sandbox`]: confining a harness with Seatbelt (macOS) or bubblewrap (Linux).
 //! - [`watch`]: session events recorded on the host while no client is connected.
 
 pub mod claude;
@@ -50,6 +51,7 @@ pub mod ndjson;
 pub mod pi;
 pub mod policy;
 pub mod question;
+pub mod sandbox;
 pub mod session;
 pub mod shell;
 pub mod state;

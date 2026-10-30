@@ -39,6 +39,9 @@ pub struct LaunchSpec {
     /// Extra environment, e.g. `PI_PROGRAM_STATUS=1`.
     pub env: Vec<(String, String)>,
     pub protocol: Protocol,
+    /// Run confined by these rules (see [`crate::sandbox`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::sandbox::Rules>,
 }
 
 /// How to start a harness other than plainly: inside a wrapper (a `bwrap`
@@ -194,6 +197,7 @@ impl Harness {
             args,
             env,
             protocol: self.preferred_protocol(),
+            sandbox: None,
         }
     }
 
@@ -331,6 +335,7 @@ mod tests {
             args: vec!["-p".into()],
             env: vec![],
             protocol: Protocol::ClaudeStreamJson,
+            sandbox: None,
         };
         let l = Launcher {
             prefix: vec![

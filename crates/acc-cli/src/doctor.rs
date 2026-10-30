@@ -4,6 +4,7 @@ use std::process::{Command, ExitCode};
 
 use acc_core::Harness;
 use acc_core::harness::Compat;
+use acc_core::sandbox::{self, Applied};
 
 /// First output line of `program arg`, if the program runs at all.
 fn version(program: &str, arg: &str) -> Option<String> {
@@ -43,6 +44,19 @@ pub fn doctor() -> ExitCode {
             ),
             None => println!("  · {:<9} {:<9} not found", name(h), h.program()),
         }
+    }
+    println!("sandbox");
+    let probe = Command::new("sh").arg("-c").arg(sandbox::probe_script()).output();
+    let support = probe
+        .ok()
+        .and_then(|o| sandbox::parse_probe(&String::from_utf8_lossy(&o.stdout)));
+    match support.map(|s| s.applied) {
+        Some(Applied::Seatbelt) => println!("  ✓ Seatbelt (sandbox-exec)  try: acc run claude --sandbox"),
+        Some(Applied::Bwrap) => println!("  ✓ bubblewrap               try: acc run claude --sandbox"),
+        Some(Applied::None { reason }) => {
+            println!("  · unavailable: {reason}; --sandbox runs harnesses unconfined");
+        }
+        None => println!("  · couldn't check"),
     }
     ExitCode::SUCCESS
 }

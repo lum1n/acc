@@ -1586,6 +1586,7 @@ pub fn launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
         args,
         env: Vec::new(),
         protocol: Protocol::Acp,
+        sandbox: None,
     }
 }
 

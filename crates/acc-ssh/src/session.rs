@@ -29,6 +29,8 @@ pub struct Session {
     unsent: Mutex<Vec<u8>>,
     /// The exit was reported; later reads only repeat `Exited`.
     exited: AtomicBool,
+    /// Events for the next [`Session::next_events`] (a sandbox that failed).
+    queued: StdMutex<Vec<Event>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -50,12 +52,18 @@ impl Session {
         }
         let cwd = config.cwd.clone();
         let model = config.model.clone();
+        let sandbox = config.sandbox.clone();
         let mut core = Core::new(config);
         let mut spec = SessionSpec::new(id, core.harness(), &cwd, core.launch_spec().clone(), now_ms());
         spec.model = model;
+        spec.sandbox = sandbox;
         let pipe = Detached::launch(host, id, core.launch_spec(), &cwd, Some(&spec.to_json())).await?;
         pipe.write(&core.start()).await?;
-        Ok(Self::from_parts(pipe, core))
+        let me = Self::from_parts(pipe, core);
+        if let Some(message) = me.pipe.sandbox().and_then(|a| a.notice()) {
+            me.lock_queued().push(Event::Notice { message });
+        }
+        Ok(me)
     }
 
     /// Rejoins running session `id` from byte `offset` of its log. Nothing is
@@ -82,7 +90,20 @@ impl Session {
             core: StdMutex::new(core),
             unsent: Mutex::new(Vec::new()),
             exited: AtomicBool::new(false),
+            queued: StdMutex::new(Vec::new()),
         }
+    }
+
+    fn lock_queued(&self) -> std::sync::MutexGuard<'_, Vec<Event>> {
+        self.queued.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the host's sandbox applied, for a session launched with
+    /// [`SessionConfig::sandbox`]. A sandbox that couldn't be applied is
+    /// also reported as an [`Event::Notice`] by the first
+    /// [`Session::next_events`].
+    pub fn sandbox(&self) -> Option<acc_core::sandbox::Applied> {
+        self.pipe.sandbox().cloned()
     }
 
     pub fn pipe(&self) -> &Detached {
@@ -130,6 +151,10 @@ impl Session {
     /// Once the harness has exited this returns the exit events, then
     /// `[Exited]` on every later call.
     pub async fn next_events(&self) -> Result<Vec<Event>> {
+        let queued = std::mem::take(&mut *self.lock_queued());
+        if !queued.is_empty() {
+            return Ok(queued);
+        }
         self.flush().await?;
         loop {
             match self.pipe.read().await? {
