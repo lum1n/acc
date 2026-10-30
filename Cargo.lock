@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acc-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acc-core",
  "acc-ssh",
@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "acc-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "serde",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "acc-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acc-core",
  "acc-ssh",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "acc-node"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acc-core",
  "acc-ssh",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "acc-ssh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acc-core",
  "rand",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "acc-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acc-core",
  "js-sys",

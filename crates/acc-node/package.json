@@ -1,6 +1,6 @@
 {
   "name": "@acc/node",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Drive coding agents on hosts over SSH: acc-core and acc-ssh for Node",
   "license": "MIT",
   "main": "index.js",
