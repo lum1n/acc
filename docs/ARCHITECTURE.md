@@ -324,6 +324,38 @@ the merge) and `worktree_discard_exec` (stops the harness, removes the worktree 
 `~/.acc/w/<name>.meta` records the base, the repository and the branch. Only `git` is needed on
 the host.
 
+**Sandboxing.** `LaunchRequest::sandbox` confines the harness at launch, off unless asked
+for. `sandbox::rules` resolves a `Sandbox` for one harness into `Rules`, kept in the launch
+spec (`spec.json`), and the launch script renders them with `sandbox::argv_script`: the script
+picks the mechanism from `uname` on the host when the session starts, so one spec works on a Mac
+and on a Linux box reached over SSH, and nothing is installed. On Linux the harness runs under
+`bwrap --ro-bind / /` with the writable paths bound back read-write, hidden directories under an
+empty tmpfs and hidden files under `/dev/null`; there is no `--unshare-pid`, so the PID the
+session records is `bwrap`'s and stopping it takes the harness down (`--die-with-parent`). On
+macOS it runs under `sandbox-exec` with a Seatbelt profile whose paths are all `-D` parameters, so
+nothing user-given is spliced into the profile text. Every path is resolved to its real location
+on the host first (Seatbelt matches real paths; `bwrap` can't mount over a symlink), and on
+Linux only paths that exist at launch can be bound. The default preset (`Preset::Workspace`)
+reads the whole filesystem except credentials (`~/.ssh` but its `config` and `known_hosts`,
+`~/.aws`, `~/.gnupg`, `~/.kube`, gcloud, Azure, Docker's `config.json`, `~/.netrc`,
+`~/.git-credentials`, `~/.password-store`), and writes the working directory, the repository's
+git directory (`git rev-parse --git-common-dir`, so commits from worktrees work), temporary
+directories, package caches and the harness's own state (`sandbox::state_paths`: `~/.claude` and
+`~/.claude.json`, `~/.codex`, `~/.cursor`, `~/.copilot`, `~/.pi`, opencode's XDG directories).
+`ssh-agent` and `gh` keep working, so agents can still push and open PRs, and the network stays
+on. `Preset::ReadOnly` drops the workspace. Seatbelt can't nest, so under it Codex gets
+`-c sandbox_mode="danger-full-access"` and Claude `--settings '{"sandbox":{"enabled":false}}'`;
+Linux nests, so nothing changes there. The sandbox is outermost: a `Launcher` prefix runs inside
+it. Relaunches and handoffs keep it (a handoff resolves the rules again for the new harness).
+
+A host that can't sandbox (no `bwrap`, user namespaces blocked as on Ubuntu's AppArmor default,
+`sandbox-exec` missing or refusing) still starts the harness, unconfined: each mechanism is tried
+once with `true` first. What was applied goes to the session's `sandbox` file, and both the launch
+script and `status_script` print it as a `B` line (`detached::parse_sandbox`).
+`Session::on_launched` and `Session::on_status` read it into `Session::sandbox`, and when the
+harness runs unconfined they emit an `Event::Notice` once per client, so attaching clients see it
+too. `sandbox::probe_script` tells a client (and `acc doctor`) up front what a host can do.
+
 **Usage across sessions.** Harnesses count differently: Claude and the ACP agents report each
 turn's tokens, Codex and pi running totals (pi's start over with a new session), and all of them a
 running total for cost. `usage::Spending` turns a session's `Usage` events into what was spent, in

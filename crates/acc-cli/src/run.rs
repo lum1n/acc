@@ -25,6 +25,7 @@ use acc_core::event::{ItemKind, PlanStatus};
 use acc_core::harness::LaunchSpec;
 use acc_core::item::ItemDetail;
 use acc_core::pi::PiDriver;
+use acc_core::sandbox::{Preset, Sandbox};
 use acc_core::state::RunState;
 use acc_core::{Event, Harness};
 
@@ -56,14 +57,14 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
     let mut json = false;
     let mut ssh = crate::remote::Options::default();
     let mut attach = None;
-    let mut it = args.iter();
+    let mut sandbox = SandboxFlags::default();
+    let mut it = args.iter().copied().peekable();
     while let Some(arg) = it.next() {
-        let mut value = || {
-            it.next()
-                .map(|v| (*v).to_owned())
-                .ok_or(format!("{arg} needs a value"))
-        };
-        match *arg {
+        if sandbox.take(arg, &mut it)? {
+            continue;
+        }
+        let mut value = || it.next().map(str::to_owned).ok_or(format!("{arg} needs a value"));
+        match arg {
             "--resume" => resume = Some(value()?),
             "--model" => model = Some(value()?),
             "--program" => program = Some(value()?),
@@ -144,22 +145,20 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
         }
     };
 
+    let mut spec = spec;
+    if let Some(p) = program {
+        spec.program = p;
+    }
+    let sandbox = sandbox.get();
+    spec.sandbox = sandbox.as_ref().map(|s| acc_core::sandbox::rules(harness, s));
     let (tx, rx) = mpsc::channel();
     let mut link = match remote {
         Some(r) => {
-            let mut spec = spec;
-            if let Some(p) = program {
-                spec.program = p;
-            }
-            Link::Remote(r.start(harness, &spec, &cwd_str, attach.as_deref(), replay, tx.clone())?)
+            let mut record = acc_core::session::SessionSpec::new("", harness, &cwd_str, spec.clone(), 0);
+            record.sandbox = sandbox;
+            Link::Remote(r.start(record, attach.as_deref(), replay, tx.clone())?)
         }
-        None => spawn_local(
-            harness,
-            program.unwrap_or(spec.program.clone()),
-            &spec,
-            &cwd_str,
-            tx.clone(),
-        )?,
+        None => spawn_local(harness, &spec, &cwd_str, tx.clone())?,
     };
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -313,11 +312,25 @@ impl Link {
 /// Starts the harness as a local child process forwarding its output to `tx`.
 fn spawn_local(
     harness: Harness,
-    program: String,
     spec: &LaunchSpec,
     cwd: &str,
     tx: mpsc::Sender<Input>,
 ) -> Result<Link, String> {
+    // Sandboxed, `sh` builds the confined command line and execs it, so
+    // the child is the sandbox and killing it takes the harness down.
+    let (program, args, env) = match &spec.sandbox {
+        Some(rules) => {
+            let script = format!(
+                "{}case $acc_sb in \
+                 none*) echo \"acc: not sandboxed, running unconfined: ${{acc_sb#none }}\" >&2 ;; \
+                 *) echo \"acc: sandboxed with $acc_sb\" >&2 ;; esac\n\
+                 exec \"$@\"\n",
+                acc_core::sandbox::argv_script(rules, spec)
+            );
+            ("sh".to_owned(), vec!["-c".to_owned(), script], Vec::new())
+        }
+        None => (spec.program.clone(), spec.args.clone(), spec.env.clone()),
+    };
     let mut proc = Proc::new(&program);
     // Started from inside Claude Code (its Bash tool, `!`), a child Claude
     // would otherwise adopt the parent's session id.
@@ -325,8 +338,8 @@ fn spawn_local(
         proc.env_remove(var);
     }
     let mut child = proc
-        .args(&spec.args)
-        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        .args(&args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -354,6 +367,50 @@ fn spawn_local(
         let _ = tx.send(Input::AgentClosed(None));
     });
     Ok(Link::Local { child, stdin })
+}
+
+/// `--sandbox [workspace|read-only]`, `--sandbox-write PATH`,
+/// `--sandbox-hide PATH` and `--sandbox-show-credentials`; any of them
+/// turns the sandbox on.
+#[derive(Default)]
+pub struct SandboxFlags {
+    on: bool,
+    sandbox: Sandbox,
+}
+
+impl SandboxFlags {
+    /// Consumes `arg` (and its value from `rest`) if it is a sandbox flag.
+    pub fn take<'a>(
+        &mut self,
+        arg: &str,
+        rest: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    ) -> Result<bool, String> {
+        let mut value = || rest.next().ok_or(format!("{arg} needs a value"));
+        match arg {
+            "--sandbox" => {
+                // The preset is optional, so only these words are taken.
+                if let Some(&word @ ("workspace" | "read-only")) = rest.peek() {
+                    self.sandbox.preset = if word == "workspace" {
+                        Preset::Workspace
+                    } else {
+                        Preset::ReadOnly
+                    };
+                    rest.next();
+                }
+            }
+            "--sandbox-write" => self.sandbox.write.push(value()?.to_owned()),
+            "--sandbox-hide" => self.sandbox.hide.push(value()?.to_owned()),
+            "--sandbox-show-credentials" => self.sandbox.show_credentials = true,
+            _ => return Ok(false),
+        }
+        self.on = true;
+        Ok(true)
+    }
+
+    /// The sandbox asked for, if any.
+    pub fn get(self) -> Option<Sandbox> {
+        self.on.then_some(self.sandbox)
+    }
 }
 
 /// Sends a command, or queues it when the harness has no session yet.

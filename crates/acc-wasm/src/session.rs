@@ -174,6 +174,19 @@ impl AccSession {
         updates(self.inner.on_status(stdout, ms(now_ms)))
     }
 
+    /// The stdout of the launch exec: a JSON array of `Update`s, with a
+    /// notice when the session asked for a sandbox but runs unconfined.
+    #[wasm_bindgen(js_name = onLaunched)]
+    pub fn on_launched(&mut self, stdout: &str) -> JsValue {
+        updates(self.inner.on_launched(stdout))
+    }
+
+    /// What the host's sandbox applied (`{type: "bwrap" | "seatbelt"}` or
+    /// `{type: "none", reason}`), or null until a launch or status said.
+    pub fn sandbox(&self) -> JsValue {
+        js(&self.inner.sandbox())
+    }
+
     /// The content of the session's exit file, from a fan-in `session_exit` entry.
     #[wasm_bindgen(js_name = onExitFile)]
     pub fn on_exit_file(&mut self, text: &str, now_ms: f64) -> JsValue {
@@ -403,6 +416,26 @@ pub fn parse_session_events(stdout: &str) -> JsValue {
 #[wasm_bindgen(js_name = probeExec)]
 pub fn probe_exec() -> AccExec {
     AccExec::script(harness::probe_script())
+}
+
+/// The rules a `Sandbox` JSON resolves to for `harness`: what a sandboxed
+/// session may write and read.
+#[wasm_bindgen(js_name = sandboxRules)]
+pub fn sandbox_rules(harness: &str, sandbox: JsValue) -> Result<JsValue, JsValue> {
+    let sandbox: acc_core::sandbox::Sandbox = arg(sandbox, "sandbox")?;
+    Ok(js(&acc_core::sandbox::rules(crate::harness(harness)?, &sandbox)))
+}
+
+/// Checks whether the host can sandbox sessions (Seatbelt or bubblewrap).
+#[wasm_bindgen(js_name = sandboxProbeExec)]
+pub fn sandbox_probe_exec() -> AccExec {
+    AccExec::script(acc_core::sandbox::probe_script())
+}
+
+/// `{os, applied}`, or null if the output is unreadable.
+#[wasm_bindgen(js_name = parseSandboxProbe)]
+pub fn parse_sandbox_probe(stdout: &str) -> JsValue {
+    js(&acc_core::sandbox::parse_probe(stdout))
 }
 
 /// JSON array of `Availability`s.

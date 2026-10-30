@@ -15,6 +15,8 @@ export interface LaunchSpec {
   args: string[];
   env: [string, string][];
   protocol: "claude_stream_json" | "codex_app_server" | "acp" | "pi_rpc" | "opencode_http";
+  /** Set for a sandboxed session: the paths it may write and may not read. */
+  sandbox?: { workspace: boolean; write: string[]; hide: string[]; show?: string[]; seatbelt_args?: string[] } | null;
 }
 
 export type RunState =
@@ -309,7 +311,27 @@ export interface SessionConfig {
   model?: string | null;
   /** Unique among clients sharing one harness process. Defaults to "acc". */
   client_tag?: string | null;
+  /** Confine the harness (Seatbelt on macOS, bubblewrap on Linux). `{}` is the opinionated preset. */
+  sandbox?: Sandbox | null;
 }
+
+/** What a sandboxed session may do. */
+export interface Sandbox {
+  /** `workspace` (default): the working directory and its repository are writable. */
+  preset?: "workspace" | "read_only";
+  /** Extra writable paths, absolute or `~/...`. */
+  write?: string[];
+  /** Extra unreadable paths. */
+  hide?: string[];
+  /** Leave `~/.ssh`, `~/.aws` and the other credentials readable. */
+  show_credentials?: boolean;
+}
+
+/** What the host's sandbox did when the session started. */
+export type SandboxApplied =
+  | { type: "seatbelt" }
+  | { type: "bwrap" }
+  | { type: "none"; reason: string };
 
 /** Exactly one of `password`, `privateKey` or `agent`. */
 export interface SshAuth {
@@ -400,6 +422,8 @@ export declare class RemoteSession {
   /** Asks the harness to exit; `nextEvents` then reports it. */
   stop(): Promise<void>;
   status(): Promise<DetachedStatus>;
+  /** What the host's sandbox applied; when it couldn't, the first `nextEvents` brings a notice. */
+  sandbox(): SandboxApplied | null;
   state(): SessionState | null;
   observe(state: SessionState): boolean;
   nativeId(): string | null;

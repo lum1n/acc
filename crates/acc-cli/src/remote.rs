@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use acc_core::harness::LaunchSpec;
 use acc_ssh::{AgentSocket, Auth, Detached, Host, HostKeyCheck, Read, SshConfig};
 use tokio::runtime::Runtime;
 
@@ -93,15 +92,14 @@ impl Remote {
         Ok(out.stdout_str().trim_end().to_owned())
     }
 
-    /// Launches `spec` (or rejoins session `attach`, replaying its log) and
+    /// Launches `record` (its id and start time are filled in here), or
+    /// rejoins session `attach`, replaying its log, and
     /// starts a thread that forwards the harness's output to `tx`. When
     /// rejoining, `Input::CaughtUp` follows once the replay reaches the
     /// `replay` bytes the log held when the client attached.
     pub fn start(
         self,
-        harness: acc_core::Harness,
-        spec: &LaunchSpec,
-        cwd: &str,
+        mut record: acc_ssh::SessionSpec,
         attach: Option<&str>,
         replay: u64,
         tx: Sender<Input>,
@@ -113,10 +111,26 @@ impl Remote {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as u64);
-                let record = acc_ssh::SessionSpec::new(&id, harness, cwd, spec.clone(), now).to_json();
-                self.rt
-                    .block_on(Detached::launch(self.host.clone(), &id, spec, cwd, Some(&record)))
-                    .map_err(|e| format!("launch on the host: {e}"))?
+                record.id.clone_from(&id);
+                record.created_ms = now;
+                let pipe = self
+                    .rt
+                    .block_on(Detached::launch(
+                        self.host.clone(),
+                        &id,
+                        &record.launch,
+                        &record.cwd,
+                        Some(&record.to_json()),
+                    ))
+                    .map_err(|e| format!("launch on the host: {e}"))?;
+                match pipe.sandbox() {
+                    Some(a @ acc_core::sandbox::Applied::None { .. }) => {
+                        eprintln!("acc: {}", a.notice().unwrap_or_default());
+                    }
+                    Some(a) => eprintln!("acc: sandboxed with {}", format!("{a:?}").to_lowercase()),
+                    None => {}
+                }
+                pipe
             }
         };
         let pipe = Arc::new(pipe);

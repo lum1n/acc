@@ -92,6 +92,9 @@ pub struct LaunchSpec {
     pub args: Vec<String>,
     pub env: Vec<EnvVar>,
     pub protocol: Protocol,
+    /// Run confined by these rules (`launch_script` renders them).
+    #[uniffi(default = None)]
+    pub sandbox: Option<crate::acc_types::AccSandboxRules>,
 }
 
 impl From<&core_h::LaunchSpec> for LaunchSpec {
@@ -108,6 +111,7 @@ impl From<&core_h::LaunchSpec> for LaunchSpec {
                 })
                 .collect(),
             protocol: s.protocol.into(),
+            sandbox: s.sandbox.clone().map(Into::into),
         }
     }
 }
@@ -119,6 +123,7 @@ impl From<LaunchSpec> for core_h::LaunchSpec {
             args: s.args,
             env: s.env.into_iter().map(|v| (v.name, v.value)).collect(),
             protocol: s.protocol.into(),
+            sandbox: s.sandbox.map(Into::into),
         }
     }
 }

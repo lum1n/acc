@@ -16,17 +16,21 @@ use acc_core::pi::PiDriver;
 
 const USAGE: &str = "\
 usage:
-  acc doctor                            installed harnesses
+  acc doctor                            installed harnesses, and whether sessions can be sandboxed
   acc run <harness> [cwd] [--resume ID] [--model M] [--program PATH] [--json]
                                         drive a harness headlessly (claude, codex, pi, cursor,
                                         copilot, opencode); type prompts or :help on stdin
+      [--sandbox [workspace|read-only]] [--sandbox-write PATH]... [--sandbox-hide PATH]...
+      [--sandbox-show-credentials]
+                                        confine it (Seatbelt on macOS, bubblewrap on Linux): write
+                                        only the workspace and its own state, credentials hidden
       [--ssh [user@]host[:port] [--identity KEY] [--insecure] [--attach ID]]
                                         run it detached on a host over SSH, nothing installed
                                         there; end stdin to detach, --attach to rejoin
   acc ssh-sessions [user@]host[:port] [--identity KEY] [--insecure] [--stop ID]... [--prune]
                                         detached sessions on a host; stop one, remove ended ones
   acc harnesses                         detect installed harnesses and versions
-  acc script launch <harness> <id> <cwd> [resume-id]
+  acc script launch <harness> <id> <cwd> [resume-id] [--sandbox [preset]] [--sandbox-...]
   acc script attach <id> [offset]
   acc script input <id>
   acc script status <id>                print a host-side shell script (pipe to `ssh host sh`)
@@ -96,8 +100,22 @@ fn harnesses() -> ExitCode {
 fn script(args: &[&str]) -> ExitCode {
     let dir = |id: &str| SessionDir::new(id).ok_or_else(|| format!("invalid session id {id:?}"));
     let out = match args {
-        ["launch", harness, id, cwd, resume @ ..] => parse_harness(harness)
-            .and_then(|h| Ok(dir(id)?.launch_script(&h.launch(resume.first().copied()), cwd))),
+        ["launch", harness, id, cwd, rest @ ..] => parse_harness(harness).and_then(|h| {
+            let mut sandbox = run::SandboxFlags::default();
+            let mut resume = None;
+            let mut it = rest.iter().copied().peekable();
+            while let Some(arg) = it.next() {
+                if !sandbox.take(arg, &mut it)? {
+                    if arg.starts_with("--") || resume.is_some() {
+                        return Err(USAGE.to_owned());
+                    }
+                    resume = Some(arg);
+                }
+            }
+            let mut spec = h.launch(resume);
+            spec.sandbox = sandbox.get().map(|s| acc_core::sandbox::rules(h, &s));
+            Ok(dir(id)?.launch_script(&spec, cwd))
+        }),
         ["attach", id] => dir(id).map(|d| d.attach_script(0)),
         ["attach", id, offset] => offset
             .parse()

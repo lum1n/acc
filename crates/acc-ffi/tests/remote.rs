@@ -35,6 +35,7 @@ fn config(sshd: &support::Sshd, host_key: HostKeyCheck) -> SshConfig {
 
 fn session_config(harness: Harness) -> SessionConfig {
     SessionConfig {
+        sandbox: None,
         harness,
         cwd: "/tmp".into(),
         opening: Opening::New,
@@ -123,6 +124,7 @@ async fn attaches_to_a_detached_session() {
         .join("../acc-core/tests/fixtures/claude/permission-deny.ndjson");
     let inlog = sshd.dir.join("stdin");
     let spec = CoreSpec {
+        sandbox: None,
         program: "sh".into(),
         args: vec![
             "-c".into(),

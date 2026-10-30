@@ -59,6 +59,28 @@ export interface SessionConfig {
   model?: string | null;
   /** Unique among clients sharing one harness process. Defaults to "acc". */
   client_tag?: string | null;
+  /** Confine the harness; `launchSpec()` then carries the rules. */
+  sandbox?: Sandbox | null;
+}
+
+/** What a sandboxed session may do. `{}` is the opinionated preset. */
+export interface Sandbox {
+  preset?: "workspace" | "read_only";
+  /** Extra writable paths, absolute or `~/...`. */
+  write?: string[];
+  /** Extra unreadable paths. */
+  hide?: string[];
+  /** Leave `~/.ssh`, `~/.aws` and the other credentials readable. */
+  show_credentials?: boolean;
+}
+
+/** The paths a `Sandbox` resolves to for one harness. */
+export interface SandboxRules {
+  workspace: boolean;
+  write: string[];
+  hide: string[];
+  show?: string[];
+  seatbelt_args?: string[];
 }
 
 export interface LaunchSpec {
@@ -66,6 +88,7 @@ export interface LaunchSpec {
   args: string[];
   env: [string, string][];
   protocol: "claude_stream_json" | "codex_app_server" | "acp" | "pi_rpc" | "opencode_http";
+  sandbox?: SandboxRules | null;
 }
 
 export type RunState =
@@ -395,6 +418,8 @@ struct SessionConfigJs {
     model: Option<String>,
     #[serde(default)]
     client_tag: Option<String>,
+    #[serde(default)]
+    sandbox: Option<acc_core::sandbox::Sandbox>,
 }
 
 #[derive(Serialize)]
@@ -447,6 +472,7 @@ impl Session {
                 opening,
                 model: c.model,
                 client_tag: tag,
+                sandbox: c.sandbox,
             }),
         })
     }

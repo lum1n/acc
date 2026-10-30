@@ -68,7 +68,8 @@ impl SessionDir {
     /// The harness is found on the `PATH` of the user's login shell. The FIFO
     /// is opened read-write (`<>`) so the harness never sees EOF when a client
     /// disconnects, and `nohup` keeps it alive after SSH hangs up. Prints the
-    /// harness PID on success. Relaunching an existing id (to resume) keeps
+    /// harness PID on success, then for a sandboxed spec a `B` line
+    /// ([`parse_sandbox`]). Relaunching an existing id (to resume) keeps
     /// appending to the same log, so client offsets stay valid.
     pub fn launch_script(&self, spec: &LaunchSpec, cwd: &str) -> String {
         self.launch_script_with_spec(spec, cwd, None)
@@ -94,9 +95,21 @@ impl SessionDir {
         // records the exit code. `$0` is the session directory. A `cd` that
         // fails is recorded as an exit too, so the launcher below sees it
         // instead of waiting for a PID that never comes.
+        // Sandboxed, the command line is built in `"$@"` on the host, which
+        // also records what it applied (see `crate::sandbox`).
+        let (setup, run) = match &spec.sandbox {
+            Some(rules) => (
+                format!(
+                    "{}printf '%s\\n' \"$acc_sb\" >\"$0/sandbox\"; ",
+                    crate::sandbox::argv_script(rules, spec)
+                ),
+                "\"$@\"".to_owned(),
+            ),
+            None => (String::new(), format!("{env}{cmd}")),
+        };
         let wrapper = format!(
             "cd {cwd} 2>>\"$0/err\" || {{ echo {EXIT_NO_CWD} >\"$0/exit\"; exit 1; }}; \
-             {env}{cmd} <>\"$0/in\" >>\"$0/out.ndjson\" 2>>\"$0/err\" & \
+             {setup}{run} <>\"$0/in\" >>\"$0/out.ndjson\" 2>>\"$0/err\" & \
              echo $! >\"$0/pid\"; wait $!; echo $? >\"$0/exit\"",
             cwd = quote_path(cwd),
         );
@@ -113,7 +126,7 @@ impl SessionDir {
              d={d}\n\
              mkdir -p \"$d\"\n\
              [ -p \"$d/in\" ] || mkfifo \"$d/in\"\n\
-             rm -f \"$d/pid\" \"$d/exit\"\n\
+             rm -f \"$d/pid\" \"$d/exit\" \"$d/sandbox\"\n\
              : >>\"$d/out.ndjson\"\n\
              {write_spec}\
              nohup sh -c {wrapper} \"$d\" </dev/null >/dev/null 2>&1 &\n\
@@ -127,9 +140,11 @@ impl SessionDir {
              if [ \"$i\" -ge {LAUNCH_WAIT_TICKS} ]; then echo \"harness did not report a pid\" >&2; exit 1; fi\n\
              sleep 0.02\n\
              done\n\
-             cat \"$d/pid\"\n",
+             cat \"$d/pid\"\n\
+             {print_sandbox}",
             wrapper = quote(&wrapper),
             cwd_text = quote(cwd),
+            print_sandbox = if spec.sandbox.is_some() { SANDBOX_LINE } else { "" },
         )
     }
 
@@ -245,8 +260,9 @@ impl SessionDir {
     }
 
     /// Script printing `alive <pid> <size>`, `exited <code> <size>` or
-    /// `missing`, where `size` is the log's length in bytes. Parse it with
-    /// [`parse_status`].
+    /// `missing`, where `size` is the log's length in bytes, then for a
+    /// sandboxed session a `B` line. Parse them with [`parse_status`] and
+    /// [`parse_sandbox`].
     pub fn status_script(&self) -> String {
         let d = self.dir();
         format!(
@@ -255,7 +271,8 @@ impl SessionDir {
              if [ -f \"$d/exit\" ]; then echo \"exited $(cat \"$d/exit\") $s\";\n\
              elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then echo \"alive $(cat \"$d/pid\") $s\";\n\
              elif [ -f \"$d/pid\" ]; then echo \"exited - $s\";\n\
-             else echo missing; fi\n"
+             else echo missing; fi\n\
+             {SANDBOX_LINE}"
         )
     }
 
@@ -294,6 +311,11 @@ impl SessionDir {
         )
     }
 }
+
+/// Prints `B <what the sandbox applied>` when the session asked for one
+/// (see [`parse_sandbox`]).
+const SANDBOX_LINE: &str =
+    "[ -f \"$d/sandbox\" ] && printf 'B %s\\n' \"$(head -n 1 \"$d/sandbox\")\"; true\n";
 
 /// Takes the session's write lock, stealing it from a holder that died
 /// (a client whose connection dropped while it was writing).
@@ -363,6 +385,15 @@ pub fn parse_status(out: &str) -> Option<Status> {
         "missing" => Some(Status::Missing),
         _ => None,
     }
+}
+
+/// What a sandboxed session's host applied, from the output of
+/// [`SessionDir::launch_script_with_spec`] or [`SessionDir::status_script`].
+/// `None` when the session didn't ask for a sandbox (or hasn't started).
+pub fn parse_sandbox(out: &str) -> Option<crate::sandbox::Applied> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("B "))
+        .and_then(crate::sandbox::Applied::parse)
 }
 
 /// One session found by [`list_script`].
@@ -739,6 +770,7 @@ mod sh_tests {
             args: vec![],
             env: vec![],
             protocol: Protocol::Acp,
+            sandbox: None,
         };
         let missing = home.join("no-such-directory");
         let started = Instant::now();
@@ -755,6 +787,103 @@ mod sh_tests {
         );
     }
 
+    /// Launches `sh -c script` sandboxed in a fresh `HOME` (outside the
+    /// temporary directory, which the sandbox leaves writable), with `path`
+    /// first on `PATH`, and waits for it to exit.
+    fn sandboxed(name: &str, script: &str, path: Option<&std::path::Path>) -> (std::path::PathBuf, String) {
+        let home = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("acc-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("work")).expect("mkdir");
+        std::fs::create_dir_all(home.join(".ssh")).expect("mkdir");
+        std::fs::write(home.join(".ssh/id_test"), "KEY").expect("write");
+        let dir = SessionDir::new(name).expect("valid id");
+        let mut spec = LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![],
+            protocol: Protocol::Acp,
+            sandbox: None,
+        };
+        spec.sandbox = Some(crate::sandbox::rules(
+            crate::harness::Harness::Pi,
+            &crate::sandbox::Sandbox::default(),
+        ));
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(dir.launch_script(&spec, &home.join("work").to_string_lossy()))
+            .env("HOME", &home)
+            // No login shell: keep this `PATH`.
+            .env("SHELL", "/nonexistent");
+        if let Some(p) = path {
+            cmd.env(
+                "PATH",
+                format!("{}:{}", p.display(), std::env::var("PATH").unwrap_or_default()),
+            );
+        }
+        let out = cmd.output().expect("sh");
+        let launched = String::from_utf8_lossy(&out.stdout).into_owned();
+        let exit = wait_for(&home.join(ROOT).join(name).join("exit"), 1);
+        assert_eq!(exit.trim(), "0", "launch: {launched}");
+        (home, launched)
+    }
+
+    #[test]
+    fn sandboxed_harness_writes_only_its_workspace() {
+        if !crate::sandbox::sh_tests::host_can_sandbox() {
+            eprintln!("skipped: this host can't sandbox");
+            return;
+        }
+        let (home, launched) = sandboxed(
+            "sbx",
+            "touch \"$PWD/ok\"; touch ~/acc-escape; cat ~/.ssh/id_test; true",
+            None,
+        );
+        let d = home.join(ROOT).join("sbx");
+        assert!(home.join("work/ok").exists());
+        assert!(!home.join("acc-escape").exists());
+        assert!(
+            !std::fs::read_to_string(d.join("out.ndjson"))
+                .unwrap_or_default()
+                .contains("KEY")
+        );
+        let applied = std::fs::read_to_string(d.join("sandbox")).unwrap_or_default();
+        let expected = if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else {
+            "bwrap"
+        };
+        assert_eq!(applied.trim(), expected);
+        assert_eq!(parse_sandbox(&launched), crate::sandbox::Applied::parse(expected));
+        let status = sh(&home, &SessionDir::new("sbx").expect("id").status_script(), b"");
+        assert!(
+            matches!(parse_status(&status), Some(Status::Exited { code: Some(0), .. })),
+            "{status}"
+        );
+        assert_eq!(parse_sandbox(&status), crate::sandbox::Applied::parse(expected));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn harness_runs_unconfined_when_the_sandbox_fails() {
+        let fakes = std::env::temp_dir().join(format!("acc-test-fakes-{}", std::process::id()));
+        std::fs::create_dir_all(&fakes).expect("mkdir");
+        for tool in ["bwrap", "sandbox-exec"] {
+            let p = fakes.join(tool);
+            std::fs::write(&p, "#!/bin/sh\necho 'no user namespaces' >&2\nexit 1\n").expect("write");
+            let _ = Command::new("chmod").arg("+x").arg(&p).status();
+        }
+        let (home, launched) = sandboxed("sbxnone", "touch ~/escaped", Some(&fakes));
+        assert!(home.join("escaped").exists(), "the harness still ran");
+        let Some(crate::sandbox::Applied::None { reason }) = parse_sandbox(&launched) else {
+            panic!("{launched}")
+        };
+        assert!(reason.contains("no user namespaces"), "{reason}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&fakes);
+    }
+
     #[test]
     fn writes_are_whole_and_at_most_once() {
         let home = std::env::temp_dir().join(format!("acc-test-w-{}", std::process::id()));
@@ -765,6 +894,7 @@ mod sh_tests {
             args: vec![],
             env: vec![],
             protocol: Protocol::Acp,
+            sandbox: None,
         };
         sh(
             &home,
@@ -816,6 +946,7 @@ mod sh_tests {
             args: vec![],
             env: vec![],
             protocol: Protocol::Acp,
+            sandbox: None,
         };
         let pid = sh(&home, &dir.launch_script(&spec, "/"), b"");
         assert!(!pid.trim().is_empty());
@@ -851,6 +982,7 @@ mod sh_tests {
             args: vec![],
             env: vec![],
             protocol: Protocol::Acp,
+            sandbox: None,
         };
         let pid = sh(
             &home,

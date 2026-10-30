@@ -167,12 +167,15 @@ struct SessionConfigJs {
     model: Option<String>,
     #[serde(default)]
     client_tag: Option<String>,
+    #[serde(default)]
+    sandbox: Option<acc_core::sandbox::Sandbox>,
 }
 
 fn session_config(value: Value) -> Result<SessionConfig> {
     let c: SessionConfigJs = from_js(value, "session config")?;
     let mut config = SessionConfig::new(c.harness, c.cwd);
     config.model = c.model;
+    config.sandbox = c.sandbox;
     if let Some(native_id) = c.resume {
         config.opening = Opening::Resume { native_id };
     }
@@ -404,6 +407,13 @@ impl RemoteSession {
     #[napi(ts_return_type = "Promise<DetachedStatus>")]
     pub async fn status(&self) -> Result<Value> {
         to_js(&self.inner.pipe().status().await.map_err(ssh_err)?)
+    }
+
+    /// What the host's sandbox applied, for a session launched with
+    /// `sandbox`. When it couldn't, the first `nextEvents` brings a notice.
+    #[napi(ts_return_type = "SandboxApplied | null")]
+    pub fn sandbox(&self) -> Result<Value> {
+        to_js(&self.inner.sandbox())
     }
 
     /// The current state, merged across sources by fidelity.

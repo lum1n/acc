@@ -18,6 +18,7 @@ use acc_core::event::{
 use acc_core::harness::{Availability, Compat, Launcher};
 use acc_core::item::{DiffLine, FileChangeKind, FileDiff, Hunk, ItemDetail, LineTag, ToolKind};
 use acc_core::policy::{Decision, Rule};
+use acc_core::sandbox::{Applied, Preset, Rules, Sandbox, Support};
 use acc_core::session::{LaunchRequest, Outbound, Permission, SessionSpec, Update};
 use acc_core::state::{BlockKind, RunState, SessionState, StateSource};
 use acc_core::transcript::{Item, ItemChange, ItemStatus};
@@ -1012,6 +1013,136 @@ impl From<AccLauncher> for Launcher {
     }
 }
 
+/// How much of the workspace a sandboxed session may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AccSandboxPreset {
+    /// The working directory and its repository are writable.
+    Workspace,
+    /// Only the harness's state, temporary directories and caches are.
+    ReadOnly,
+}
+
+/// What a sandboxed session may do; the defaults are the opinionated
+/// preset (workspace writable, credentials hidden).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccSandbox {
+    /// `None` is `Workspace`.
+    #[uniffi(default = None)]
+    pub preset: Option<AccSandboxPreset>,
+    /// Extra writable paths, absolute or `~/...`.
+    #[uniffi(default = [])]
+    pub write: Vec<String>,
+    /// Extra unreadable paths, absolute or `~/...`.
+    #[uniffi(default = [])]
+    pub hide: Vec<String>,
+    /// Leave `~/.ssh`, `~/.aws` and the other credentials readable.
+    #[uniffi(default = false)]
+    pub show_credentials: bool,
+}
+
+impl From<AccSandbox> for Sandbox {
+    fn from(s: AccSandbox) -> Self {
+        Self {
+            preset: match s.preset {
+                None | Some(AccSandboxPreset::Workspace) => Preset::Workspace,
+                Some(AccSandboxPreset::ReadOnly) => Preset::ReadOnly,
+            },
+            write: s.write,
+            hide: s.hide,
+            show_credentials: s.show_credentials,
+        }
+    }
+}
+
+impl From<Sandbox> for AccSandbox {
+    fn from(s: Sandbox) -> Self {
+        Self {
+            preset: Some(match s.preset {
+                Preset::Workspace => AccSandboxPreset::Workspace,
+                Preset::ReadOnly => AccSandboxPreset::ReadOnly,
+            }),
+            write: s.write,
+            hide: s.hide,
+            show_credentials: s.show_credentials,
+        }
+    }
+}
+
+/// The paths a sandbox resolves to for one harness (`sandbox_rules`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccSandboxRules {
+    /// The working directory and its git directory are writable.
+    pub workspace: bool,
+    pub write: Vec<String>,
+    pub hide: Vec<String>,
+    /// Readable paths inside hidden ones.
+    pub show: Vec<String>,
+    /// Harness flags added under Seatbelt (macOS), which can't nest.
+    pub seatbelt_args: Vec<String>,
+}
+
+impl From<Rules> for AccSandboxRules {
+    fn from(r: Rules) -> Self {
+        Self {
+            workspace: r.workspace,
+            write: r.write,
+            hide: r.hide,
+            show: r.show,
+            seatbelt_args: r.seatbelt_args,
+        }
+    }
+}
+
+impl From<AccSandboxRules> for Rules {
+    fn from(r: AccSandboxRules) -> Self {
+        Self {
+            workspace: r.workspace,
+            write: r.write,
+            hide: r.hide,
+            show: r.show,
+            seatbelt_args: r.seatbelt_args,
+        }
+    }
+}
+
+/// What the host's sandbox did when the session started.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum AccSandboxApplied {
+    /// macOS `sandbox-exec`.
+    Seatbelt,
+    /// Linux bubblewrap.
+    Bwrap,
+    /// The harness runs unconfined.
+    None { reason: String },
+}
+
+impl From<Applied> for AccSandboxApplied {
+    fn from(a: Applied) -> Self {
+        match a {
+            Applied::Seatbelt => Self::Seatbelt,
+            Applied::Bwrap => Self::Bwrap,
+            Applied::None { reason } => Self::None { reason },
+        }
+    }
+}
+
+/// Whether a host can sandbox sessions (`parse_sandbox_probe`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccSandboxSupport {
+    /// `uname -s`.
+    pub os: String,
+    pub applied: AccSandboxApplied,
+}
+
+impl From<Support> for AccSandboxSupport {
+    fn from(s: Support) -> Self {
+        Self {
+            os: s.os,
+            applied: s.applied.into(),
+        }
+    }
+}
+
 /// What to start.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AccLaunchRequest {
@@ -1041,6 +1172,9 @@ pub struct AccLaunchRequest {
     /// The git worktree `cwd` is in (from `worktree_add_exec`).
     #[uniffi(default = None)]
     pub worktree: Option<String>,
+    /// Confine the harness; `None` runs it unconfined.
+    #[uniffi(default = None)]
+    pub sandbox: Option<AccSandbox>,
 }
 
 impl From<AccLaunchRequest> for LaunchRequest {
@@ -1060,6 +1194,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             labels: r.labels.into_iter().collect(),
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
+            sandbox: r.sandbox.map(Into::into),
         }
     }
 }
@@ -1081,6 +1216,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             labels: r.labels.into_iter().collect(),
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
+            sandbox: r.sandbox.map(Into::into),
         }
     }
 }
@@ -1103,6 +1239,8 @@ pub struct AccSessionSpec {
     pub launcher: Option<AccLauncher>,
     /// The session's git worktree, when it has one.
     pub worktree: Option<String>,
+    /// The sandbox the session asked for.
+    pub sandbox: Option<AccSandbox>,
     /// The full spec, to persist and pass back to `AccSession.attach`.
     pub json: String,
 }
@@ -1122,6 +1260,7 @@ impl From<&SessionSpec> for AccSessionSpec {
             labels: s.labels.clone().into_iter().collect(),
             launcher: s.launcher.clone().map(Into::into),
             worktree: s.worktree.clone(),
+            sandbox: s.sandbox.clone().map(Into::into),
             json: s.to_json(),
         }
     }

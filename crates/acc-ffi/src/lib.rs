@@ -173,6 +173,9 @@ pub struct SessionConfig {
     /// harness process (`[A-Za-z0-9_-]`). Defaults to `acc`.
     #[uniffi(default = None)]
     pub client_tag: Option<String>,
+    /// Confine the harness; `launch_spec` then carries the rules.
+    #[uniffi(default = None)]
+    pub sandbox: Option<acc_types::AccSandbox>,
 }
 
 fn core_session_config(config: SessionConfig) -> Result<core_session::SessionConfig, AccError> {
@@ -197,6 +200,7 @@ fn core_session_config(config: SessionConfig) -> Result<core_session::SessionCon
         opening,
         model: config.model,
         client_tag: tag,
+        sandbox: config.sandbox.map(Into::into),
     })
 }
 
@@ -390,6 +394,7 @@ mod tests {
 
     fn config(harness: Harness) -> SessionConfig {
         SessionConfig {
+            sandbox: None,
             harness,
             cwd: "/tmp".into(),
             opening: Opening::New,

@@ -35,7 +35,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// One detached agent session on a host, from this client's point of view.
 ///
-/// 1. `launch` (then run `take_launch_exec`; its stdout is the PID) or
+/// 1. `launch` (then run `take_launch_exec`; its stdout is the PID, and goes
+///    to `on_launched`) or
 ///    `attach` (then run `status_exec` and pass its stdout to `on_status`).
 /// 2. Follow the log from `offset` and pass every chunk to `feed`.
 /// 3. After `feed` and `command`, send `take_transmit` with `input_exec`.
@@ -143,6 +144,17 @@ impl AccSession {
 
     pub fn on_status(&self, stdout: String, now_ms: u64) -> Vec<AccUpdate> {
         convert(lock(&self.inner).on_status(&stdout, now_ms))
+    }
+
+    /// The stdout of the launch exec. A session that asked for a sandbox
+    /// but runs unconfined gets a notice.
+    pub fn on_launched(&self, stdout: String) -> Vec<AccUpdate> {
+        convert(lock(&self.inner).on_launched(&stdout))
+    }
+
+    /// What the host's sandbox applied, once a launch or status said.
+    pub fn sandbox(&self) -> Option<AccSandboxApplied> {
+        lock(&self.inner).sandbox().cloned().map(Into::into)
     }
 
     /// The content of the session's exit file, from a fan-in `SessionExit` entry.
@@ -355,6 +367,24 @@ pub fn probe_exec() -> AccExec {
     AccExec::script(harness::probe_script())
 }
 
+/// The rules `sandbox` resolves to for `harness`, to show what a sandboxed
+/// session may write and read.
+#[uniffi::export]
+pub fn sandbox_rules(harness: AccHarness, sandbox: AccSandbox) -> AccSandboxRules {
+    acc_core::sandbox::rules(harness.into(), &sandbox.into()).into()
+}
+
+/// Checks whether the host can sandbox sessions (Seatbelt or bubblewrap).
+#[uniffi::export]
+pub fn sandbox_probe_exec() -> AccExec {
+    AccExec::script(acc_core::sandbox::probe_script())
+}
+
+#[uniffi::export]
+pub fn parse_sandbox_probe(stdout: String) -> Option<AccSandboxSupport> {
+    acc_core::sandbox::parse_probe(&stdout).map(Into::into)
+}
+
 #[uniffi::export]
 pub fn parse_probe(stdout: String) -> Vec<AccAvailability> {
     harness::parse_probe(&stdout)
@@ -464,6 +494,7 @@ mod tests {
     #[test]
     fn launch_attach_feed_round_trip_through_ffi_types() {
         let req = AccLaunchRequest {
+            sandbox: None,
             harness: AccHarness::Claude,
             cwd: "/w".into(),
             model: None,
@@ -504,6 +535,7 @@ mod tests {
     #[test]
     fn images_cross_as_bytes_and_oversized_ones_are_rejected() {
         let req = AccLaunchRequest {
+            sandbox: None,
             harness: AccHarness::Claude,
             cwd: "/w".into(),
             model: None,
@@ -555,6 +587,7 @@ mod tests {
     fn subagents_cross_the_ffi() {
         const SUB: &[u8] = include_bytes!("../../acc-core/tests/fixtures/claude/subagents.ndjson");
         let req = AccLaunchRequest {
+            sandbox: None,
             harness: AccHarness::Claude,
             cwd: "/w".into(),
             model: None,
@@ -600,6 +633,7 @@ mod tests {
     fn snapshots_restore_through_ffi() {
         let s = AccSession::launch(
             AccLaunchRequest {
+                sandbox: None,
                 harness: AccHarness::Claude,
                 cwd: "/w".into(),
                 model: None,
@@ -639,6 +673,7 @@ mod tests {
             include_bytes!("../../acc-core/tests/fixtures/claude/background-agent-wakes.ndjson");
         let s = AccSession::launch(
             AccLaunchRequest {
+                sandbox: None,
                 harness: AccHarness::Claude,
                 cwd: "/w".into(),
                 model: None,
@@ -679,6 +714,7 @@ mod tests {
             .collect();
         let s = AccSession::launch(
             AccLaunchRequest {
+                sandbox: None,
                 harness: AccHarness::Claude,
                 cwd: "/w".into(),
                 model: None,
