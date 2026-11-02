@@ -543,12 +543,17 @@ fn push_path(paths: &mut Vec<String>, p: &str) {
 }
 
 /// A native item without the bookkeeping keys every protocol adds, as the
-/// input of a tool ACC has no shape for.
+/// input of a tool ACC has no shape for. Codex 0.166 times every item.
 fn without_bookkeeping(ext: &Value) -> Value {
     match ext {
         Value::Object(map) => Value::Object(
             map.iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "id" | "type" | "status"))
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_str(),
+                        "id" | "type" | "status" | "startedAtMs" | "completedAtMs"
+                    )
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         ),
@@ -1403,7 +1408,8 @@ mod tests {
                 paths: vec![],
             }
         );
-        let ext = json!({"type": "imageView", "id": "iv1", "path": "/w/a.png"});
+        let ext = json!({"type": "imageView", "id": "iv1", "path": "/w/a.png",
+            "startedAtMs": 1_700_000_000_000_u64, "completedAtMs": 1_700_000_000_250_u64});
         let ItemDetail::Tool {
             tool, input, paths, ..
         } = detail(Harness::Codex, ItemKind::ToolCall, &ext, "")
@@ -1413,6 +1419,15 @@ mod tests {
         assert_eq!(tool, "imageView");
         assert_eq!(input, json!({"path": "/w/a.png"}));
         assert_eq!(paths, ["/w/a.png"]);
+        // 0.166 image generations may name a file instead of carrying `result`.
+        let ext = json!({"type": "imageGeneration", "id": "ig1", "status": "completed",
+            "revisedPrompt": "a cat", "fileId": "file_1", "inputImages": [], "generationId": "g1"});
+        let ItemDetail::Tool { tool, input, .. } = detail(Harness::Codex, ItemKind::ToolCall, &ext, "")
+        else {
+            panic!("tool")
+        };
+        assert_eq!(tool, "imageGeneration");
+        assert_eq!(input["fileId"], "file_1");
     }
 
     #[test]

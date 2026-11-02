@@ -319,6 +319,41 @@ fn failed_turn_is_error_with_message() {
 }
 
 #[test]
+fn model_not_found_is_final_and_named() {
+    let mut d = started();
+    feed(
+        &mut d,
+        json!({"method": "turn/started", "params": {"threadId": THREAD, "turn": {"id": "t1"}}}),
+    );
+    let err = json!({"message": "The model `gpt-9` does not exist", "codexErrorInfo": "modelNotFound"});
+    let events = feed(
+        &mut d,
+        json!({"method": "error", "params": {"threadId": THREAD, "turnId": "t1", "willRetry": false, "error": err}}),
+    );
+    assert_eq!(
+        events,
+        [Event::StateChanged(SessionState {
+            state: RunState::Error,
+            message: Some("Model not available: The model `gpt-9` does not exist".into()),
+            source: StateSource::Native,
+            observed_at_ms: 0,
+        })]
+    );
+    // However the turn's completion reports it, the turn ends in error.
+    let events = feed(
+        &mut d,
+        json!({"method": "turn/completed", "params": {"threadId": THREAD, "turn": {"id": "t1", "status": "completed"}}}),
+    );
+    assert_eq!(events, [Event::TurnCompleted]);
+
+    // Kinds with fields are objects; their message stands alone.
+    let err = json!({"message": "connection reset", "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}}});
+    assert_eq!(turn_error(&err).as_deref(), Some("connection reset"));
+    let err = json!({"message": "", "codexErrorInfo": "policyCapacityUnavailable"});
+    assert_eq!(turn_error(&err).as_deref(), Some("No capacity for this model"));
+}
+
+#[test]
 fn command_approval_round_trip() {
     let mut d = started();
     let events = feed(

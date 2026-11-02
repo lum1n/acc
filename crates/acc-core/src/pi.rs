@@ -8,8 +8,8 @@
 //! approval gate of its own: "blocked" means an extension dialog
 //! (`extension_ui_request`), which ACC surfaces as a permission request.
 //!
-//! Checked against pi 1.1.0 (`@earendil-works/pi-coding-agent`); the fixtures
-//! in `tests/fixtures/pi/` are recorded from that version. See
+//! Checked against pi 1.4.0 (`@earendil-works/pi-coding-agent`); the fixtures
+//! in `tests/fixtures/pi/` are recorded from 1.1.0. See
 //! `research/commands-and-options/pi-opencode.md`.
 //!
 //! pi's session files hold the same message objects as its RPC events, so
@@ -582,6 +582,11 @@ impl PiDriver {
                             .unwrap_or_default()
                             .to_owned(),
                     );
+                } else if stop == "length" {
+                    // The turn still ends done, as ACP's `max_tokens` does.
+                    out.push(Event::Notice {
+                        message: "Reply cut off at the model's output limit".into(),
+                    });
                 }
                 self.items.complete(
                     id,
@@ -706,7 +711,7 @@ impl PiDriver {
     }
 
     /// Maps pi's built-in TUI commands to RPC calls. pi would otherwise send
-    /// them to the model as plain text (checked against 1.1.0).
+    /// them to the model as plain text (checked against 1.4.0).
     fn builtin(&mut self, text: &str) -> Option<Vec<u8>> {
         let rest = text.strip_prefix('/')?;
         let (name, arg) = match rest.split_once(char::is_whitespace) {
@@ -1570,6 +1575,48 @@ mod tests {
         let last = last.unwrap();
         assert_eq!(last.state, RunState::Error);
         assert_eq!(last.message.as_deref(), Some("429 rate limited"));
+    }
+
+    #[test]
+    fn length_stop_is_a_notice_not_an_error() {
+        let mut d = PiDriver::new();
+        let events = d.on_output(
+            b"{\"type\":\"agent_start\"}\n\
+              {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n\
+              {\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[],\"stopReason\":\"length\"}}\n\
+              {\"type\":\"agent_settled\",\"aborted\":false}\n",
+        );
+        assert!(events.iter().any(|e| matches!(e,
+            Event::Notice { message } if message.contains("output limit"))));
+        assert_eq!(states(&events).last(), Some(&RunState::Done));
+    }
+
+    /// pi 1.3 fails a call whose arguments were malformed JSON before running
+    /// it, with the parse error (pi-ai's `argumentsError`) as its result.
+    #[test]
+    fn malformed_arguments_show_on_the_failed_call() {
+        use crate::event::ItemStatus;
+        use crate::item::ItemDetail;
+        let mut d = PiDriver::new();
+        let events = d.on_output(
+            br#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"read","args":{"path":"a"}}
+{"type":"tool_execution_end","toolCallId":"c1","toolName":"read","result":{"content":[{"type":"text","text":"Invalid arguments for tool \"read\": Unexpected end of JSON input"}],"details":{}},"isError":true}
+"#,
+        );
+        let Some(Event::ItemCompleted {
+            status,
+            detail: ItemDetail::Tool { output, .. },
+            ..
+        }) = events.last()
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(*status, ItemStatus::Failed);
+        assert!(
+            output
+                .as_deref()
+                .is_some_and(|o| o.ends_with("Unexpected end of JSON input"))
+        );
     }
 
     /// Synthetic (pi isn't recorded with pi-subagents): an `async: true`
