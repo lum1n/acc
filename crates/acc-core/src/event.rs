@@ -38,6 +38,10 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<ItemId>,
         detail: ItemDetail,
+        /// When the harness says the item began, in milliseconds since the
+        /// Unix epoch (Codex 0.166 times every item); `None` where it doesn't.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<u64>,
         /// The harness's own JSON for this frame, for debugging and
         /// harness-specific UI. Nothing in ACC's model depends on it.
         #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -61,6 +65,10 @@ pub enum Event {
         id: ItemId,
         status: ItemStatus,
         detail: ItemDetail,
+        /// When the harness says the item finished, in milliseconds since
+        /// the Unix epoch; `None` where it doesn't.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completed_at_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Value::is_null")]
         native: Value,
     },

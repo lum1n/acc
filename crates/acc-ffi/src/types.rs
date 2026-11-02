@@ -396,6 +396,9 @@ pub enum Event {
         /// The subagent item this one ran inside, if any.
         parent: Option<String>,
         detail: AccItemDetail,
+        /// When the harness says the item began, in milliseconds since the
+        /// Unix epoch; absent where it doesn't time items.
+        started_at_ms: Option<u64>,
         /// The harness's own JSON for this frame; for debugging only.
         native_json: Option<String>,
     },
@@ -414,6 +417,9 @@ pub enum Event {
         id: String,
         status: AccItemStatus,
         detail: AccItemDetail,
+        /// When the harness says the item finished, in milliseconds since
+        /// the Unix epoch; absent where it doesn't time items.
+        completed_at_ms: Option<u64>,
         native_json: Option<String>,
     },
     PermissionRequested {
@@ -500,12 +506,14 @@ impl From<core_ev::Event> for Event {
                 kind,
                 parent,
                 detail,
+                started_at_ms,
                 native,
             } => Self::ItemStarted {
                 id,
                 kind: kind.into(),
                 parent,
                 detail: detail.into(),
+                started_at_ms,
                 native_json: json(&native),
             },
             E::ItemDelta { id, text } => Self::ItemDelta { id, text },
@@ -518,11 +526,13 @@ impl From<core_ev::Event> for Event {
                 id,
                 status,
                 detail,
+                completed_at_ms,
                 native,
             } => Self::ItemCompleted {
                 id,
                 status: status.into(),
                 detail: detail.into(),
+                completed_at_ms,
                 native_json: json(&native),
             },
             E::PermissionRequested {

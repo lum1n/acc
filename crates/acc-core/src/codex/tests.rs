@@ -279,6 +279,7 @@ fn turn_lifecycle_and_sticky_done() {
         kind: ItemKind::AgentMessage,
         parent: None,
         detail: ItemDetail::Text,
+        started_at_ms: None,
         native: json!({"type": "agentMessage", "id": "a1", "text": ""})
     }));
     assert!(events.contains(&Event::ItemDelta {

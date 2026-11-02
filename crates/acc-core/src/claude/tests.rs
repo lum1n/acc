@@ -561,6 +561,7 @@ fn unstreamed_assistant_text_is_announced_whole() {
                 kind: ItemKind::AgentMessage,
                 parent: None,
                 detail: ItemDetail::Text,
+                started_at_ms: None,
                 native: Value::Null
             },
             Event::ItemDelta {
@@ -571,6 +572,7 @@ fn unstreamed_assistant_text_is_announced_whole() {
                 id: "m1:0".into(),
                 status: ItemStatus::Completed,
                 detail: ItemDetail::Text,
+                completed_at_ms: None,
                 native: Value::Null
             },
         ]

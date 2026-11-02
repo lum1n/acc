@@ -542,6 +542,12 @@ fn push_path(paths: &mut Vec<String>, p: &str) {
     }
 }
 
+/// A time the harness stamped on an item frame, in milliseconds since the
+/// Unix epoch.
+fn time_at(native: &Value, key: &str) -> Option<u64> {
+    native.get(key).and_then(Value::as_u64)
+}
+
 /// A native item without the bookkeeping keys every protocol adds, as the
 /// input of a tool ACC has no shape for. Codex 0.166 times every item.
 fn without_bookkeeping(ext: &Value) -> Value {
@@ -1179,11 +1185,13 @@ impl ItemFeed {
             merge(&mut tracked.ext, &native);
         }
         let detail = self.view(&id);
+        let started_at_ms = time_at(&native, "startedAtMs");
         out.push(Event::ItemStarted {
             id,
             kind,
             parent,
             detail,
+            started_at_ms,
             native,
         });
     }
@@ -1233,10 +1241,12 @@ impl ItemFeed {
         if self.items.get(&id).is_some_and(|t| is_message(t.kind)) {
             self.items.remove(&id);
         }
+        let completed_at_ms = time_at(&native, "completedAtMs");
         out.push(Event::ItemCompleted {
             id,
             status,
             detail,
+            completed_at_ms,
             native,
         });
     }
@@ -1493,6 +1503,54 @@ mod tests {
         assert!(
             matches!(&out[0], Event::ItemCompleted { detail: ItemDetail::Tool { tool, .. }, .. } if tool == "web_search")
         );
+    }
+
+    #[test]
+    fn feed_carries_the_times_the_harness_stamps() {
+        let mut feed = ItemFeed::new(Harness::Codex);
+        let mut out = Vec::new();
+        feed.start(
+            "c1",
+            ItemKind::CommandExecution,
+            None,
+            json!({"type": "commandExecution", "id": "c1", "command": "ls", "startedAtMs": 1_700_000_000_000_u64}),
+            &mut out,
+        );
+        feed.complete(
+            "c1",
+            json!({"status": "completed", "completedAtMs": 1_700_000_000_250_u64}),
+            &mut out,
+        );
+        assert!(matches!(
+            &out[0],
+            Event::ItemStarted {
+                started_at_ms: Some(1_700_000_000_000),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &out[1],
+            Event::ItemCompleted {
+                completed_at_ms: Some(1_700_000_000_250),
+                ..
+            }
+        ));
+        // No stamp, no time.
+        let mut out = Vec::new();
+        feed.start(
+            "c2",
+            ItemKind::CommandExecution,
+            None,
+            json!({"command": "ls"}),
+            &mut out,
+        );
+        assert!(matches!(
+            &out[0],
+            Event::ItemStarted {
+                started_at_ms: None,
+                ..
+            }
+        ));
     }
 
     #[test]

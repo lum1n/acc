@@ -103,7 +103,9 @@ changes, subagent runs), each in its own JSON. A client never reads that JSON: e
 items through an `item::ItemFeed`, which merges the native frames of an item and emits
 `Event::ItemStarted`, `ItemUpdated` and `ItemCompleted` with the item's whole `item::ItemDetail` so
 far (a client replaces the detail it had, never merges), and `ItemCompleted` with its
-`ItemStatus`. The detail is the same shape on every harness:
+`ItemStatus`. Where the harness times its items (Codex 0.166's `startedAtMs`/`completedAtMs`),
+`ItemStarted` carries `started_at_ms` and `ItemCompleted` `completed_at_ms`, in epoch milliseconds;
+elsewhere they are `None`. The detail is the same shape on every harness:
 
 | Detail | Carries |
 |---|---|
