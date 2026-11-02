@@ -1,6 +1,6 @@
 # Recorded harness sessions
 
-Real stdout captured from the harnesses on 2026-10-10 (2026-10-12 for the subagent recordings, 2026-10-13 for the background-agent one, 2026-10-14 for Cursor and the Codex subagent),
+Real stdout captured from the harnesses on 2026-10-10 (2026-10-12 for the subagent recordings, 2026-10-13 for the background-agent one, 2026-10-14 for Cursor and the Codex subagent, 2026-11-02 for the Claude fork),
 replayed by the driver tests.
 
 | File | Harness | What it covers |
@@ -8,6 +8,7 @@ replayed by the driver tests.
 | `claude/hi-and-controls.ndjson` | Claude Code 2.1.296 | `initialize`, one streamed turn, `rate_limit_event`, `get_context_usage`, `set_model` |
 | `claude/permission-deny.ndjson` | Claude Code 2.1.296 | `can_use_tool` for Bash answered with deny, session-state frames |
 | `claude/subagents.ndjson` | Claude Code 2.1.280 | `--forward-subagent-text`: a foreground and a background `Agent` call, `task_started`/`task_progress`/`task_updated`/`task_notification`, the background one's hand-back as a queued `<task-notification>` |
+| `claude/fork-subagent-2.1.316.ndjson` | Claude Code 2.1.316 | `-p` forking by default: an `Agent` call with `subagent_type: "fork"` that runs in the background (`background_tasks_changed`, `task_*`), ends the turn, and wakes a second one with its report; `stream_event` lines dropped, `init` lists cut to four entries |
 | `claude/background-agent-wakes.ndjson` | Claude Code 2.1.280 | a turn that ends while its background `Agent` call runs, then the second turn its report starts (no `running` state), then `idle`; `stream_event` and `thinking_tokens` lines dropped |
 | `codex/handshake.ndjson` | codex-cli 0.162.1 | `initialize`, `thread/start`, `model/list`, profiles, modes, rate limits without auth |
 | `codex/turn-network-error.ndjson` | codex-cli 0.162.1 | a turn that can't reach the API (retries) |

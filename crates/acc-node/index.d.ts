@@ -16,7 +16,7 @@ export interface LaunchSpec {
   env: [string, string][];
   protocol: "claude_stream_json" | "codex_app_server" | "acp" | "pi_rpc" | "opencode_http";
   /** Set for a sandboxed session: the paths it may write and may not read. */
-  sandbox?: { workspace: boolean; write: string[]; hide: string[]; show?: string[]; seatbelt_args?: string[] } | null;
+  sandbox?: { workspace: boolean; write: string[]; hide: string[]; show?: string[]; seatbelt_args?: string[]; seatbelt_before?: string } | null;
 }
 
 export type RunState =
@@ -112,6 +112,8 @@ export interface Usage {
   cost_usd: number | null;
   context_used: number | null;
   context_window: number | null;
+  /** A running total in a unit other than US dollars (Copilot's AI Credits), never added to `cost_usd`. */
+  other_cost?: { amount: number; currency: string };
 }
 
 export interface QuotaWindow {

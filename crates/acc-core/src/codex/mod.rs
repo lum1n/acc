@@ -3,9 +3,9 @@
 //! Speaks the `codex app-server` protocol: JSON-RPC 2.0 over stdio, one
 //! message per line, without the `"jsonrpc"` member. ACC is the client; the
 //! server also sends requests back (approvals, user input), which must always
-//! be answered. Checked against `codex-cli` 0.162.1 with
+//! be answered. Checked against `codex-cli` 0.166.0 with
 //! `codex app-server generate-ts --experimental`; the fixtures under
-//! `tests/fixtures/codex` are recorded from that version.
+//! `tests/fixtures/codex` are recorded from 0.162.1.
 //!
 //! What maps where:
 //! - Session: `thread/start` (new) or `thread/resume` (resume and
@@ -466,13 +466,12 @@ impl CodexDriver {
                 let turn = p.get("turn").cloned().unwrap_or(Value::Null);
                 match str_at(&turn, "status") {
                     Some("failed") => {
-                        let msg = turn
-                            .pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .map(|m| wire::one_line(m, 200));
+                        let msg = turn.get("error").and_then(turn_error);
                         self.set_state(RunState::Error, msg, out);
                     }
                     Some("interrupted") => self.set_state(RunState::Idle, Some("Interrupted".into()), out),
+                    // A final `error` notification already ended it.
+                    _ if self.state == Some(RunState::Error) => {}
                     _ => self.set_state(RunState::Done, None, out),
                 }
                 out.push(Event::TurnCompleted);
@@ -534,6 +533,7 @@ impl CodexDriver {
                     cost_usd: None,
                     context_used: usage.pointer("/last/totalTokens").and_then(Value::as_u64),
                     context_window: u64_at(&usage, "modelContextWindow"),
+                    ..Usage::default()
                 }));
             }
             "account/rateLimits/updated" => {
@@ -542,10 +542,7 @@ impl CodexDriver {
                 }
             }
             "error" if ours => {
-                let msg = p
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .map(|m| wire::one_line(m, 200));
+                let msg = p.get("error").and_then(turn_error);
                 if p.get("willRetry").and_then(Value::as_bool) == Some(true) {
                     self.set_state(RunState::Working { progress: None }, msg, out);
                 } else {
@@ -1236,6 +1233,7 @@ impl CodexDriver {
             params["model"] = json!(m);
             self.model = Some(m.clone());
         }
+        // Codex 0.165+ honours an effort change mid-conversation by default.
         if let Some(e) = &o.effort {
             params["effort"] = json!(e);
             self.effort = Some(e.clone());
@@ -1566,6 +1564,27 @@ fn initial_text(item: &Value) -> Option<String> {
         "commandExecution" => owned(item, "command").map(|c| format!("$ {c}\n")),
         _ => None,
     }
+}
+
+/// A `TurnError`'s message on one line, named by its `codexErrorInfo` where
+/// the kind says more than the message (0.166).
+fn turn_error(err: &Value) -> Option<String> {
+    let msg = str_at(err, "message").filter(|m| !m.is_empty());
+    // Unit kinds are strings; kinds with fields are one-key objects.
+    let kind = match err.get("codexErrorInfo") {
+        Some(Value::String(k)) => Some(k.as_str()),
+        Some(Value::Object(m)) => m.keys().next().map(String::as_str),
+        _ => None,
+    };
+    let label = match kind {
+        Some("modelNotFound") => "Model not available",
+        Some("policyCapacityUnavailable") => "No capacity for this model",
+        _ => return msg.map(|m| wire::one_line(m, 200)),
+    };
+    Some(wire::one_line(
+        &msg.map_or_else(|| label.to_owned(), |m| format!("{label}: {m}")),
+        200,
+    ))
 }
 
 /// Text of a finished item, used when replaying thread history.

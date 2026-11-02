@@ -104,8 +104,8 @@ impl ToolKind {
         match t.as_str() {
             "bash" | "shell" | "execute" | "exec_command" | "local_shell" | "run_terminal_cmd"
             | "terminal" | "commandexecution" => ToolKind::Shell,
-            "edit" | "write" | "multiedit" | "notebookedit" | "apply_patch" | "filechange" | "delete"
-            | "move" => ToolKind::Edit,
+            "edit" | "write" | "multiedit" | "notebookedit" | "apply_patch" | "patch" | "filechange"
+            | "delete" | "move" => ToolKind::Edit,
             "read" | "glob" | "grep" | "ls" | "view" | "search" | "find" | "list" => ToolKind::Read,
             "webfetch" | "fetch" | "websearch" | "web_search" => ToolKind::Fetch,
             _ if t.starts_with("mcp") => ToolKind::Mcp,
@@ -543,12 +543,17 @@ fn push_path(paths: &mut Vec<String>, p: &str) {
 }
 
 /// A native item without the bookkeeping keys every protocol adds, as the
-/// input of a tool ACC has no shape for.
+/// input of a tool ACC has no shape for. Codex 0.166 times every item.
 fn without_bookkeeping(ext: &Value) -> Value {
     match ext {
         Value::Object(map) => Value::Object(
             map.iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "id" | "type" | "status"))
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_str(),
+                        "id" | "type" | "status" | "startedAtMs" | "completedAtMs"
+                    )
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         ),
@@ -943,13 +948,16 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
 }
 
 /// Whether an ACP tool call runs another agent: opencode's `task` (input
-/// `subagent_type`/`agent`, `description`, `prompt`), and agents that name
-/// the tool `subagent`, `task` or `Task` with an agent and a prompt.
+/// `subagent_type`/`agent`, `description`, `prompt`; `name` `subagent` or
+/// `task` from 2.2), and agents that name the tool `subagent`, `task` or
+/// `Task` with an agent and a prompt.
 pub(crate) fn acp_is_subagent(update: &Value) -> bool {
     let input = update.get("rawInput").unwrap_or(&Value::Null);
     let title = str_at(update, "title").unwrap_or_default();
     let named = |k: &str| input.get(k).is_some_and(|v| v.is_string());
-    (named("subagent_type") && (named("prompt") || named("description")))
+    let tool = str_at(update, "name").map(str::to_ascii_lowercase);
+    matches!(tool.as_deref(), Some("subagent" | "task"))
+        || (named("subagent_type") && (named("prompt") || named("description")))
         || (named("agent") && (named("task") || named("prompt")))
         || matches!(title, "task" | "Task" | "subagent" | "Subagent" | "Agent")
         || title.ends_with(" Subagent")
@@ -1018,6 +1026,21 @@ fn acp_subagent(name: &str, ext: &Value, output: Option<String>, text: &str) -> 
     }
 }
 
+/// The item kind of an ACP tool call that isn't a subagent: by its tool
+/// name when the agent gives one (`name`, opencode 2.2), else by ACP's
+/// tool kind.
+pub(crate) fn acp_tool_kind(update: &Value) -> ItemKind {
+    match str_at(update, "name").map(ToolKind::of) {
+        Some(ToolKind::Shell) => ItemKind::CommandExecution,
+        Some(ToolKind::Edit) => ItemKind::FileChange,
+        _ => match str_at(update, "kind") {
+            Some("execute") => ItemKind::CommandExecution,
+            Some("edit" | "delete" | "move") => ItemKind::FileChange,
+            _ => ItemKind::ToolCall,
+        },
+    }
+}
+
 fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     let content: &[Value] = ext
         .get("content")
@@ -1035,9 +1058,15 @@ fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
             }
         })
         .collect();
-    // ACP's tool kind (`read`, `edit`, `execute`, ...) is the closest it has
-    // to a tool name.
-    let name = str_at(ext, "kind").unwrap_or("other");
+    // The tool's name when the agent gives one (opencode 2.2: `shell`,
+    // `patch`, `read`, ...); otherwise ACP's tool kind (`read`, `edit`,
+    // `execute`, ...) is the closest it has.
+    let acp_kind = str_at(ext, "kind").unwrap_or("other");
+    let name = str_at(ext, "name").filter(|n| !n.is_empty()).unwrap_or(acp_kind);
+    let tool_kind = match ToolKind::of(name) {
+        ToolKind::Other => ToolKind::of(acp_kind),
+        k => k,
+    };
     if !diffs.is_empty() {
         return ItemDetail::FileChange {
             tool: name.to_owned(),
@@ -1057,7 +1086,7 @@ fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     }
     let input = ext.get("rawInput").cloned().unwrap_or(Value::Null);
     let title = owned(ext, "title").unwrap_or_default();
-    if kind == ItemKind::CommandExecution || str_at(ext, "kind") == Some("execute") {
+    if kind == ItemKind::CommandExecution || acp_kind == "execute" || tool_kind == ToolKind::Shell {
         return ItemDetail::Command {
             tool: name.to_owned(),
             command: owned(&input, "command").unwrap_or(title),
@@ -1083,7 +1112,7 @@ fn acp(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
     }
     ItemDetail::Tool {
         tool: name.to_owned(),
-        kind: ToolKind::of(name),
+        kind: tool_kind,
         title: if title.is_empty() { subject(&input) } else { title },
         input,
         output,
@@ -1221,6 +1250,11 @@ impl ItemFeed {
         merge(&mut ext, native);
         let kind = tracked.map_or(kind, |t| t.kind);
         detail(self.harness, kind, &ext, tracked.map_or("", |t| t.text.as_str()))
+    }
+
+    /// The item's native JSON so far, every frame merged.
+    pub(crate) fn native(&self, id: &str) -> Option<&Value> {
+        self.items.get(id).map(|t| &t.ext)
     }
 
     fn absorb(&mut self, id: &str, native: &Value) {
@@ -1403,7 +1437,8 @@ mod tests {
                 paths: vec![],
             }
         );
-        let ext = json!({"type": "imageView", "id": "iv1", "path": "/w/a.png"});
+        let ext = json!({"type": "imageView", "id": "iv1", "path": "/w/a.png",
+            "startedAtMs": 1_700_000_000_000_u64, "completedAtMs": 1_700_000_000_250_u64});
         let ItemDetail::Tool {
             tool, input, paths, ..
         } = detail(Harness::Codex, ItemKind::ToolCall, &ext, "")
@@ -1413,6 +1448,15 @@ mod tests {
         assert_eq!(tool, "imageView");
         assert_eq!(input, json!({"path": "/w/a.png"}));
         assert_eq!(paths, ["/w/a.png"]);
+        // 0.166 image generations may name a file instead of carrying `result`.
+        let ext = json!({"type": "imageGeneration", "id": "ig1", "status": "completed",
+            "revisedPrompt": "a cat", "fileId": "file_1", "inputImages": [], "generationId": "g1"});
+        let ItemDetail::Tool { tool, input, .. } = detail(Harness::Codex, ItemKind::ToolCall, &ext, "")
+        else {
+            panic!("tool")
+        };
+        assert_eq!(tool, "imageGeneration");
+        assert_eq!(input["fileId"], "file_1");
     }
 
     #[test]

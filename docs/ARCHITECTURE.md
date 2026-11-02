@@ -55,7 +55,7 @@ the turn ended in.
 **Session names.** `Event::TitleChanged` carries the harness's name for the session, and
 `Session` keeps `SessionSpec::title` in step with it, over the launch title and the first-prompt
 fallback. Copilot and Cursor name sessions themselves (ACP `session_info_update`). opencode
-(2.0.14) names them too but never says so, so after a turn the ACP driver asks `session/list`
+(2.0.14 to 2.2.4) names them too but never says so, so after a turn the ACP driver asks `session/list`
 until it reports a name other than its `New session - <time>` placeholder. Codex and pi report
 only names given with rename (`thread.name`, `sessionName`). Headless Claude names nothing on its
 own, so with `ClaudeConfig::auto_title` (on for fresh untitled sessions) the driver sends
@@ -76,13 +76,17 @@ resize first. Transcripts show a prompt's text, or `[image]` when it had none.
 
 ### ACP driver (Cursor, Copilot, opencode)
 
-`acc_core::acp::AcpDriver` speaks ACP protocol version 1 (`@agentclientprotocol/sdk` 1.8.0). It
+`acc_core::acp::AcpDriver` speaks ACP protocol version 1 (schema 1.29, `@agentclientprotocol/sdk` 2.2.0). It
 sends `initialize`, then opens the session itself (`session/new`, or `session/load` / `session/resume`
 to resume), so transports write `Driver::poll_transmit()` after every `on_output`. Options come from
 the agent's `configOptions` (categories `model`, `mode`, `thought_level`, Copilot's `allow_all`), with the
 legacy `modes`/`models` fields and `session/set_mode`/`session/set_model` as fallback. Cursor's model is a
 spawn flag (`agent --model X acp`), reported as `Apply::Restart`. Slash commands are prompt text, taken
-from `available_commands_update`. Request ids carry a per-client tag, and `Start::Attach` lets a second
+from `available_commands_update`; rename uses `session/set_title` and `/new` closes the old session
+(`session/close`) when the agent offers them. Form elicitations (`elicitation/create`, opencode's
+question tool) are `BlockKind::Question` requests whose `native` carries the form's fields as
+`questions`; `$/cancel_request` withdraws a waiting permission or question. A cost in a unit other
+than dollars (Copilot's AI Credits) is `Usage::other_cost`, never summed with `cost_usd`. Request ids carry a per-client tag, and `Start::Attach` lets a second
 client (or a reconnect) adopt a running agent from its log, reading other clients' responses by shape.
 Recorded Copilot 1.0.95, opencode 1.18.35 and Cursor 2026.10.01 sessions under
 `crates/acc-core/tests/fixtures/acp` are replayed in CI. `acc run <harness> [cwd]` drives any harness
@@ -344,7 +348,8 @@ directories, package caches and the harness's own state (`sandbox::state_paths`:
 `~/.claude.json`, `~/.codex`, `~/.cursor`, `~/.copilot`, `~/.pi`, opencode's XDG directories).
 `ssh-agent` and `gh` keep working, so agents can still push and open PRs, and the network stays
 on. `Preset::ReadOnly` drops the workspace. Seatbelt can't nest, so under it Codex gets
-`-c sandbox_mode="danger-full-access"` and Claude `--settings '{"sandbox":{"enabled":false}}'`;
+`-c sandbox_mode="danger-full-access"`, Claude `--settings '{"sandbox":{"enabled":false}}'`, Copilot
+`--no-sandbox` and Cursor `--sandbox disabled` (before `acp`, `Rules::seatbelt_before`);
 Linux nests, so nothing changes there. The sandbox is outermost: a `Launcher` prefix runs inside
 it. Relaunches and handoffs keep it (a handoff resolves the rules again for the new harness).
 

@@ -5,9 +5,9 @@
 //! same one the Claude Agent SDK uses. Every stdout line is one JSON message:
 //! conversation frames (`system`, `assistant`, `user`, `stream_event`,
 //! `result`, `rate_limit_event`) and `control_request` / `control_response`
-//! envelopes going both ways. Checked against Claude Code 2.1.296 and the
-//! Agent SDK 0.3.296 type definitions; the fixtures under
-//! `tests/fixtures/claude` are recorded from that version.
+//! envelopes going both ways. Checked against Claude Code 2.1.316 and the
+//! Agent SDK 0.3.316 type definitions; the fixtures under
+//! `tests/fixtures/claude` are recorded from 2.1.280 to 2.1.316.
 //!
 //! What maps where:
 //! - State: `system/session_state_changed` (enabled by
@@ -17,6 +17,8 @@
 //! - Permissions: `can_use_tool` control requests, which the CLI only sends
 //!   with `--permission-prompt-tool stdio`. `AskUserQuestion` arrives the same
 //!   way and is answered by allowing it with the chosen answer filled in.
+//!   An MCP server's `elicitation` request is a question too, its form
+//!   fields as the questions.
 //! - Commands: the palette comes from the `initialize` reply and
 //!   `system/commands_changed`; slash commands run by sending `/name args` as
 //!   a user message. Model, effort, permission mode and rename use dedicated
@@ -139,6 +141,10 @@ struct PendingPermission {
     suggestions: Value,
     /// For `AskUserQuestion`: the question text the answer is keyed by.
     question: Option<String>,
+    /// An MCP `elicitation` rather than a tool call; `input` is the request
+    /// with its form fields as `questions`.
+    #[serde(default)]
+    elicitation: bool,
 }
 
 /// Content blocks of one assistant message that started streaming but whose
@@ -192,6 +198,11 @@ pub struct ClaudeDriver {
     /// `generate_session_title` went out (see [`ClaudeConfig::auto_title`]).
     #[serde(default)]
     title_requested: bool,
+    /// `system/init` listed `ask_user_question_unanswered_v1` (2.1.312), so
+    /// a question left unanswered is allowed with an annotation saying how
+    /// rather than denied.
+    #[serde(default)]
+    unanswered_annotations: bool,
 }
 
 impl Default for ClaudeDriver {
@@ -229,6 +240,7 @@ impl ClaudeDriver {
             options: Vec::new(),
             transmit: Vec::new(),
             title_requested: false,
+            unanswered_annotations: false,
         };
         d.rebuild_options(None, None);
         d.set_commands(&[]);
@@ -364,6 +376,11 @@ impl ClaudeDriver {
                         .collect();
                     self.set_commands(&list);
                     out.push(Event::CommandsChanged);
+                }
+                if let Some(caps) = v.get("capabilities").and_then(Value::as_array) {
+                    self.unanswered_annotations = caps
+                        .iter()
+                        .any(|c| c.as_str() == Some("ask_user_question_unanswered_v1"));
                 }
                 let changed = id != self.session_id || model != self.model;
                 self.model = model.clone().or(self.model.take());
@@ -595,13 +612,10 @@ impl ClaudeDriver {
         if top_level && let Some(usage) = message.get("usage") {
             self.last_context = wire::sum(
                 usage,
-                &[
-                    "input_tokens",
-                    "cache_read_input_tokens",
-                    "cache_creation_input_tokens",
-                    "output_tokens",
-                ],
-            );
+                &["input_tokens", "cache_read_input_tokens", "output_tokens"],
+            )
+            .map(|n| n.saturating_add(cache_writes(usage).unwrap_or(0)))
+            .or_else(|| cache_writes(usage));
         }
         let blocks = message
             .get("content")
@@ -769,10 +783,11 @@ impl ClaudeDriver {
             input_tokens: u64_at(&usage, "input_tokens"),
             output_tokens: u64_at(&usage, "output_tokens"),
             cache_read_tokens: u64_at(&usage, "cache_read_input_tokens"),
-            cache_write_tokens: u64_at(&usage, "cache_creation_input_tokens"),
+            cache_write_tokens: cache_writes(&usage),
             cost_usd: f64_at(v, "total_cost_usd"),
             context_used: self.last_context,
             context_window: self.context_window,
+            ..Usage::default()
         }));
         // A turn can't end while a prompt is open, so anything left was
         // answered or withdrawn in a way the log doesn't show.
@@ -791,6 +806,7 @@ impl ClaudeDriver {
                 .and_then(|e| e.first())
                 .and_then(Value::as_str)
                 .or_else(|| str_at(v, "result"))
+                .or_else(|| str_at(v, "startup_failure_reason"))
                 .or_else(|| str_at(v, "subtype"))
                 .map(|m| wire::one_line(m, 200));
             self.set_state(RunState::Error, message, out);
@@ -841,6 +857,7 @@ impl ClaudeDriver {
         let req = v.get("request").cloned().unwrap_or(Value::Null);
         match str_at(&req, "subtype") {
             Some("can_use_tool") => self.permission_request(id, &req, out),
+            Some("elicitation") => self.elicitation_request(id, &req, out),
             // ACC registers no hooks, SDK MCP servers or dialogs, so anything
             // else is answered with an error rather than left hanging.
             other => {
@@ -911,6 +928,7 @@ impl ClaudeDriver {
                 input,
                 suggestions,
                 question,
+                elicitation: false,
             },
         );
         out.push(Event::PermissionRequested {
@@ -933,6 +951,58 @@ impl ClaudeDriver {
                 BlockKind::Permission
             };
             self.set_state(RunState::Blocked { kind }, None, out);
+        }
+    }
+
+    /// An MCP server asking the user for input (`elicitation`). A form's
+    /// fields are its questions; a URL flow, or a form without fields, is
+    /// accepted as is.
+    fn elicitation_request(&mut self, id: String, req: &Value, out: &mut Vec<Event>) {
+        let server = str_at(req, "display_name")
+            .or_else(|| str_at(req, "mcp_server_name"))
+            .unwrap_or("MCP server");
+        let text = str_at(req, "message")
+            .or_else(|| str_at(req, "title"))
+            .unwrap_or("");
+        let title = format!("{server}: {}", wire::one_line(text, 200));
+        let questions = elicitation_fields(req);
+        let mut options = Vec::new();
+        if questions.is_empty() {
+            options.push(PermissionOption::new("accept", "Accept"));
+        }
+        options.extend([
+            PermissionOption::new("decline", "Decline"),
+            PermissionOption::new("cancel", "Cancel"),
+        ]);
+        let mut native = req.clone();
+        native["questions"] = Value::Array(questions);
+        self.permissions.insert(
+            id.clone(),
+            PendingPermission {
+                tool_use_id: None,
+                input: native.clone(),
+                suggestions: Value::Null,
+                question: Some(title.clone()),
+                elicitation: true,
+            },
+        );
+        out.push(Event::PermissionRequested {
+            request_id: id,
+            title,
+            options,
+            kind: BlockKind::Question,
+            item_id: None,
+            detail: None,
+            native,
+        });
+        if !self.native_state_events {
+            self.set_state(
+                RunState::Blocked {
+                    kind: BlockKind::Question,
+                },
+                None,
+                out,
+            );
         }
     }
 
@@ -1391,23 +1461,67 @@ impl ClaudeDriver {
             .permissions
             .remove(request_id)
             .ok_or_else(|| DriverError::UnknownRequest(request_id.to_owned()))?;
+        if p.elicitation {
+            let Some(result) = elicitation_result(&p.input, option_id) else {
+                self.permissions.insert(request_id.to_owned(), p);
+                return Err(DriverError::InvalidOption(option_id.to_owned()));
+            };
+            return Ok(wire::line(&json!({
+                "type": "control_response",
+                "response": {"subtype": "success", "request_id": request_id, "response": result},
+            })));
+        }
+        let deny = json!({"behavior": "deny", "message": "The user denied this request."});
+        let dismissed = option_id == "deny";
         let mut result = match (option_id, &p.question) {
-            ("deny", _) => json!({"behavior": "deny", "message": "The user denied this request."}),
+            ("deny", None) => deny,
+            // Older CLIs take no annotation: a dismissed question is a denial.
+            (_, Some(_)) if dismissed && !self.unanswered_annotations => deny,
             (_, Some(question)) => {
                 let mut input = p.input.clone();
-                let answers = crate::question::decode(option_id);
+                let answers = if dismissed {
+                    Vec::new()
+                } else {
+                    crate::question::decode(option_id)
+                };
                 let questions = crate::question::parse(&p.input);
                 let mut map = serde_json::Map::new();
+                let mut notes = serde_json::Map::new();
+                // With the capability, a question left unanswered says how
+                // (2.1.312); the model reads only the text in `answers`.
+                let annotate = self.unanswered_annotations;
+                let mut unanswered = |q: &str, map: &mut serde_json::Map<String, Value>| {
+                    if annotate {
+                        let (how, text) = if dismissed {
+                            ("dismissed", "The user dismissed this question without answering.")
+                        } else {
+                            ("skipped", "The user skipped this question.")
+                        };
+                        map.insert(q.to_owned(), json!(text));
+                        notes.insert(q.to_owned(), json!({"unanswered": how}));
+                    }
+                };
                 if questions.is_empty() {
-                    map.insert(question.clone(), json!(answers.concat().join(", ")));
+                    match answers.concat() {
+                        a if a.is_empty() => unanswered(question, &mut map),
+                        a => {
+                            map.insert(question.clone(), json!(a.join(", ")));
+                        }
+                    }
                 }
                 // Several picks to one question are joined, as Claude's own UI does.
-                for (q, a) in questions.iter().zip(&answers) {
-                    if !a.is_empty() {
-                        map.insert(q.question.clone(), json!(a.join(", ")));
+                for (i, q) in questions.iter().enumerate() {
+                    match answers.get(i).filter(|a| !a.is_empty()) {
+                        Some(a) => {
+                            map.insert(q.question.clone(), json!(a.join(", ")));
+                        }
+                        None => unanswered(&q.question, &mut map),
                     }
                 }
                 input["answers"] = Value::Object(map);
+                if !notes.is_empty() {
+                    input["annotations"] = Value::Object(notes);
+                }
                 json!({"behavior": "allow", "updatedInput": input})
             }
             ("allow", None) => json!({"behavior": "allow", "updatedInput": p.input}),
@@ -1860,6 +1974,178 @@ fn slash(name: &str, args: &str) -> String {
     } else {
         format!("/{name} {args}")
     }
+}
+
+/// Cache writes in an API `usage`: `cache_creation_input_tokens`, or when
+/// that is missing or zero, its 5-minute and 1-hour parts (2.1.311).
+fn cache_writes(usage: &Value) -> Option<u64> {
+    let total = u64_at(usage, "cache_creation_input_tokens");
+    let split = usage
+        .get("cache_creation")
+        .and_then(|c| wire::sum(c, &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]));
+    match total {
+        Some(0) | None => split.or(total),
+        total => total,
+    }
+}
+
+/// An elicitation form's fields as `AskUserQuestion`-shaped questions, `id`
+/// the field name, in the order the server listed them (`property_order`,
+/// 2.1.299; the schema's own keys come back sorted).
+fn elicitation_fields(req: &Value) -> Vec<Value> {
+    let Some(schema) = req.get("requested_schema") else {
+        return Vec::new();
+    };
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let required = strs(schema.get("required"));
+    let mut names: Vec<&str> = strs(req.get("property_order"))
+        .into_iter()
+        .filter(|n| props.contains_key(*n))
+        .collect();
+    for k in props.keys() {
+        if !names.contains(&k.as_str()) {
+            names.push(k);
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let p = &props[name];
+            let multi = str_at(p, "type") == Some("array");
+            let choices = field_choices(if multi {
+                p.get("items").unwrap_or(&Value::Null)
+            } else {
+                p
+            });
+            json!({
+                "id": name,
+                "question": str_at(p, "description").or_else(|| str_at(p, "title")).unwrap_or(name),
+                "header": str_at(p, "title"),
+                "multiSelect": multi,
+                "options": choices.iter().map(|(_, l)| json!({"label": l})).collect::<Vec<_>>(),
+                "required": required.contains(&name),
+            })
+        })
+        .collect()
+}
+
+/// The strings in a JSON array.
+fn strs(v: Option<&Value>) -> Vec<&str> {
+    v.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// A form field's choices as (value, label): `enum` (labelled by the legacy
+/// `enumNames`), `oneOf`/`anyOf` of `const`s, or yes and no for a boolean.
+fn field_choices(p: &Value) -> Vec<(Value, String)> {
+    let text = |v: &Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+    if let Some(values) = p.get("enum").and_then(Value::as_array) {
+        let names = strs(p.get("enumNames"));
+        return values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (
+                    v.clone(),
+                    names.get(i).map_or_else(|| text(v), |n| (*n).to_owned()),
+                )
+            })
+            .collect();
+    }
+    if let Some(consts) = p
+        .get("oneOf")
+        .or_else(|| p.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return consts
+            .iter()
+            .filter_map(|c| {
+                let v = c.get("const")?;
+                Some((v.clone(), owned(c, "title").unwrap_or_else(|| text(v))))
+            })
+            .collect();
+    }
+    if str_at(p, "type") == Some("boolean") {
+        return vec![(json!(true), "Yes".into()), (json!(false), "No".into())];
+    }
+    Vec::new()
+}
+
+/// One answer to a form field, as the type its schema asks for. A field
+/// with choices takes only those.
+fn field_value(p: &Value, answer: &str) -> Option<Value> {
+    let choices = field_choices(p);
+    if let Some((v, _)) = choices
+        .iter()
+        .find(|(v, l)| l == answer || v.as_str() == Some(answer))
+    {
+        return Some(v.clone());
+    }
+    match str_at(p, "type") {
+        _ if !choices.is_empty() && str_at(p, "type") != Some("boolean") => None,
+        Some("boolean") => match answer.to_ascii_lowercase().as_str() {
+            "true" | "yes" => Some(json!(true)),
+            "false" | "no" => Some(json!(false)),
+            _ => None,
+        },
+        Some("integer") => answer.trim().parse::<i64>().ok().map(Value::from),
+        Some("number") => answer.trim().parse::<f64>().ok().map(Value::from),
+        _ => Some(json!(answer)),
+    }
+}
+
+/// The reply to an elicitation (MCP `ElicitResult`): `accept`, `decline` or
+/// `cancel`, or [`crate::question::encode`]d answers to its fields, accepted
+/// with them as `content`. `None` when an answer doesn't fit its field or a
+/// required one is missing.
+fn elicitation_result(native: &Value, option_id: &str) -> Option<Value> {
+    let fields = crate::question::parse(native);
+    match option_id {
+        "decline" | "cancel" => return Some(json!({"action": option_id})),
+        "accept" if fields.is_empty() => {
+            return Some(match str_at(native, "mode") {
+                Some("url") => json!({"action": "accept"}),
+                _ => json!({"action": "accept", "content": {}}),
+            });
+        }
+        _ => {}
+    }
+    let props = native.pointer("/requested_schema/properties")?;
+    let answers = crate::question::decode(option_id);
+    let mut content = serde_json::Map::new();
+    for (i, f) in fields.iter().enumerate() {
+        let name = f.id.as_deref()?;
+        let p = props.get(name)?;
+        let a: Vec<&String> = answers
+            .get(i)
+            .into_iter()
+            .flatten()
+            .filter(|x| !x.is_empty())
+            .collect();
+        if a.is_empty() {
+            if native.pointer(&format!("/questions/{i}/required")) == Some(&Value::Bool(true)) {
+                return None;
+            }
+            continue;
+        }
+        let value = if f.multi_select {
+            let items = p.get("items").unwrap_or(&Value::Null);
+            Value::Array(
+                a.iter()
+                    .map(|x| field_value(items, x))
+                    .collect::<Option<Vec<_>>>()?,
+            )
+        } else {
+            field_value(p, a[0])?
+        };
+        content.insert(name.to_owned(), value);
+    }
+    Some(json!({"action": "accept", "content": content}))
 }
 
 /// The item kind of a call to Claude tool `name`.

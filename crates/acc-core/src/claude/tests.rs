@@ -1213,3 +1213,296 @@ fn a_turn_left_waiting_on_a_background_agent_is_not_done() {
     assert_eq!(agent_while_waiting, Some(ItemStatus::Running));
     assert!(t.subagents().all(|i| i.status == ItemStatus::Completed));
 }
+
+/// Claude Code 2.1.316, where `-p` forks by default: an `Agent` call with
+/// `subagent_type: "fork"` runs in the background, ends the turn, and its
+/// report wakes a second one.
+const FORK: &str = include_str!("../../tests/fixtures/claude/fork-subagent-2.1.316.ndjson");
+
+#[test]
+fn recorded_fork_is_a_subagent_that_wakes_the_session() {
+    use crate::transcript::{ItemStatus, Transcript};
+    let mut d = ClaudeDriver::default();
+    let mut t = Transcript::new();
+    let mut states = Vec::new();
+    for line in FORK.split_inclusive('\n') {
+        for e in d.on_output(line.as_bytes()) {
+            t.settle(&e);
+            t.apply(&e);
+            if let Event::StateChanged(s) = &e {
+                states.push(s.state.clone());
+            }
+        }
+    }
+    assert_eq!(states.last(), Some(&RunState::Done), "{states:?}");
+    assert!(states.contains(&RunState::Waiting), "{states:?}");
+    let subs: Vec<_> = t.subagents().collect();
+    assert_eq!(subs.len(), 1);
+    let fork = subs[0];
+    assert_eq!(fork.status, ItemStatus::Completed);
+    let ItemDetail::Subagent {
+        agent, child, output, ..
+    } = fork.detail.clone()
+    else {
+        panic!("subagent detail")
+    };
+    assert_eq!(agent.as_deref(), Some("fork"));
+    assert!(child.is_some());
+    assert!(output.is_some_and(|o| o.contains('3')));
+    assert!(
+        t.children(&fork.id).next().is_some(),
+        "the fork's own conversation"
+    );
+}
+
+/// An MCP form elicitation as 2.1.316 sends it: `requested_schema` with
+/// `property_order` (the schema's keys come back sorted).
+fn elicitation(id: &str) -> Value {
+    json!({"type":"control_request","request_id":id,"request":{
+        "subtype":"elicitation","mcp_server_name":"deploy","message":"Where to deploy?","mode":"form",
+        "requested_schema":{"type":"object","required":["target"],"properties":{
+            "target":{"type":"string","title":"Target","enum":["prod","staging"],"enumNames":["Production","Staging"]},
+            "replicas":{"type":"integer","description":"How many replicas?"},
+            "notify":{"type":"boolean","title":"Notify"},
+            "regions":{"type":"array","items":{"anyOf":[{"const":"eu","title":"Europe"},{"const":"us","title":"US"}]}}}},
+        "property_order":["target","replicas","notify","regions"]}})
+}
+
+#[test]
+fn mcp_elicitation_is_a_question_with_its_form_fields() {
+    let mut d = ClaudeDriver::default();
+    let events = d.on_output(&wire::line(&elicitation("e1")));
+    let Some(Event::PermissionRequested {
+        title,
+        options,
+        kind,
+        native,
+        ..
+    }) = events
+        .iter()
+        .find(|e| matches!(e, Event::PermissionRequested { .. }))
+    else {
+        panic!("no question: {events:?}")
+    };
+    assert_eq!(title, "deploy: Where to deploy?");
+    assert_eq!(*kind, BlockKind::Question);
+    let ids: Vec<_> = options.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids, ["decline", "cancel"]);
+    let qs = crate::question::parse(native);
+    let fields: Vec<_> = qs.iter().map(|q| q.id.as_deref().unwrap()).collect();
+    assert_eq!(fields, ["target", "replicas", "notify", "regions"]);
+    assert_eq!(qs[0].options[0].label, "Production");
+    assert_eq!(qs[1].question, "How many replicas?");
+    assert!(qs[3].multi_select);
+    assert_eq!(qs[3].options[1].label, "US");
+    assert!(states(&events).contains(&RunState::Blocked {
+        kind: BlockKind::Question
+    }));
+
+    let answer = |d: &mut ClaudeDriver, answers: &[&[&str]]| {
+        let answers: Vec<Vec<String>> = answers
+            .iter()
+            .map(|a| a.iter().map(|s| (*s).to_owned()).collect())
+            .collect();
+        d.command(Command::AnswerPermission {
+            request_id: "e1".into(),
+            option_id: crate::question::encode(&answers),
+        })
+    };
+    // A count that isn't a number, a target not offered, or no target is
+    // refused and stays open.
+    assert!(answer(&mut d, &[&["Production"], &["many"]]).is_err());
+    assert!(answer(&mut d, &[&["moon"]]).is_err());
+    assert!(answer(&mut d, &[&[], &["2"]]).is_err());
+    let bytes = answer(&mut d, &[&["Production"], &["3"], &["Yes"], &["Europe", "US"]]).unwrap();
+    let msg = &sent(&bytes)[0];
+    assert_eq!(msg["response"]["request_id"], "e1");
+    assert_eq!(
+        msg["response"]["response"],
+        json!({"action": "accept", "content": {
+            "target": "prod", "replicas": 3, "notify": true, "regions": ["eu", "us"]}})
+    );
+
+    d.on_output(&wire::line(&elicitation("e2")));
+    let bytes = d
+        .command(Command::AnswerPermission {
+            request_id: "e2".into(),
+            option_id: "decline".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        sent(&bytes)[0]["response"]["response"],
+        json!({"action": "decline"})
+    );
+}
+
+#[test]
+fn mcp_url_elicitation_is_accepted_as_is() {
+    let mut d = ClaudeDriver::default();
+    let req = json!({"type":"control_request","request_id":"u1","request":{
+        "subtype":"elicitation","mcp_server_name":"github","message":"Sign in","mode":"url",
+        "url":"https://example.com/auth","elicitation_id":"el-1"}});
+    let events = d.on_output(&wire::line(&req));
+    assert!(events.iter().any(|e| matches!(e,
+        Event::PermissionRequested { options, .. } if options[0].id == "accept")));
+    let bytes = d
+        .command(Command::AnswerPermission {
+            request_id: "u1".into(),
+            option_id: "accept".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        sent(&bytes)[0]["response"]["response"],
+        json!({"action": "accept"})
+    );
+}
+
+fn ask_two(d: &mut ClaudeDriver, id: &str) {
+    let req = json!({"type":"control_request","request_id":id,"request":{
+        "subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"toolu_q",
+        "input":{"questions":[
+            {"question":"Which DB?","header":"DB","multiSelect":false,
+                "options":[{"label":"Postgres","description":""},{"label":"SQLite","description":""}]},
+            {"question":"Which extras?","header":"Extras","multiSelect":true,
+                "options":[{"label":"Cache","description":""},{"label":"Search","description":""}]}]}}});
+    d.on_output(&wire::line(&req));
+}
+
+#[test]
+fn unanswered_questions_are_annotated_when_claude_takes_it() {
+    // Without the capability, dismissing is a denial.
+    let mut d = ClaudeDriver::default();
+    ask_two(&mut d, "q1");
+    let bytes = d
+        .command(Command::AnswerPermission {
+            request_id: "q1".into(),
+            option_id: "deny".into(),
+        })
+        .unwrap();
+    assert_eq!(sent(&bytes)[0]["response"]["response"]["behavior"], "deny");
+
+    let mut d = ClaudeDriver::default();
+    d.on_output(&wire::line(
+        &json!({"type":"system","subtype":"init","session_id":"s",
+        "capabilities":["interrupt_receipt_v1","ask_user_question_unanswered_v1"]}),
+    ));
+    ask_two(&mut d, "q1");
+    let bytes = d
+        .command(Command::AnswerPermission {
+            request_id: "q1".into(),
+            option_id: "deny".into(),
+        })
+        .unwrap();
+    let result = &sent(&bytes)[0]["response"]["response"];
+    assert_eq!(result["behavior"], "allow");
+    assert_eq!(
+        result["updatedInput"]["annotations"],
+        json!({"Which DB?": {"unanswered": "dismissed"}, "Which extras?": {"unanswered": "dismissed"}})
+    );
+    assert!(result["updatedInput"]["answers"]["Which DB?"].is_string());
+
+    ask_two(&mut d, "q2");
+    let bytes = d
+        .command(Command::AnswerPermission {
+            request_id: "q2".into(),
+            option_id: crate::question::encode(&[vec!["SQLite".to_owned()], vec![]]),
+        })
+        .unwrap();
+    let input = &sent(&bytes)[0]["response"]["response"]["updatedInput"];
+    assert_eq!(input["answers"]["Which DB?"], "SQLite");
+    assert_eq!(
+        input["annotations"],
+        json!({"Which extras?": {"unanswered": "skipped"}})
+    );
+}
+
+#[test]
+fn startup_failure_reason_explains_a_failed_start() {
+    let mut d = ClaudeDriver::default();
+    let events = d.on_output(&wire::line(
+        &json!({"type":"result","subtype":"error_during_execution",
+        "is_error":true,"errors":[],"startup_failure_reason":"sandbox_required_unavailable"}),
+    ));
+    assert!(events.iter().any(|e| matches!(e, Event::StateChanged(s)
+        if s.state == RunState::Error && s.message.as_deref() == Some("sandbox_required_unavailable"))));
+}
+
+#[test]
+fn cache_writes_count_their_split_when_the_total_is_missing() {
+    let mut d = ClaudeDriver::default();
+    let usage = |d: &mut ClaudeDriver, usage: Value| {
+        d.on_output(&wire::line(
+            &json!({"type":"result","subtype":"success","usage":usage}),
+        ))
+        .into_iter()
+        .find_map(|e| match e {
+            Event::Usage(u) => Some(u.cache_write_tokens),
+            _ => None,
+        })
+        .unwrap()
+    };
+    let split = json!({"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 20});
+    // The split is already inside the total.
+    assert_eq!(
+        usage(
+            &mut d,
+            json!({"cache_creation_input_tokens": 120, "cache_creation": split})
+        ),
+        Some(120)
+    );
+    assert_eq!(usage(&mut d, json!({"cache_creation": split})), Some(120));
+    assert_eq!(
+        usage(
+            &mut d,
+            json!({"cache_creation_input_tokens": 0, "cache_creation": split})
+        ),
+        Some(120)
+    );
+    assert_eq!(usage(&mut d, json!({"cache_creation_input_tokens": 0})), Some(0));
+    assert_eq!(usage(&mut d, json!({"input_tokens": 1})), None);
+}
+
+#[test]
+fn fork_subagents_are_subagents() {
+    use crate::transcript::{ItemStatus, Transcript};
+    // 2.1.302 offers `subagent_type: "fork"` headless: the same `Agent`
+    // input, the child inheriting the conversation.
+    let frames = [
+        json!({"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_fork","name":"Agent","input":{
+                "description":"Try the other fix","prompt":"Apply the second approach","subagent_type":"fork",
+                "run_in_background":false}}]},"parent_tool_use_id":null}),
+        json!({"type":"assistant","message":{"id":"msg_2","role":"assistant","content":[
+            {"type":"text","text":"Trying it."}]},"parent_tool_use_id":"toolu_fork"}),
+        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fork",
+            "content":[{"type":"text","text":"Second approach works."}]}]},"parent_tool_use_id":null,
+            "tool_use_result":{"status":"completed","agentId":"afork1","agentType":"fork",
+                "prompt":"Apply the second approach","content":[{"type":"text","text":"Second approach works."}]}}),
+    ];
+    let mut d = ClaudeDriver::default();
+    let mut t = Transcript::new();
+    for f in &frames {
+        for e in d.on_output(&wire::line(f)) {
+            t.settle(&e);
+            t.apply(&e);
+        }
+    }
+    let sub = t.get("toolu_fork").unwrap();
+    assert_eq!(sub.kind, ItemKind::Subagent);
+    assert_eq!(sub.status, ItemStatus::Completed);
+    let ItemDetail::Subagent {
+        agent,
+        description,
+        child,
+        output,
+        ..
+    } = sub.detail.clone()
+    else {
+        panic!("subagent detail")
+    };
+    assert_eq!(agent.as_deref(), Some("fork"));
+    assert_eq!(description, "Try the other fix");
+    assert_eq!(child.as_deref(), Some("afork1"));
+    assert_eq!(output.as_deref(), Some("Second approach works."));
+    assert_eq!(t.children("toolu_fork").count(), 1);
+}

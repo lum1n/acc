@@ -81,6 +81,8 @@ export interface SandboxRules {
   hide: string[];
   show?: string[];
   seatbelt_args?: string[];
+  /** The subcommand `seatbelt_args` go before (`acp` for Cursor); otherwise they go last. */
+  seatbelt_before?: string;
 }
 
 export interface LaunchSpec {
@@ -184,6 +186,8 @@ export interface Usage {
   cost_usd: number | null;
   context_used: number | null;
   context_window: number | null;
+  /** A running total in a unit other than US dollars (Copilot's AI Credits), never added to `cost_usd`. */
+  other_cost?: { amount: number; currency: string };
 }
 
 export interface QuotaWindow {

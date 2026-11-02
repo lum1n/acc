@@ -260,15 +260,17 @@ impl SessionDir {
     }
 
     /// Script printing `alive <pid> <size>`, `exited <code> <size>` or
-    /// `missing`, where `size` is the log's length in bytes, then for a
-    /// sandboxed session a `B` line. Parse them with [`parse_status`] and
-    /// [`parse_sandbox`].
+    /// `missing`, where `size` is the log's length in bytes, then for an
+    /// exited session an `E` line with the last line it wrote to stderr, and
+    /// for a sandboxed session a `B` line. Parse them with [`parse_status`],
+    /// [`parse_stderr`] and [`parse_sandbox`].
     pub fn status_script(&self) -> String {
         let d = self.dir();
         format!(
             "d={d}\n\
              s=$(wc -c <\"$d/out.ndjson\" 2>/dev/null | tr -d ' ' || echo 0)\n\
              if [ -f \"$d/exit\" ]; then echo \"exited $(cat \"$d/exit\") $s\";\n\
+             e=$(grep -v '^[[:space:]]*$' \"$d/err\" 2>/dev/null | tail -n 1); [ -n \"$e\" ] && printf 'E %s\\n' \"$e\";\n\
              elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then echo \"alive $(cat \"$d/pid\") $s\";\n\
              elif [ -f \"$d/pid\" ]; then echo \"exited - $s\";\n\
              else echo missing; fi\n\
@@ -385,6 +387,15 @@ pub fn parse_status(out: &str) -> Option<Status> {
         "missing" => Some(Status::Missing),
         _ => None,
     }
+}
+
+/// The last line an exited session wrote to stderr, from the output of
+/// [`SessionDir::status_script`] (`opencode acp: server exited unexpectedly`).
+pub fn parse_stderr(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("E "))
+        .map(|l| crate::wire::one_line(l, 300))
+        .filter(|l| !l.is_empty())
 }
 
 /// What a sandboxed session's host applied, from the output of
@@ -969,6 +980,44 @@ mod sh_tests {
         assert!(sh(&home, &dir.status_script(), b"").starts_with("alive"));
 
         let _ = Command::new("kill").arg(pid.trim()).status();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn status_reports_the_last_stderr_line_of_a_failed_harness() {
+        let home = std::env::temp_dir().join(format!("acc-test-err-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let dir = SessionDir::new("err").expect("valid id");
+        let spec = LaunchSpec {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo starting >&2; echo 'opencode acp: server exited unexpectedly' >&2; echo >&2; exit 1"
+                    .into(),
+            ],
+            env: vec![],
+            protocol: Protocol::Acp,
+            sandbox: None,
+        };
+        let _ = sh(&home, &dir.launch_script_with_spec(&spec, "~", None), b"");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut out = String::new();
+        while Instant::now() < deadline {
+            out = sh(&home, &dir.status_script(), b"");
+            if out.starts_with("exited") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(parse_status(&out), Some(Status::Exited { code: Some(1), .. })),
+            "{out}"
+        );
+        assert_eq!(
+            parse_stderr(&out).as_deref(),
+            Some("opencode acp: server exited unexpectedly")
+        );
+        assert_eq!(parse_stderr("exited 0 3\n"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

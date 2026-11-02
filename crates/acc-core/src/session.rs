@@ -32,7 +32,7 @@ use crate::acp::{AcpConfig, AcpDriver, Start, launch_spec as acp_launch};
 use crate::claude::{ClaudeConfig, ClaudeDriver};
 use crate::codex::{CodexConfig, CodexDriver};
 use crate::command::{Apply, Attachment, Command, CommandEntry, OptionDef, OptionId};
-use crate::detached::{SessionDir, Status, parse_sandbox, parse_status};
+use crate::detached::{SessionDir, Status, parse_sandbox, parse_status, parse_stderr};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
 use crate::exec::Exec;
@@ -697,8 +697,8 @@ impl Session {
                     self.finish_replay();
                 }
             }
-            Status::Exited { code, .. } => self.exit(code, now_ms, &mut out),
-            Status::Missing => self.exit(None, now_ms, &mut out),
+            Status::Exited { code, .. } => self.exit(code, parse_stderr(stdout), now_ms, &mut out),
+            Status::Missing => self.exit(None, None, now_ms, &mut out),
         }
         self.police(&mut out);
         out
@@ -740,7 +740,7 @@ impl Session {
     /// Applies the content of the session's exit file (from a fan-in entry).
     pub fn on_exit_file(&mut self, text: &str, now_ms: u64) -> Vec<Update> {
         let mut out = Vec::new();
-        self.exit(text.trim().parse().ok(), now_ms, &mut out);
+        self.exit(text.trim().parse().ok(), None, now_ms, &mut out);
         out
     }
 
@@ -1036,7 +1036,9 @@ impl Session {
         self.handshaken = false;
     }
 
-    fn exit(&mut self, code: Option<i32>, now_ms: u64, out: &mut Vec<Update>) {
+    /// The harness exited with `code`; `stderr` is the last line it wrote
+    /// there, shown with a failure (opencode's private server dying).
+    fn exit(&mut self, code: Option<i32>, stderr: Option<String>, now_ms: u64, out: &mut Vec<Update>) {
         self.alive = false;
         if self.exited {
             return;
@@ -1052,7 +1054,13 @@ impl Session {
         let (state, message) = match code {
             None | Some(0) => (RunState::Exited, None),
             Some(c) if c > 128 => (RunState::Exited, Some(format!("Stopped (signal {})", c - 128))),
-            Some(c) => (RunState::Error, Some(format!("Exited with code {c}"))),
+            Some(c) => (
+                RunState::Error,
+                Some(match stderr {
+                    Some(line) => format!("Exited with code {c}: {line}"),
+                    None => format!("Exited with code {c}"),
+                }),
+            ),
         };
         events.push(Event::StateChanged(SessionState {
             state,
@@ -1181,6 +1189,9 @@ fn merge_usage(into: &mut Usage, from: &Usage) {
         context_used,
         context_window
     );
+    if from.other_cost.is_some() {
+        into.other_cost.clone_from(&from.other_cost);
+    }
 }
 
 /// Script printing the absolute path of `dir` (`~` expanded), or failing

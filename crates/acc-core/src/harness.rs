@@ -211,12 +211,12 @@ impl Harness {
     /// flag ACC passes (Claude before 2.1.280 rejects `--forward-subagent-text`).
     pub fn tested_versions(self) -> (&'static str, &'static str) {
         match self {
-            Harness::Claude => ("2.1.280", "2.1.296"),
-            Harness::Codex => ("0.128.0", "0.162.1"),
-            Harness::Cursor => ("2026.10.01", "2026.10.01"),
-            Harness::Copilot => ("1.0.94", "1.0.95"),
-            Harness::Pi => ("0.82.1", "1.1.0"),
-            Harness::Opencode => ("1.18.30", "2.0.14"),
+            Harness::Claude => ("2.1.280", "2.1.316"),
+            Harness::Codex => ("0.128.0", "0.166.0"),
+            Harness::Cursor => ("2026.10.01", "2026.10.22"),
+            Harness::Copilot => ("1.0.94", "1.0.105"),
+            Harness::Pi => ("0.82.1", "1.4.0"),
+            Harness::Opencode => ("1.18.30", "2.2.4"),
         }
     }
 
@@ -404,12 +404,12 @@ mod tests {
     #[test]
     fn versions_compare_with_the_tested_range() {
         assert_eq!(Harness::Claude.compat("2.1.296 (Claude Code)"), Compat::Tested);
-        assert_eq!(Harness::Claude.compat("2.1.300 (Claude Code)"), Compat::Newer);
+        assert_eq!(Harness::Claude.compat("2.1.320 (Claude Code)"), Compat::Newer);
         assert_eq!(Harness::Claude.compat("2.1.99 (Claude Code)"), Compat::Older);
         assert_eq!(Harness::Codex.compat("codex-cli 0.128.0"), Compat::Tested);
         assert_eq!(Harness::Cursor.compat("2026.10.01-e373342"), Compat::Tested);
         assert_eq!(Harness::Opencode.compat("opencode v2.0.14"), Compat::Tested);
-        assert_eq!(Harness::Opencode.compat("opencode v2.1.0"), Compat::Newer);
+        assert_eq!(Harness::Opencode.compat("opencode v2.3.0"), Compat::Newer);
         assert_eq!(Harness::Pi.compat("1.1.0"), Compat::Tested);
         assert_eq!(
             Harness::Copilot.compat("GitHub Copilot CLI 1.0.95."),
