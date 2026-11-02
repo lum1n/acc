@@ -69,6 +69,11 @@ pub struct Rules {
     /// harness's own sandbox off, since ACC's already confines it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub seatbelt_args: Vec<String>,
+    /// The subcommand [`Self::seatbelt_args`] go before, for a harness that
+    /// only takes them as global flags (`agent --sandbox disabled acp`).
+    /// Otherwise they go last.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seatbelt_before: Option<String>,
 }
 
 /// Package caches every harness's tools may fill.
@@ -130,7 +135,10 @@ fn nested_off(harness: Harness) -> &'static [&'static str] {
     match harness {
         Harness::Codex => &["-c", "sandbox_mode=\"danger-full-access\""],
         Harness::Claude => &["--settings", r#"{"sandbox":{"enabled":false}}"#],
-        _ => &[],
+        // Copilot 1.0.103+ applies its saved sandbox setting in ACP mode too.
+        Harness::Copilot => &["--no-sandbox"],
+        Harness::Cursor => &["--sandbox", "disabled"],
+        Harness::Pi | Harness::Opencode => &[],
     }
 }
 
@@ -152,6 +160,8 @@ pub fn rules(harness: Harness, sandbox: &Sandbox) -> Rules {
         hide,
         show,
         seatbelt_args: owned(nested_off(harness)),
+        // `agent acp` takes no options of its own.
+        seatbelt_before: (harness == Harness::Cursor).then(|| "acp".to_owned()),
     }
 }
 
@@ -329,7 +339,14 @@ pub fn argv_script(rules: &Rules, spec: &LaunchSpec) -> String {
         cmd.extend(spec.env.iter().map(|(k, v)| format!("{k}={v}")));
     }
     cmd.push(spec.program.clone());
-    cmd.extend(spec.args.iter().cloned());
+    // The flags go last, or before the subcommand that takes none.
+    let split = rules
+        .seatbelt_before
+        .as_ref()
+        .and_then(|sub| spec.args.iter().position(|a| a == sub))
+        .unwrap_or(spec.args.len());
+    let (head, tail) = spec.args.split_at(split);
+    cmd.extend(head.iter().cloned());
     s.push_str(&format!(
         "set -- \"$@\" {}\n",
         join(cmd.iter().map(String::as_str))
@@ -338,6 +355,12 @@ pub fn argv_script(rules: &Rules, spec: &LaunchSpec) -> String {
         s.push_str(&format!(
             "if [ \"$acc_sb\" = seatbelt ]; then set -- \"$@\" {}; fi\n",
             join(rules.seatbelt_args.iter().map(String::as_str))
+        ));
+    }
+    if !tail.is_empty() {
+        s.push_str(&format!(
+            "set -- \"$@\" {}\n",
+            join(tail.iter().map(String::as_str))
         ));
     }
     s
@@ -415,6 +438,14 @@ mod tests {
         let codex = rules(Harness::Codex, &Sandbox::default());
         assert_eq!(codex.seatbelt_args, ["-c", "sandbox_mode=\"danger-full-access\""]);
         assert!(rules(Harness::Pi, &Sandbox::default()).seatbelt_args.is_empty());
+        assert_eq!(
+            rules(Harness::Copilot, &Sandbox::default()).seatbelt_args,
+            ["--no-sandbox"]
+        );
+        assert_eq!(
+            rules(Harness::Cursor, &Sandbox::default()).seatbelt_args,
+            ["--sandbox", "disabled"]
+        );
     }
 
     #[test]
@@ -455,6 +486,7 @@ mod tests {
             hide: vec!["~/.ssh".into()],
             show: vec!["~/.ssh/config".into()],
             seatbelt_args: vec![],
+            seatbelt_before: None,
         };
         let p = seatbelt_profile(&r);
         assert!(!p.contains("a\"b"), "paths are parameters, never spliced in");
@@ -487,10 +519,32 @@ mod tests {
             "acc_x=$(acc_rp \"$HOME\"/.ssh); if [ -d \"$acc_x\" ]; then set -- \"$@\" --tmpfs \"$acc_x\""
         ));
         assert!(s.contains("acc_x=$(acc_rp \"$HOME\"/.ssh/config); set -- \"$@\" --ro-bind-try"));
-        assert!(s.contains("set -- \"$@\" codex app-server\n"));
         assert!(s.contains(
-            "if [ \"$acc_sb\" = seatbelt ]; then set -- \"$@\" -c 'sandbox_mode=\"danger-full-access\"'; fi"
+            "set -- \"$@\" codex app-server\n\
+             if [ \"$acc_sb\" = seatbelt ]; then set -- \"$@\" -c 'sandbox_mode=\"danger-full-access\"'; fi\n"
         ));
+
+        // Cursor's go before `acp`, behind a launcher's prefix too.
+
+        let launcher = crate::harness::Launcher {
+            prefix: vec!["nice".into()],
+            program: None,
+            args: vec![],
+        };
+        let cursor = argv_script(
+            &rules(Harness::Cursor, &Sandbox::default()),
+            &launcher.wrap(crate::acp::launch_spec(Harness::Cursor, Some("gpt-5"))),
+        );
+        assert!(cursor.contains(
+            "set -- \"$@\" nice agent --model gpt-5\n\
+             if [ \"$acc_sb\" = seatbelt ]; then set -- \"$@\" --sandbox disabled; fi\n\
+             set -- \"$@\" acp\n"
+        ));
+        let pi = argv_script(
+            &rules(Harness::Pi, &Sandbox::default()),
+            &Harness::Pi.launch(None),
+        );
+        assert!(!pi.contains("acc_sb\" = seatbelt ]; then"));
     }
 
     #[test]

@@ -183,6 +183,16 @@ pub struct AccUsage {
     pub cost_usd: Option<f64>,
     pub context_used: Option<u64>,
     pub context_window: Option<u64>,
+    /// A running total in a unit other than US dollars (Copilot's AI
+    /// Credits), never added to `cost_usd`.
+    pub other_cost: Option<AccCost>,
+}
+
+/// An amount in the harness's own unit: an ISO 4217 code or its own name.
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct AccCost {
+    pub amount: f64,
+    pub currency: String,
 }
 
 impl From<Usage> for AccUsage {
@@ -195,6 +205,10 @@ impl From<Usage> for AccUsage {
             cost_usd: u.cost_usd,
             context_used: u.context_used,
             context_window: u.context_window,
+            other_cost: u.other_cost.map(|c| AccCost {
+                amount: c.amount,
+                currency: c.currency,
+            }),
         }
     }
 }
@@ -1079,6 +1093,8 @@ pub struct AccSandboxRules {
     pub show: Vec<String>,
     /// Harness flags added under Seatbelt (macOS), which can't nest.
     pub seatbelt_args: Vec<String>,
+    /// The subcommand `seatbelt_args` go before; otherwise they go last.
+    pub seatbelt_before: Option<String>,
 }
 
 impl From<Rules> for AccSandboxRules {
@@ -1089,6 +1105,7 @@ impl From<Rules> for AccSandboxRules {
             hide: r.hide,
             show: r.show,
             seatbelt_args: r.seatbelt_args,
+            seatbelt_before: r.seatbelt_before,
         }
     }
 }
@@ -1101,6 +1118,7 @@ impl From<AccSandboxRules> for Rules {
             hide: r.hide,
             show: r.show,
             seatbelt_args: r.seatbelt_args,
+            seatbelt_before: r.seatbelt_before,
         }
     }
 }

@@ -208,6 +208,17 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
     pub context_used: Option<u64>,
     pub context_window: Option<u64>,
+    /// A running total in a unit other than US dollars (Copilot's AI
+    /// Credits), never added to [`Self::cost_usd`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_cost: Option<Cost>,
+}
+
+/// An amount in the harness's own unit: an ISO 4217 code or its own name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Cost {
+    pub amount: f64,
+    pub currency: String,
 }
 
 /// A harness-reported quota snapshot. ACC never fetches quota itself.

@@ -5,8 +5,12 @@
 //! `initialize`, opens a session (`session/new`, `session/load` or
 //! `session/resume`), sends `session/prompt` per turn and answers the agent's
 //! `session/request_permission` requests. Everything else arrives as
-//! `session/update` notifications. Targets protocol version 1 as published in
-//! `@agentclientprotocol/sdk` 1.8.0, including `configOptions`.
+//! `session/update` notifications. Targets protocol version 1, checked
+//! against the ACP schema 1.29 (`@agentclientprotocol/sdk` 2.2.0), Cursor
+//! 2026.10.22, Copilot 1.0.105 and opencode 2.2.5. Besides the stable
+//! protocol it uses `configOptions`, session compaction, form elicitation
+//! (questions), `$/cancel_request`, and, when the agent offers them,
+//! `session/set_title` and `session/close`.
 //!
 //! Several clients can share one detached agent (desktop and phone on the
 //! same FIFO and log, see [`crate::detached`]). For that, request ids carry a
@@ -19,6 +23,7 @@
 //! A client joining a running agent uses [`Start::Attach`], which skips the
 //! handshake and adopts the session it sees in the log.
 
+mod elicitation;
 mod options;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,12 +38,12 @@ use crate::command::{
     offer_option, validate_attachments,
 };
 use crate::driver::{Driver, DriverError};
-use crate::event::{Event, ItemId, ItemKind, PermissionOption, PermissionOptionKind, Plan, Usage};
+use crate::event::{Cost, Event, ItemId, ItemKind, PermissionOption, PermissionOptionKind, Plan, Usage};
 use crate::harness::{Harness, LaunchSpec, Protocol};
 use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
-use crate::wire::title_at;
+use crate::wire::{one_line, str_at, title_at};
 
 /// The ACP protocol version this driver speaks.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -111,6 +116,8 @@ enum Pending {
     SetModel { model: String },
     // `session/list`, for the active session's name.
     ListSessions,
+    SetTitle { title: String },
+    Close,
 }
 
 /// Where the connection is in its lifecycle.
@@ -130,6 +137,10 @@ struct PermissionWait {
     rpc_id: Value,
     tool_call_id: Option<String>,
     option_ids: Vec<String>,
+    /// The `requestedSchema` of a form elicitation (a question), answered
+    /// with an action and content rather than a permission outcome.
+    #[serde(default)]
+    form: Option<Value>,
 }
 
 /// Sans-IO ACP client for one agent process and one active session.
@@ -154,6 +165,12 @@ pub struct AcpDriver {
     /// `sessionCapabilities.list`: whether `session/list` can name the session.
     #[serde(default)]
     list_sessions: bool,
+    /// `sessionCapabilities.title`: `session/set_title` renames the session.
+    #[serde(default)]
+    set_title: bool,
+    /// `sessionCapabilities.close`: `session/close` frees a session left behind.
+    #[serde(default)]
+    close_session: bool,
     auth_methods: Vec<(String, String)>,
 
     session_id: Option<String>,
@@ -227,6 +244,8 @@ impl AcpDriver {
             resume_session: false,
             fork_session: false,
             list_sessions: false,
+            set_title: false,
+            close_session: false,
             auth_methods: Vec::new(),
             session_id: None,
             titled: false,
@@ -425,6 +444,16 @@ impl AcpDriver {
         ));
     }
 
+    /// Answers a form elicitation: `accept` with `content`, `decline` or `cancel`.
+    fn answer_form(&mut self, rpc_id: Value, action: &str, content: Option<Value>) {
+        let mut result = json!({ "action": action });
+        if let Some(c) = content {
+            result["content"] = c;
+        }
+        self.outgoing
+            .extend(line(&json!({ "jsonrpc": "2.0", "id": rpc_id, "result": result })));
+    }
+
     // ---- Incoming -------------------------------------------------------
 
     fn handle_line(&mut self, text: &str, out: &mut Vec<Event>) {
@@ -499,6 +528,11 @@ impl AcpDriver {
                 self.opts.set_current_model(&model);
                 self.options_changed(out);
             }
+            Pending::SetTitle { title } => {
+                self.titled = true;
+                out.push(Event::TitleChanged { title });
+            }
+            Pending::Close => {}
         }
     }
 
@@ -549,20 +583,26 @@ impl AcpDriver {
                 self.set_state(RunState::Error, Some(message), out);
                 out.push(Event::TurnCompleted);
             }
-            // A rejected fork or setting leaves the session as it was.
-            Pending::Fork | Pending::SetConfig | Pending::SetMode { .. } | Pending::SetModel { .. } => {
+            // A rejected fork, setting or name leaves the session as it was.
+            Pending::Fork
+            | Pending::SetConfig
+            | Pending::SetMode { .. }
+            | Pending::SetModel { .. }
+            | Pending::SetTitle { .. } => {
                 let what = match kind {
                     Pending::Fork => "fork the session",
                     Pending::SetMode { .. } => "change the mode",
                     Pending::SetModel { .. } => "change the model",
+                    Pending::SetTitle { .. } => "rename the session",
                     _ => "change the setting",
                 };
                 out.push(Event::Notice {
                     message: format!("Couldn't {what}: {message}"),
                 });
             }
-            // The session keeps the name it has.
-            Pending::ListSessions => {}
+            // The session keeps the name it has; a session that wouldn't
+            // close is the agent's to keep.
+            Pending::ListSessions | Pending::Close => {}
         }
     }
 
@@ -604,6 +644,8 @@ impl AcpDriver {
         self.resume_session = has("resume");
         self.fork_session = has("fork");
         self.list_sessions = has("list");
+        self.set_title = has("title");
+        self.close_session = has("close");
         self.auth_methods = r
             .get("authMethods")
             .and_then(Value::as_array)
@@ -698,6 +740,16 @@ impl AcpDriver {
         let (state, message) = match stop {
             "end_turn" => (RunState::Done, None),
             "cancelled" => (RunState::Idle, None),
+            // The turn failed after the prompt was taken (schema 1.25),
+            // with the failure as a JSON-RPC error.
+            "error" => (
+                RunState::Error,
+                Some(
+                    r.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map_or_else(|| "error".to_owned(), |m| one_line(m, 200)),
+                ),
+            ),
             other => (RunState::Done, Some(other.to_owned())),
         };
         self.set_state(state, message, out);
@@ -758,13 +810,18 @@ impl AcpDriver {
 
     fn on_agent_request(&mut self, method: &str, id: Value, msg: &Value, out: &mut Vec<Event>) {
         let params = msg.get("params").unwrap_or(&Value::Null);
-        if method == "session/request_permission" {
-            self.on_permission(id, params, out);
-            return;
+        match method {
+            "session/request_permission" => return self.on_permission(id, params, out),
+            "elicitation/create" if str_at(params, "mode").is_none_or(|m| m == "form") => {
+                return self.on_form(id, params, out);
+            }
+            // Only forms were advertised.
+            "elicitation/create" => return self.answer_form(id, "decline", None),
+            _ => {}
         }
-        // ACC advertises no fs, terminal or elicitation capability. Answer
-        // anything else (including extensions like `cursor/ask_question`) so
-        // the agent never waits on a request nobody will serve.
+        // ACC advertises no fs or terminal capability. Answer anything else
+        // (including extensions like `cursor/ask_question`) so the agent
+        // never waits on a request nobody will serve.
         self.outgoing.extend(line(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -777,12 +834,16 @@ impl AcpDriver {
     }
 
     fn on_permission(&mut self, id: Value, params: &Value, out: &mut Vec<Event>) {
-        let tool = params.get("toolCall").unwrap_or(&Value::Null);
+        // An empty `rawInput` says nothing: Cursor starts tool calls while
+        // the model is still writing their input.
+        let tool = &without_empty_input(params.get("toolCall").unwrap_or(&Value::Null));
         let tool_call_id = tool.get("toolCallId").and_then(Value::as_str).map(str::to_owned);
-        if let Some(tid) = &tool_call_id
-            && !self.open_tools.contains(tid)
-        {
-            self.start_tool(tid.clone(), tool, None, out);
+        if let Some(tid) = &tool_call_id {
+            if self.open_tools.contains(tid) {
+                self.upgrade_to_subagent(tid, tool, None, out);
+            } else {
+                self.start_tool(tid.clone(), tool, None, out);
+            }
         }
         let options: Vec<PermissionOption> = params
             .get("options")
@@ -814,9 +875,17 @@ impl AcpDriver {
                 rpc_id: id,
                 tool_call_id,
                 option_ids: options.iter().map(|o| o.id.clone()).collect(),
+                form: None,
             },
         );
-        let native = tool.get("rawInput").cloned().unwrap_or(Value::Null);
+        let native = tool
+            .get("rawInput")
+            .or_else(|| {
+                let tid = tool.get("toolCallId").and_then(Value::as_str)?;
+                self.items.native(tid)?.get("rawInput")
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
         let item_id = self
             .permissions
             .get(&request_id)
@@ -841,8 +910,74 @@ impl AcpDriver {
         );
     }
 
+    /// A form elicitation (opencode's question tool), asked as an ACC
+    /// question: the `questions` in its `native` are the form's fields.
+    fn on_form(&mut self, id: Value, params: &Value, out: &mut Vec<Event>) {
+        let schema = params.get("requestedSchema").cloned().unwrap_or(Value::Null);
+        let message = str_at(params, "message").unwrap_or("").to_owned();
+        let questions = elicitation::questions(&schema, &message);
+        // A single choice can be answered with one of its options.
+        let mut options: Vec<PermissionOption> = match questions.as_slice() {
+            [q] if q["multiSelect"] != true => q["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o["label"].as_str())
+                .map(|l| PermissionOption::new(l, l))
+                .collect(),
+            _ => Vec::new(),
+        };
+        options.extend([
+            PermissionOption::new("decline", "Decline").with_kind(PermissionOptionKind::RejectOnce),
+            PermissionOption::new("cancel", "Cancel"),
+        ]);
+        let mut native = params.clone();
+        native["questions"] = Value::Array(questions);
+        let title = if message.is_empty() {
+            "Question".to_owned()
+        } else {
+            message
+        };
+        let request_id = id_key(&id);
+        let item_id = str_at(params, "toolCallId").map(str::to_owned);
+        self.permissions.insert(
+            request_id.clone(),
+            PermissionWait {
+                rpc_id: id,
+                tool_call_id: item_id.clone(),
+                option_ids: Vec::new(),
+                form: Some(schema),
+            },
+        );
+        out.push(Event::PermissionRequested {
+            request_id,
+            title: title.clone(),
+            options,
+            kind: BlockKind::Question,
+            item_id,
+            detail: None,
+            native,
+        });
+        self.set_state(
+            RunState::Blocked {
+                kind: BlockKind::Question,
+            },
+            Some(title),
+            out,
+        );
+    }
+
     fn on_notification(&mut self, method: &str, msg: &Value, out: &mut Vec<Event>) {
         let params = msg.get("params").unwrap_or(&Value::Null);
+        // The agent withdrew a request: a permission or question answered
+        // elsewhere, or one its cancelled turn no longer needs.
+        if method == "$/cancel_request"
+            && let Some(request_id) = params.get("requestId").map(id_key)
+            && self.permissions.remove(&request_id).is_some()
+        {
+            out.push(Event::PermissionResolved { request_id });
+            return;
+        }
         if method != "session/update" {
             out.push(Event::Native {
                 kind: method.to_owned(),
@@ -903,35 +1038,55 @@ impl AcpDriver {
                     self.options_changed(out);
                 }
             }
-            "session_info_update" => match title_at(update, "title") {
-                Some(title) => {
+            "session_info_update" => {
+                let title = title_at(update, "title");
+                // opencode: `null` once the retry starts.
+                let retry = update.pointer("/_meta/opencode~1retry");
+                if let Some(title) = title.clone() {
                     self.titled = true;
                     out.push(Event::TitleChanged { title });
                 }
-                None => out.push(native(kind, update)),
-            },
+                if let Some(retry) = retry {
+                    self.on_retry(retry, out);
+                }
+                // opencode's compaction marker, for clients that don't take
+                // compaction updates (and for older opencode).
+                if let Some(marker) = update.pointer("/_meta/opencode~1compaction") {
+                    let error = marker.pointer("/error/message").and_then(Value::as_str);
+                    self.on_compaction(str_at(marker, "status").unwrap_or(""), error, out);
+                }
+                if title.is_none() && retry.is_none() {
+                    out.push(native(kind, update));
+                }
+            }
             "usage_update" => {
                 let n = |k: &str| update.get(k).and_then(Value::as_u64);
                 let cost = update.get("cost");
-                let usd = cost
-                    .filter(|c| c.get("currency").and_then(Value::as_str) == Some("USD"))
-                    .and_then(|c| c.get("amount"))
-                    .and_then(Value::as_f64);
+                let amount = cost.and_then(|c| c.get("amount")).and_then(Value::as_f64);
+                let currency = cost.and_then(|c| str_at(c, "currency"));
+                // Credits and other units (schema 1.28) are kept apart from dollars.
+                let (usd, other) = match (amount, currency) {
+                    (Some(a), Some("USD")) => (Some(a), None),
+                    (Some(amount), Some(c)) => (
+                        None,
+                        Some(Cost {
+                            amount,
+                            currency: c.to_owned(),
+                        }),
+                    ),
+                    _ => (None, None),
+                };
                 out.push(Event::Usage(Usage {
                     context_used: n("used"),
                     context_window: n("size"),
                     cost_usd: usd,
+                    other_cost: other,
                     ..Usage::default()
                 }));
             }
             "compaction_update" => {
-                if !self.replaying && update.get("status").and_then(Value::as_str) == Some("in_progress") {
-                    self.set_state(
-                        RunState::Working { progress: None },
-                        Some("Compacting".into()),
-                        out,
-                    );
-                }
+                let status = str_at(update, "status").unwrap_or("");
+                self.on_compaction(status, str_at(update, "error"), out);
                 out.push(native(kind, update));
             }
             "notice" => {
@@ -955,6 +1110,49 @@ impl AcpDriver {
         if !blocked || self.permissions.is_empty() {
             self.set_state(RunState::Working { progress: None }, None, out);
         }
+    }
+
+    /// A compaction's progress, from `compaction_update` or opencode's
+    /// marker (`started` where the update says `in_progress`). Its summary
+    /// stays in the native update; `compaction_summary_chunk`s, which only
+    /// stream that summary, stay native.
+    fn on_compaction(&mut self, status: &str, error: Option<&str>, out: &mut Vec<Event>) {
+        if self.replaying {
+            return;
+        }
+        match status {
+            "in_progress" | "started" => self.set_state(
+                RunState::Working { progress: None },
+                Some("Compacting".into()),
+                out,
+            ),
+            "completed" => out.push(Event::Notice {
+                message: "Conversation compacted".into(),
+            }),
+            "failed" => out.push(Event::Notice {
+                message: match error {
+                    Some(e) => format!("Compaction failed: {}", one_line(e, 200)),
+                    None => "Compaction failed".into(),
+                },
+            }),
+            _ => {}
+        }
+    }
+
+    /// opencode's retry status (`_meta["opencode/retry"]`): a failed model
+    /// call it will try again, or `null` once it does.
+    fn on_retry(&mut self, retry: &Value, out: &mut Vec<Event>) {
+        if self.replaying {
+            return;
+        }
+        let message = (!retry.is_null()).then(|| {
+            let attempt = retry.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+            match retry.pointer("/error/message").and_then(Value::as_str) {
+                Some(e) => format!("Retrying (attempt {attempt}): {}", one_line(e, 200)),
+                None => format!("Retrying (attempt {attempt})"),
+            }
+        });
+        self.set_state(RunState::Working { progress: None }, message, out);
     }
 
     fn chunk(&mut self, kind: ItemKind, update: &Value, out: &mut Vec<Event>) {
@@ -1014,11 +1212,7 @@ impl AcpDriver {
             self.note_subagent(&id, parent.as_ref().map(|(c, _)| c.clone()));
             ItemKind::Subagent
         } else {
-            match update.get("kind").and_then(Value::as_str) {
-                Some("execute") => ItemKind::CommandExecution,
-                Some("edit" | "delete" | "move") => ItemKind::FileChange,
-                _ => ItemKind::ToolCall,
-            }
+            crate::item::acp_tool_kind(update)
         };
         self.open_tools.insert(id.clone());
         self.items
@@ -1034,7 +1228,9 @@ impl AcpDriver {
     }
 
     /// A tool call first reported without what identifies it as a subagent
-    /// (opencode sends the input in a later update): report its kind now.
+    /// (opencode sends the input in a later update, Cursor 2026.10.22 starts
+    /// the call while the model still writes it): report its kind once
+    /// everything reported so far says so.
     fn upgrade_to_subagent(
         &mut self,
         id: &str,
@@ -1042,7 +1238,12 @@ impl AcpDriver {
         session: Option<String>,
         out: &mut Vec<Event>,
     ) {
-        if self.subagent_tools.contains(id) || !crate::item::acp_is_subagent(update) {
+        if self.subagent_tools.contains(id) {
+            return;
+        }
+        let mut seen = self.items.native(id).cloned().unwrap_or(Value::Null);
+        crate::item::merge(&mut seen, update);
+        if !crate::item::acp_is_subagent(&seen) {
             return;
         }
         self.note_subagent(id, session);
@@ -1168,10 +1369,11 @@ impl AcpDriver {
         };
         // Progress on a tool call means its permission was answered,
         // possibly by another client sharing this agent.
+        // Not a question: its tool call runs on while it waits.
         let answered: Vec<String> = self
             .permissions
             .iter()
-            .filter(|(_, w)| w.tool_call_id.as_deref() == Some(id))
+            .filter(|(_, w)| w.form.is_none() && w.tool_call_id.as_deref() == Some(id))
             .map(|(k, _)| k.clone())
             .collect();
         for request_id in answered {
@@ -1181,9 +1383,11 @@ impl AcpDriver {
         self.working(out);
         if !self.open_tools.contains(id) {
             self.start_tool(id.to_owned(), update, None, out);
-        } else if !is_final(update) {
+        } else {
             self.upgrade_to_subagent(id, update, None, out);
-            self.items.update(id.to_owned(), strip_tag(update), out);
+            if !is_final(update) {
+                self.items.update(id.to_owned(), strip_tag(update), out);
+            }
         }
         self.finish_tool_if_done(id, update, out);
     }
@@ -1320,7 +1524,8 @@ impl Driver for AcpDriver {
                 "clientCapabilities": {
                     "fs": { "readTextFile": false, "writeTextFile": false },
                     "terminal": false,
-                    "session": { "configOptions": { "boolean": {} } },
+                    "session": { "configOptions": { "boolean": {} }, "compaction": {} },
+                    "elicitation": { "form": {} },
                 },
                 "clientInfo": { "name": "acc", "title": "Agent Control Core", "version": crate::VERSION },
             }),
@@ -1395,7 +1600,11 @@ impl Driver for AcpDriver {
                 // The spec requires answering open permission requests with
                 // `cancelled` once the client cancels.
                 for (_, wait) in std::mem::take(&mut self.permissions) {
-                    self.answer_permission(wait.rpc_id, json!({ "outcome": "cancelled" }));
+                    if wait.form.is_some() {
+                        self.answer_form(wait.rpc_id, "cancel", None);
+                    } else {
+                        self.answer_permission(wait.rpc_id, json!({ "outcome": "cancelled" }));
+                    }
                 }
                 let mut bytes = std::mem::take(&mut self.outgoing);
                 bytes.extend(Self::notification("session/cancel", json!({ "sessionId": sid })));
@@ -1405,12 +1614,20 @@ impl Driver for AcpDriver {
                 if self.phase == Phase::Initializing || self.phase == Phase::Failed {
                     return Err(DriverError::NotStarted);
                 }
+                // Free the session left behind; the agent keeps it on disk.
+                let mut bytes = match self.session_id.clone() {
+                    Some(sid) if self.close_session => {
+                        self.request("session/close", json!({ "sessionId": sid }), Pending::Close)
+                    }
+                    _ => Vec::new(),
+                };
                 let cwd = self.cfg.cwd.clone();
-                Ok(self.request(
+                bytes.extend(self.request(
                     "session/new",
                     json!({ "cwd": cwd, "mcpServers": [] }),
                     Pending::NewSession,
-                ))
+                ));
+                Ok(bytes)
             }
             Command::Fork => {
                 if !self.fork_session {
@@ -1429,6 +1646,14 @@ impl Driver for AcpDriver {
                 hint.as_deref().unwrap_or(""),
                 "compact",
             ),
+            Command::Rename { name } if self.set_title => {
+                let sid = self.require_session()?;
+                Ok(self.request(
+                    "session/set_title",
+                    json!({ "sessionId": sid, "title": name }),
+                    Pending::SetTitle { title: name },
+                ))
+            }
             Command::Rename { name } => self.slash(&["rename"], &name, "rename"),
             Command::Review => self.slash(&["review"], "", "review"),
             Command::Shell { .. } => Err(self.unsupported("shell commands")),
@@ -1446,6 +1671,17 @@ impl Driver for AcpDriver {
                     .permissions
                     .remove(&request_id)
                     .ok_or_else(|| DriverError::UnknownRequest(request_id.clone()))?;
+                if let Some(schema) = &wait.form {
+                    match option_id.as_str() {
+                        "decline" | "cancel" => self.answer_form(wait.rpc_id, &option_id, None),
+                        _ => {
+                            let answers = crate::question::decode(&option_id);
+                            let content = elicitation::content(schema, &answers);
+                            self.answer_form(wait.rpc_id, "accept", Some(content));
+                        }
+                    }
+                    return Ok(std::mem::take(&mut self.outgoing));
+                }
                 if !wait.option_ids.is_empty() && !wait.option_ids.contains(&option_id) {
                     self.permissions.insert(request_id.clone(), wait);
                     return Err(DriverError::InvalidOption(option_id));
@@ -1615,6 +1851,19 @@ fn is_final(update: &Value) -> bool {
         update.get("status").and_then(Value::as_str),
         Some("completed" | "failed")
     )
+}
+
+/// A tool call without an empty `rawInput` (`{}`, or none yet), so it
+/// doesn't hide the input an earlier update reported.
+fn without_empty_input(tool: &Value) -> Value {
+    let mut v = tool.clone();
+    let empty = v
+        .get("rawInput")
+        .is_some_and(|i| i.is_null() || i.as_object().is_some_and(serde_json::Map::is_empty));
+    if empty && let Some(o) = v.as_object_mut() {
+        o.remove("rawInput");
+    }
+    v
 }
 
 /// The update without its `sessionUpdate` discriminator, for `extensions`.

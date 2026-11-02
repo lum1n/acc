@@ -1371,3 +1371,511 @@ fn images_need_the_agents_prompt_capability() {
     );
     assert_eq!(both["params"]["prompt"][1]["type"], "image");
 }
+
+/// An opencode 2.2-like agent with a session open, given its capabilities.
+fn ready_opencode(caps: Value) -> AcpDriver {
+    let mut d = driver(Harness::Opencode, Start::New);
+    let init = one(&d.handshake());
+    feed(&mut d, &[result(init["id"].clone(), init_result(caps))]);
+    let new = one(&d.poll_transmit());
+    feed(
+        &mut d,
+        &[result(new["id"].clone(), opencode_session("s1", "mock/mock-1"))],
+    );
+    let _ = d.poll_transmit();
+    d
+}
+
+#[test]
+fn handshake_asks_for_compaction_updates_and_forms() {
+    let mut d = driver(Harness::Opencode, Start::New);
+    let caps = one(&d.handshake())["params"]["clientCapabilities"].clone();
+    assert_eq!(caps["session"]["compaction"], json!({}));
+    assert_eq!(caps["elicitation"], json!({ "form": {} }));
+}
+
+#[test]
+fn withdrawn_requests_are_resolved() {
+    let mut d = ready_opencode(json!({}));
+    d.command(Command::prompt("go")).expect("prompt");
+    feed(
+        &mut d,
+        &[
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "session/request_permission", "params": {
+            "sessionId": "s1", "toolCall": { "toolCallId": "t1", "title": "rm -rf build", "kind": "execute" },
+            "options": [{ "optionId": "once", "name": "Allow once", "kind": "allow_once" }] } }),
+        ],
+    );
+    let events = feed(
+        &mut d,
+        &[json!({ "jsonrpc": "2.0", "method": "$/cancel_request", "params": { "requestId": 4 } })],
+    );
+    assert_eq!(
+        events,
+        [Event::PermissionResolved {
+            request_id: "4".into()
+        }]
+    );
+    assert!(matches!(
+        d.command(Command::AnswerPermission {
+            request_id: "4".into(),
+            option_id: "once".into()
+        }),
+        Err(DriverError::UnknownRequest(_))
+    ));
+    // One for a request ACC doesn't know is only shown.
+    let events = feed(
+        &mut d,
+        &[json!({ "jsonrpc": "2.0", "method": "$/cancel_request", "params": { "requestId": "x" } })],
+    );
+    assert!(matches!(&events[..], [Event::Native { kind, .. }] if kind == "$/cancel_request"));
+}
+
+/// opencode's question form: a choice with a typed answer beside it, and
+/// a multiple choice.
+fn question_form(id: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "elicitation/create", "params": {
+        "mode": "form", "sessionId": "s1", "toolCallId": "q1", "message": "Which package manager?",
+        "requestedSchema": { "type": "object", "required": ["pm"], "properties": {
+            "pm": { "type": "string", "title": "Package manager",
+                    "oneOf": [{ "const": "bun", "title": "Bun" }, { "const": "pnpm", "title": "pnpm" }] },
+            "pm_custom": { "type": "string", "title": "Package manager (other)" },
+            "extras": { "type": "array", "title": "Extras",
+                        "items": { "anyOf": [{ "const": "lint", "title": "Lint" }, { "const": "fmt", "title": "Format" }] } }
+        } } } })
+}
+
+fn requested(events: &[Event]) -> &Event {
+    events
+        .iter()
+        .find(|e| matches!(e, Event::PermissionRequested { .. }))
+        .unwrap_or_else(|| panic!("no request in {events:?}"))
+}
+
+#[test]
+fn form_elicitations_are_questions() {
+    let mut d = ready_opencode(json!({}));
+    d.command(Command::prompt("set it up")).expect("prompt");
+    let events = feed(
+        &mut d,
+        &[
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "q1", "title": "question",
+                        "name": "question", "kind": "other", "status": "in_progress" }),
+            ),
+            question_form(json!(11)),
+            // Its tool call runs on while the question waits.
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "q1", "status": "in_progress" }),
+            ),
+        ],
+    );
+    let Event::PermissionRequested {
+        request_id,
+        title,
+        options,
+        kind,
+        item_id,
+        native,
+        ..
+    } = requested(&events)
+    else {
+        unreachable!()
+    };
+    assert_eq!(request_id, "11");
+    assert_eq!(title, "Which package manager?");
+    assert_eq!(*kind, BlockKind::Question);
+    assert_eq!(item_id.as_deref(), Some("q1"));
+    let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids, ["decline", "cancel"], "two questions: answered as a whole");
+    let qs = crate::question::parse(native);
+    assert_eq!(qs.len(), 2, "the typed answer folds into its choice");
+    assert_eq!(qs[0].id.as_deref(), Some("pm"), "required first");
+    assert_eq!(qs[0].question, "Package manager");
+    assert_eq!(qs[0].options[0].label, "Bun");
+    assert!(qs[1].multi_select);
+    assert_eq!(
+        states(&events).last(),
+        Some(&RunState::Blocked {
+            kind: BlockKind::Question
+        })
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::PermissionResolved { .. }))
+    );
+
+    // Labels map back to values; an answer that isn't an option is typed.
+    let answers = vec![
+        vec!["yarn".to_owned()],
+        vec!["Lint".to_owned(), "Format".to_owned()],
+    ];
+    let reply = one(&d
+        .command(Command::AnswerPermission {
+            request_id: "11".into(),
+            option_id: crate::question::encode(&answers),
+        })
+        .expect("answer"));
+    assert_eq!(
+        reply,
+        json!({ "jsonrpc": "2.0", "id": 11, "result": { "action": "accept",
+                "content": { "pm_custom": "yarn", "extras": ["lint", "fmt"] } } })
+    );
+
+    feed(&mut d, &[question_form(json!(12))]);
+    let reply = one(&d
+        .command(Command::AnswerPermission {
+            request_id: "12".into(),
+            option_id: "pnpm".into(),
+        })
+        .expect("answer"));
+    assert_eq!(
+        reply["result"],
+        json!({ "action": "accept", "content": { "pm": "pnpm" } })
+    );
+
+    feed(&mut d, &[question_form(json!(13))]);
+    let reply = one(&d
+        .command(Command::AnswerPermission {
+            request_id: "13".into(),
+            option_id: "decline".into(),
+        })
+        .expect("decline"));
+    assert_eq!(reply["result"], json!({ "action": "decline" }));
+
+    // Interrupting cancels an open form, then the turn.
+    feed(&mut d, &[question_form(json!(14))]);
+    let msgs = sent(&d.command(Command::Interrupt).expect("interrupt"));
+    assert_eq!(
+        msgs[0],
+        json!({ "jsonrpc": "2.0", "id": 14, "result": { "action": "cancel" } })
+    );
+    assert_eq!(msgs[1]["method"], "session/cancel");
+
+    // Only forms were advertised.
+    feed(
+        &mut d,
+        &[
+            json!({ "jsonrpc": "2.0", "id": 15, "method": "elicitation/create", "params": {
+            "mode": "url", "sessionId": "s1", "message": "Log in", "url": "https://x", "elicitationId": "e" } }),
+        ],
+    );
+    assert_eq!(
+        one(&d.poll_transmit()),
+        json!({ "jsonrpc": "2.0", "id": 15, "result": { "action": "decline" } })
+    );
+}
+
+#[test]
+fn a_single_choice_is_answered_with_its_option() {
+    let mut d = ready_opencode(json!({}));
+    let events = feed(
+        &mut d,
+        &[
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "elicitation/create", "params": {
+            "mode": "form", "sessionId": "s1", "message": "Proceed?",
+            "requestedSchema": { "type": "object", "properties": {
+                "go": { "type": "boolean", "title": "Go" },
+            } } } }),
+        ],
+    );
+    let Event::PermissionRequested { options, native, .. } = requested(&events) else {
+        unreachable!()
+    };
+    let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids, ["Yes", "No", "decline", "cancel"]);
+    let qs = crate::question::parse(native);
+    assert_eq!(
+        (qs[0].question.as_str(), qs[0].header.as_deref()),
+        ("Proceed?", Some("Go"))
+    );
+    let reply = one(&d
+        .command(Command::AnswerPermission {
+            request_id: "3".into(),
+            option_id: "Yes".into(),
+        })
+        .expect("answer"));
+    assert_eq!(
+        reply["result"],
+        json!({ "action": "accept", "content": { "go": true } })
+    );
+}
+
+#[test]
+fn retries_compaction_and_failed_turns() {
+    let mut d = ready_opencode(json!({}));
+    let prompt = one(&d.command(Command::prompt("go")).expect("prompt"));
+    let events = feed(
+        &mut d,
+        &[
+            update(
+                "s1",
+                json!({ "sessionUpdate": "session_info_update", "_meta": { "opencode/retry": {
+                    "attempt": 2, "nextRetryAt": "2026-10-02T12:00:05.000Z",
+                    "error": { "type": "provider.rate-limit", "message": "Rate limit exceeded", "status": 429 } } } }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "session_info_update", "_meta": { "opencode/retry": null } }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "compaction_update", "compactionId": "m1", "status": "in_progress" }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "m1",
+                        "content": { "type": "text", "text": "So far" } }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "compaction_update", "compactionId": "m1", "status": "completed",
+                        "summary": [{ "type": "text", "text": "So far" }] }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "compaction_update", "compactionId": "m2", "status": "failed",
+                        "error": "Context too large" }),
+            ),
+            result(
+                prompt["id"].clone(),
+                json!({ "stopReason": "error", "error": { "code": -32603, "message": "Provider unavailable" } }),
+            ),
+        ],
+    );
+    let messages: Vec<(RunState, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::StateChanged(s) => Some((s.state.clone(), s.message.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            (
+                working(),
+                Some("Retrying (attempt 2): Rate limit exceeded".into())
+            ),
+            (working(), None),
+            (working(), Some("Compacting".into())),
+            (RunState::Error, Some("Provider unavailable".into())),
+        ]
+    );
+    assert!(events.contains(&Event::Notice {
+        message: "Conversation compacted".into()
+    }));
+    assert!(events.contains(&Event::Notice {
+        message: "Compaction failed: Context too large".into()
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Native { kind, .. } if kind == "compaction_summary_chunk"))
+    );
+    assert_eq!(events.last(), Some(&Event::TurnCompleted));
+
+    // Without the capability (older opencode), the marker says the same.
+    let events = feed(
+        &mut d,
+        &[update(
+            "s1",
+            json!({ "sessionUpdate": "session_info_update",
+                    "_meta": { "opencode/compaction": { "status": "started", "messageId": "m3", "reason": "auto" } } }),
+        )],
+    );
+    assert_eq!(states(&events), [working()]);
+}
+
+#[test]
+fn credits_are_not_dollars() {
+    let mut d = ready_copilot();
+    let events = feed(
+        &mut d,
+        &[update(
+            "s1",
+            json!({ "sessionUpdate": "usage_update", "used": 10, "size": 100,
+                    "cost": { "amount": 3.5, "currency": "AI Credits" } }),
+        )],
+    );
+    assert_eq!(
+        events,
+        [Event::Usage(Usage {
+            context_used: Some(10),
+            context_window: Some(100),
+            other_cost: Some(Cost {
+                amount: 3.5,
+                currency: "AI Credits".into()
+            }),
+            ..Usage::default()
+        })]
+    );
+}
+
+#[test]
+fn opencode_tool_names_classify_its_calls() {
+    let mut d = ready_opencode(json!({}));
+    let events = feed(
+        &mut d,
+        &[
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "p1", "title": "src/a.rs",
+                        "name": "patch", "kind": "other", "status": "pending", "rawInput": {} }),
+            ),
+            // A subagent known by name before its input arrives.
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "a1", "title": "subagent",
+                        "name": "subagent", "kind": "think", "status": "pending", "rawInput": {} }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "g1", "title": "docs",
+                        "name": "context7_get_library_docs", "kind": "search", "status": "pending",
+                        "rawInput": { "query": "x" } }),
+            ),
+        ],
+    );
+    let kinds: Vec<(&str, ItemKind)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ItemStarted { id, kind, .. } => Some((id.as_str(), *kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("p1", ItemKind::FileChange),
+            ("a1", ItemKind::Subagent),
+            ("g1", ItemKind::ToolCall)
+        ]
+    );
+    let Some(Event::ItemStarted { detail, .. }) = events.last() else {
+        panic!("{events:?}")
+    };
+    assert!(
+        matches!(detail, ItemDetail::Tool { tool, kind: crate::item::ToolKind::Read, .. }
+            if tool == "context7_get_library_docs"),
+        "{detail:?}"
+    );
+}
+
+#[test]
+fn cursor_tool_calls_started_before_their_input() {
+    let mut d = ready_copilot();
+    d.command(Command::prompt("go")).expect("prompt");
+    let events = feed(
+        &mut d,
+        &[
+            // Cursor 2026.10.22 announces the call while the model writes it.
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "sh1", "title": "Terminal",
+                        "kind": "execute", "status": "pending", "rawInput": {} }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "sh1", "title": "`cargo test`",
+                        "rawInput": { "command": "cargo test" } }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "",
+                        "kind": "think", "status": "pending", "rawInput": {} }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                        "rawInput": { "subagent_type": "explore" } }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                        "rawInput": { "subagent_type": "explore", "prompt": "Map the crate" } }),
+            ),
+            // The approval repeats the call without its input.
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "session/request_permission", "params": {
+                "sessionId": "s1", "toolCall": { "toolCallId": "sh1", "rawInput": {} },
+                "options": [{ "optionId": "allow-once", "name": "Allow", "kind": "allow_once" }] } }),
+        ],
+    );
+    let subagents: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Event::ItemStarted { id, kind: ItemKind::Subagent, .. } if id == "t1"))
+        .collect();
+    assert_eq!(subagents.len(), 1, "upgraded once its prompt arrived");
+    let Event::ItemStarted { detail, .. } = subagents[0] else {
+        unreachable!()
+    };
+    assert!(
+        matches!(detail, ItemDetail::Subagent { agent: Some(a), prompt: Some(p), .. }
+            if a == "explore" && p == "Map the crate"),
+        "{detail:?}"
+    );
+    let Event::PermissionRequested { detail, native, .. } = requested(&events) else {
+        unreachable!()
+    };
+    assert!(
+        matches!(detail, Some(ItemDetail::Command { command, .. }) if command == "cargo test"),
+        "{detail:?}"
+    );
+    assert_eq!(native, &json!({ "command": "cargo test" }));
+}
+
+#[test]
+fn advertised_title_and_close_are_used() {
+    let caps = json!({ "sessionCapabilities": { "title": {}, "close": {} } });
+    let mut d = ready_opencode(caps);
+    let rename = one(&d
+        .command(Command::Rename {
+            name: "Build fixes".into(),
+        })
+        .expect("rename"));
+    assert_eq!(rename["method"], "session/set_title");
+    assert_eq!(
+        rename["params"],
+        json!({ "sessionId": "s1", "title": "Build fixes" })
+    );
+    let events = feed(&mut d, &[result(rename["id"].clone(), json!({}))]);
+    assert_eq!(
+        events,
+        [Event::TitleChanged {
+            title: "Build fixes".into()
+        }]
+    );
+
+    let msgs = sent(&d.command(Command::New).expect("new"));
+    assert_eq!(msgs[0]["method"], "session/close");
+    assert_eq!(msgs[0]["params"], json!({ "sessionId": "s1" }));
+    assert_eq!(msgs[1]["method"], "session/new");
+    let events = feed(
+        &mut d,
+        &[
+            result(msgs[0]["id"].clone(), json!({})),
+            result(msgs[1]["id"].clone(), opencode_session("s2", "mock/mock-1")),
+        ],
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::SessionStarted { native_id, .. } if native_id == "s2"))
+    );
+
+    // Without them: the slash command, and no close.
+    let mut d = ready_copilot();
+    let rename = one(&d
+        .command(Command::Rename {
+            name: "Build fixes".into(),
+        })
+        .expect("rename"));
+    assert_eq!(rename["params"]["prompt"][0]["text"], "/rename Build fixes");
+    assert_eq!(
+        one(&d.command(Command::New).expect("new"))["method"],
+        "session/new"
+    );
+}

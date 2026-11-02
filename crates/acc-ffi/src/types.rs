@@ -308,6 +308,15 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
     pub context_used: Option<u64>,
     pub context_window: Option<u64>,
+    /// A running total in a unit other than US dollars, never added to `cost_usd`.
+    pub other_cost: Option<Cost>,
+}
+
+/// An amount in the harness's own unit: an ISO 4217 code or its own name.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct Cost {
+    pub amount: f64,
+    pub currency: String,
 }
 
 impl From<core_ev::Usage> for Usage {
@@ -320,6 +329,10 @@ impl From<core_ev::Usage> for Usage {
             cost_usd: u.cost_usd,
             context_used: u.context_used,
             context_window: u.context_window,
+            other_cost: u.other_cost.map(|c| Cost {
+                amount: c.amount,
+                currency: c.currency,
+            }),
         }
     }
 }

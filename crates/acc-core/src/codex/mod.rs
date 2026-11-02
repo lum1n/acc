@@ -534,6 +534,7 @@ impl CodexDriver {
                     cost_usd: None,
                     context_used: usage.pointer("/last/totalTokens").and_then(Value::as_u64),
                     context_window: u64_at(&usage, "modelContextWindow"),
+                    ..Usage::default()
                 }));
             }
             "account/rateLimits/updated" => {
