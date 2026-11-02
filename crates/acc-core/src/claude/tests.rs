@@ -1214,6 +1214,47 @@ fn a_turn_left_waiting_on_a_background_agent_is_not_done() {
     assert!(t.subagents().all(|i| i.status == ItemStatus::Completed));
 }
 
+/// Claude Code 2.1.316, where `-p` forks by default: an `Agent` call with
+/// `subagent_type: "fork"` runs in the background, ends the turn, and its
+/// report wakes a second one.
+const FORK: &str = include_str!("../../tests/fixtures/claude/fork-subagent-2.1.316.ndjson");
+
+#[test]
+fn recorded_fork_is_a_subagent_that_wakes_the_session() {
+    use crate::transcript::{ItemStatus, Transcript};
+    let mut d = ClaudeDriver::default();
+    let mut t = Transcript::new();
+    let mut states = Vec::new();
+    for line in FORK.split_inclusive('\n') {
+        for e in d.on_output(line.as_bytes()) {
+            t.settle(&e);
+            t.apply(&e);
+            if let Event::StateChanged(s) = &e {
+                states.push(s.state.clone());
+            }
+        }
+    }
+    assert_eq!(states.last(), Some(&RunState::Done), "{states:?}");
+    assert!(states.contains(&RunState::Waiting), "{states:?}");
+    let subs: Vec<_> = t.subagents().collect();
+    assert_eq!(subs.len(), 1);
+    let fork = subs[0];
+    assert_eq!(fork.status, ItemStatus::Completed);
+    let ItemDetail::Subagent {
+        agent, child, output, ..
+    } = fork.detail.clone()
+    else {
+        panic!("subagent detail")
+    };
+    assert_eq!(agent.as_deref(), Some("fork"));
+    assert!(child.is_some());
+    assert!(output.is_some_and(|o| o.contains('3')));
+    assert!(
+        t.children(&fork.id).next().is_some(),
+        "the fork's own conversation"
+    );
+}
+
 /// An MCP form elicitation as 2.1.316 sends it: `requested_schema` with
 /// `property_order` (the schema's keys come back sorted).
 fn elicitation(id: &str) -> Value {

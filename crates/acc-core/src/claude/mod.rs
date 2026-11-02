@@ -7,7 +7,7 @@
 //! `result`, `rate_limit_event`) and `control_request` / `control_response`
 //! envelopes going both ways. Checked against Claude Code 2.1.316 and the
 //! Agent SDK 0.3.316 type definitions; the fixtures under
-//! `tests/fixtures/claude` are recorded from 2.1.296.
+//! `tests/fixtures/claude` are recorded from 2.1.280 to 2.1.316.
 //!
 //! What maps where:
 //! - State: `system/session_state_changed` (enabled by

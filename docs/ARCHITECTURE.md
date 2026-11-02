@@ -55,7 +55,7 @@ the turn ended in.
 **Session names.** `Event::TitleChanged` carries the harness's name for the session, and
 `Session` keeps `SessionSpec::title` in step with it, over the launch title and the first-prompt
 fallback. Copilot and Cursor name sessions themselves (ACP `session_info_update`). opencode
-(2.0.14) names them too but never says so, so after a turn the ACP driver asks `session/list`
+(2.0.14 to 2.2.4) names them too but never says so, so after a turn the ACP driver asks `session/list`
 until it reports a name other than its `New session - <time>` placeholder. Codex and pi report
 only names given with rename (`thread.name`, `sessionName`). Headless Claude names nothing on its
 own, so with `ClaudeConfig::auto_title` (on for fresh untitled sessions) the driver sends
