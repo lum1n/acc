@@ -1,6 +1,7 @@
 //! Multi-part questions: Claude's `AskUserQuestion` and Codex's
 //! `requestUserInput` can ask several questions at once, some of them
-//! multiple-choice.
+//! multiple-choice. Claude's MCP elicitation forms come as questions too,
+//! one per field.
 //!
 //! A question request's [`Permission::native`](crate::session::Permission)
 //! holds them; [`parse`] reads them back. Answer them all with
@@ -14,7 +15,8 @@ use crate::wire::{owned, str_at};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
-    /// Codex's question id; Claude keys answers by the question text.
+    /// Codex's question id, or an elicitation form's field name; Claude
+    /// keys `AskUserQuestion` answers by the question text.
     pub id: Option<String>,
     pub question: String,
     pub header: Option<String>,
