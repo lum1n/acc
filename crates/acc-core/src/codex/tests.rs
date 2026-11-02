@@ -293,6 +293,7 @@ fn turn_lifecycle_and_sticky_done() {
         cost_usd: None,
         context_used: Some(90),
         context_window: Some(258_400),
+        ..Usage::default()
     })));
     assert!(events.contains(&Event::TurnCompleted));
     let last_state = events.iter().rev().find_map(|e| match e {

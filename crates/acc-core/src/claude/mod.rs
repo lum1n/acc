@@ -787,6 +787,7 @@ impl ClaudeDriver {
             cost_usd: f64_at(v, "total_cost_usd"),
             context_used: self.last_context,
             context_window: self.context_window,
+            ..Usage::default()
         }));
         // A turn can't end while a prompt is open, so anything left was
         // answered or withdrawn in a way the log doesn't show.
