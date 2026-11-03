@@ -203,6 +203,7 @@ impl Transcript {
             id: change.id().to_owned(),
             status: item.map_or(ItemStatus::Completed, |i| i.status),
             detail: item.map_or(ItemDetail::Text, |i| i.detail.clone()),
+            completed_at_ms: None,
             native: Value::Null,
         }
     }
@@ -237,6 +238,7 @@ impl Transcript {
                 parent,
                 detail,
                 native,
+                ..
             } => {
                 let (item, new) = self.slot(id, *kind);
                 item.kind = *kind;
@@ -271,6 +273,7 @@ impl Transcript {
                 status,
                 detail,
                 native,
+                ..
             } => {
                 let &i = self.index.get(id)?;
                 let item = &mut self.items[i];

@@ -197,10 +197,10 @@ export interface UsageRollup {
 export type Event =
   | { type: "session_started"; harness: HarnessId; native_id: string; model: string | null }
   | ({ type: "state_changed" } & SessionState)
-  | { type: "item_started"; id: string; kind: ItemKind; parent?: string; detail: ItemDetail; native?: unknown }
+  | { type: "item_started"; id: string; kind: ItemKind; parent?: string; detail: ItemDetail; started_at_ms?: number; native?: unknown }
   | { type: "item_delta"; id: string; text: string }
   | { type: "item_updated"; id: string; detail: ItemDetail; native?: unknown }
-  | { type: "item_completed"; id: string; status: ItemStatus; detail: ItemDetail; native?: unknown }
+  | { type: "item_completed"; id: string; status: ItemStatus; detail: ItemDetail; completed_at_ms?: number; native?: unknown }
   | {
       type: "permission_requested";
       request_id: string;

@@ -520,6 +520,7 @@ fn prompts_are_echoed_once() {
                 kind: ItemKind::UserMessage,
                 parent: None,
                 detail: ItemDetail::Text,
+                started_at_ms: None,
                 native: Value::Null,
             },
             Event::ItemDelta {
@@ -530,6 +531,7 @@ fn prompts_are_echoed_once() {
                 id: "prompt-1".into(),
                 status: ItemStatus::Completed,
                 detail: ItemDetail::Text,
+                completed_at_ms: None,
                 native: Value::Null,
             },
         ]
