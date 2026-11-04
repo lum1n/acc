@@ -95,9 +95,10 @@ acc doctor                             # harnesses found here and their versions
 
 **Drive a harness.** `acc run <harness> [dir]` starts it headlessly through its ACC driver
 (`claude`, `codex`, `pi`, `cursor`, `copilot`, `opencode`). Type prompts; events print as
-readable lines (`--json` prints the raw event stream). `:help` lists the commands: `:answer allow`
-for a permission prompt, `:interrupt`, `:compact`, `:set model <m>`, `:commands`, `:options`.
-Ctrl-D ends the session after the current turn.
+readable lines (`--json` prints the raw event stream, `--program PATH` runs another binary than
+the one on `PATH`). `:help` lists the commands: `:answer allow` for a permission prompt,
+`:interrupt`, `:compact`, `:new`, `:fork`, `:refresh`, `:set model <m>`, `:invoke <name>`,
+`:commands`, `:options`. Ctrl-D ends the session after the current turn.
 
 ```sh
 acc run claude ~/project
@@ -109,7 +110,7 @@ acc run codex . --model gpt-5.5 --json
 on that host, with nothing installed there. Ending input (Ctrl-D) or losing the connection leaves
 it running; `--attach` rejoins it from any machine and replays what you missed. Keys come from
 the running ssh-agent (`SSH_AUTH_SOCK`), else `~/.ssh`; `--identity` names a key file. Host keys
-are checked against `~/.ssh/known_hosts`.
+are checked against `~/.ssh/known_hosts`; `--insecure` skips that check.
 
 ```sh
 acc run claude ~/project --ssh me@devbox            # prints the id to rejoin with
