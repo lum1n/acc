@@ -182,3 +182,143 @@ fn choices(prop: &Value) -> Vec<(String, String, Option<String>)> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answers(a: &[&[&str]]) -> Vec<Vec<String>> {
+        a.iter()
+            .map(|q| q.iter().map(|s| (*s).to_owned()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn single_field_takes_the_message_and_title_as_header() {
+        let schema = json!({ "properties": { "name": { "type": "string", "title": "Name" } } });
+        let qs = questions(&schema, "What is it called?");
+        assert_eq!(qs[0]["question"], "What is it called?");
+        assert_eq!(qs[0]["header"], "Name");
+        assert_eq!(qs[0]["multiSelect"], false);
+        assert_eq!(qs[0]["options"], json!([]));
+    }
+
+    #[test]
+    fn several_fields_fall_back_title_description_key() {
+        let schema = json!({
+            "required": ["c"],
+            "properties": {
+                "a": { "type": "string", "title": "Alpha", "description": "d" },
+                "b": { "type": "string", "description": "Beta?" },
+                "c": { "type": "string" },
+            }
+        });
+        let qs = questions(&schema, "ignored with several fields");
+        let texts: Vec<&str> = qs.iter().map(|q| q["question"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["c", "Alpha", "Beta?"], "required first");
+        assert!(qs.iter().all(|q| q["header"].is_null()));
+    }
+
+    #[test]
+    fn choices_read_enum_names_and_titled_alternatives() {
+        let named = json!({ "type": "string", "enum": ["a", "b"], "enumNames": ["A"] });
+        assert_eq!(
+            choices(&named),
+            [("a".into(), "A".into(), None), ("b".into(), "b".into(), None)]
+        );
+        let titled = json!({ "anyOf": [
+            { "const": "x", "title": "X", "description": "ex" },
+            { "const": "y", "description": "" },
+            { "title": "no const" },
+        ] });
+        assert_eq!(
+            choices(&titled),
+            [
+                ("x".into(), "X".into(), Some("ex".into())),
+                ("y".into(), "y".into(), None)
+            ]
+        );
+        let array = json!({ "type": "array", "items": { "enum": ["p"] } });
+        assert_eq!(choices(&array).len(), 1);
+        assert!(choices(&json!({ "type": "string" })).is_empty());
+    }
+
+    #[test]
+    fn booleans_are_yes_no_questions_and_answers() {
+        let schema = json!({ "properties": { "ok": { "type": "boolean" } } });
+        let qs = questions(&schema, "");
+        assert_eq!(qs[0]["options"].as_array().unwrap().len(), 2);
+        for (said, want) in [("Yes", true), ("TRUE", true), ("no", false), ("maybe", false)] {
+            assert_eq!(
+                content(&schema, &answers(&[&[said]])),
+                json!({ "ok": want }),
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
+    fn numbers_parse_and_bad_numbers_are_left_out() {
+        let schema = json!({ "properties": {
+            "n": { "type": "integer" }, "f": { "type": "number" } } });
+        let fields: Vec<String> = fields(&schema).into_iter().map(|(k, _)| k).collect();
+        let pick = |n: &str, f: &str| {
+            let mut a = vec![Vec::new(); 2];
+            a[fields.iter().position(|k| k == "n").unwrap()] = vec![n.to_owned()];
+            a[fields.iter().position(|k| k == "f").unwrap()] = vec![f.to_owned()];
+            content(&schema, &a)
+        };
+        assert_eq!(pick(" 42 ", "1.5"), json!({ "n": 42, "f": 1.5 }));
+        assert_eq!(pick("4.2", "abc"), json!({}));
+    }
+
+    #[test]
+    fn unanswered_and_blank_questions_are_left_out() {
+        let schema = json!({ "properties": { "a": { "type": "string" }, "b": { "type": "string" } } });
+        assert_eq!(content(&schema, &answers(&[&[""], &["x"]])), json!({ "b": "x" }));
+        assert_eq!(content(&schema, &answers(&[&[]])), json!({}));
+        assert_eq!(content(&schema, &[]), json!({}));
+        // Free text with several lines is joined.
+        assert_eq!(
+            content(&schema, &answers(&[&["l1", "l2"]])),
+            json!({ "a": "l1\nl2" })
+        );
+    }
+
+    #[test]
+    fn choices_map_by_label_or_value_and_unknowns_pass_through_without_a_companion() {
+        let schema = json!({ "properties": { "pm": { "type": "string", "oneOf": [
+            { "const": "bun", "title": "Bun" }, { "const": "npm", "title": "npm" } ] } } });
+        assert_eq!(content(&schema, &answers(&[&["Bun"]])), json!({ "pm": "bun" }));
+        assert_eq!(content(&schema, &answers(&[&["npm"]])), json!({ "pm": "npm" }));
+        assert_eq!(content(&schema, &answers(&[&["yarn"]])), json!({ "pm": "yarn" }));
+    }
+
+    #[test]
+    fn multi_select_typed_answers_go_to_the_companion() {
+        let schema = json!({ "properties": {
+            "x": { "type": "array", "items": { "oneOf": [{ "const": "a", "title": "A" }] } },
+            "x_custom": { "type": "string" },
+        } });
+        // The companion isn't a question of its own.
+        assert_eq!(fields(&schema).len(), 1);
+        assert_eq!(
+            content(&schema, &answers(&[&["A", "zed", "yo"]])),
+            json!({ "x": ["a"], "x_custom": "zed, yo" })
+        );
+        // Only typed answers: no empty choice array.
+        assert_eq!(
+            content(&schema, &answers(&[&["zed"]])),
+            json!({ "x_custom": "zed" })
+        );
+    }
+
+    #[test]
+    fn schemas_without_properties_have_no_questions() {
+        assert!(questions(&json!({}), "hi").is_empty());
+        assert_eq!(content(&json!({}), &answers(&[&["x"]])), json!({}));
+        // A `_custom` key without a choice to attach to is a question itself.
+        let schema = json!({ "properties": { "s_custom": { "type": "string" }, "s": { "type": "string" } } });
+        assert_eq!(fields(&schema).len(), 2);
+    }
+}
