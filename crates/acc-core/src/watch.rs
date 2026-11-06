@@ -189,7 +189,8 @@ pub fn watch_script(dir: &SessionDir, harness: Harness, hook: Option<&Hook>) -> 
     format!(
         "{LOGIN_PATH}\
          d={d}\n\
-         pid=$(cat \"$d/pid\" 2>/dev/null) && kill -0 \"$pid\" 2>/dev/null && [ ! -f \"$d/exit\" ] || exit {EXIT_NOT_RUNNING}\n\
+         {RUNNING}\
+         acc_running || exit {EXIT_NOT_RUNNING}\n\
          if [ -f \"$d/watch.pid\" ]; then\n\
          old=$(cat \"$d/watch.pid\")\n\
          kill \"$(cat \"$d/watch.tail\" 2>/dev/null)\" \"$old\" 2>/dev/null\n\
@@ -197,6 +198,7 @@ pub fn watch_script(dir: &SessionDir, harness: Harness, hook: Option<&Hook>) -> 
          fi\n\
          nohup sh -c {body} acc-watch \"$d\" </dev/null >/dev/null 2>&1 &\n",
         body = quote(&body),
+        RUNNING = crate::detached::RUNNING,
     )
 }
 

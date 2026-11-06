@@ -66,6 +66,51 @@ impl Session {
         Ok(me)
     }
 
+    /// Starts the harness of session `id` again after it stopped running
+    /// (the host rebooted, or it exited), resuming the harness's own session
+    /// with what `spec.json` recorded: model, permission, launcher,
+    /// worktree, sandbox, title and labels. Output is appended to the same
+    /// log, and the returned session reads only this run's. Clients that
+    /// followed the earlier run saw it exit; they attach again.
+    ///
+    /// [`Error::NotResumable`] when the harness never reported its session
+    /// id (or the session has no `spec.json`), [`Error::Remote`] while it is
+    /// still running.
+    pub async fn revive(host: Arc<Host>, id: &str, client_tag: &str) -> Result<Self> {
+        let listing = crate::detached::list(&host)
+            .await?
+            .into_iter()
+            .find(|l| l.id == id)
+            .ok_or_else(|| Error::NotResumable(id.to_owned()))?;
+        let spec = listing
+            .spec_json
+            .as_deref()
+            .and_then(SessionSpec::from_json)
+            .ok_or_else(|| Error::NotResumable(id.to_owned()))?;
+        let (launched, _) = acc_core::session::Session::revive(&spec, client_tag).map_err(|e| match e {
+            acc_core::session::SessionError::NotResumable(id) => Error::NotResumable(id),
+            _ => Error::Invalid("the session's spec.json can't be relaunched"),
+        })?;
+        let spec = launched.spec();
+        let mut config = SessionConfig::new(spec.harness, spec.cwd.clone());
+        config.opening = Opening::Resume {
+            native_id: spec.native_id.clone().unwrap_or_default(),
+        };
+        config.model = spec.model.clone();
+        config.client_tag = client_tag.to_owned();
+        config.sandbox = spec.sandbox.clone();
+        let mut core = Core::new(config);
+        // The launch the core session built keeps the permission mode and
+        // launcher, which the live session doesn't know about.
+        let pipe = Detached::launch(host, id, &spec.launch, &spec.cwd, Some(&spec.to_json())).await?;
+        pipe.write(&core.start()).await?;
+        let me = Self::from_parts(pipe, core);
+        if let Some(message) = me.pipe.sandbox().and_then(|a| a.notice()) {
+            me.lock_queued().push(Event::Notice { message });
+        }
+        Ok(me)
+    }
+
     /// Rejoins running session `id` from byte `offset` of its log. Nothing is
     /// written: the harness already had its handshake. `config.opening` is
     /// replaced by [`Opening::Attach`].

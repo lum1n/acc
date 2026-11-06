@@ -22,6 +22,7 @@ impl From<SessionError> for AccError {
     fn from(e: SessionError) -> Self {
         match e {
             SessionError::Driver(e) => e.into(),
+            SessionError::NotResumable(session_id) => Self::NotResumable { session_id },
             e => Self::InvalidSession {
                 reason: e.to_string(),
             },
@@ -58,6 +59,25 @@ impl AccSession {
         now_ms: u64,
     ) -> Result<Arc<Self>, AccError> {
         let (session, exec) = Session::launch(request.into(), &id, &client_tag, now_ms)?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(session),
+            launch: Mutex::new(Some(exec.into())),
+        }))
+    }
+
+    /// Starts the harness of a session that stopped running (its host
+    /// rebooted, or it exited) again under the same id, resuming the
+    /// harness's own session from its `spec.json`. Fails with
+    /// `NotResumable` when the harness never reported a session id. Check
+    /// the session isn't running first (`list_script`). Continue as after
+    /// `launch`: run `take_launch_exec`, pass its output to `on_launched`,
+    /// then follow the log from `offset`.
+    #[uniffi::constructor]
+    pub fn revive(spec_json: String, client_tag: String) -> Result<Arc<Self>, AccError> {
+        let spec = SessionSpec::from_json(&spec_json).ok_or_else(|| AccError::InvalidSession {
+            reason: "unreadable spec.json".into(),
+        })?;
+        let (session, exec) = Session::revive(&spec, &client_tag)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(session),
             launch: Mutex::new(Some(exec.into())),

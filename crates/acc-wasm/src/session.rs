@@ -22,6 +22,7 @@ pub(crate) fn session_error(e: SessionError) -> JsValue {
         SessionError::Driver(DriverError::MissingArgument(_)) => "MissingArgument",
         SessionError::Driver(DriverError::Unsupported { .. }) => "Unsupported",
         SessionError::Driver(DriverError::AttachmentRejected(_)) => "AttachmentRejected",
+        SessionError::NotResumable(_) => "NotResumable",
         _ => "InvalidSession",
     };
     error(kind, &e.to_string())
@@ -84,6 +85,21 @@ impl AccSession {
     pub fn launch(request: JsValue, id: &str, client_tag: &str, now_ms: f64) -> Result<AccSession, JsValue> {
         let request: LaunchRequest = arg(request.clone(), "launch request")?;
         let (inner, exec) = Session::launch(request, id, client_tag, ms(now_ms)).map_err(session_error)?;
+        Ok(Self {
+            inner,
+            launch: Some(exec.into()),
+        })
+    }
+
+    /// Starts the harness of a session that stopped running (its host
+    /// rebooted, or it exited) again under the same id, resuming the
+    /// harness's own session from its `spec.json`. Fails with
+    /// `NotResumable` when the harness never reported a session id. Check
+    /// the session isn't running first (`listScript`). Continue as after
+    /// `launch`: run `takeLaunchExec`, pass its output to `onLaunched`, then
+    /// follow the log from `offset`.
+    pub fn revive(spec_json: &str, client_tag: &str) -> Result<AccSession, JsValue> {
+        let (inner, exec) = Session::revive(&spec_from(spec_json)?, client_tag).map_err(session_error)?;
         Ok(Self {
             inner,
             launch: Some(exec.into()),

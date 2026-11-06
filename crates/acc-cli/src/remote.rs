@@ -306,6 +306,7 @@ pub fn sessions(dest: &str, args: &[&str]) -> Result<std::process::ExitCode, Str
             acc_ssh::Status::Alive { pid, .. } => format!("running (pid {pid})"),
             acc_ssh::Status::Exited { code: Some(c), .. } => format!("exited {c}"),
             acc_ssh::Status::Exited { code: None, .. } => "exited".to_owned(),
+            acc_ssh::Status::Interrupted { .. } => "interrupted (revive to resume)".to_owned(),
             acc_ssh::Status::Missing => "never started".to_owned(),
         };
         let what = l
