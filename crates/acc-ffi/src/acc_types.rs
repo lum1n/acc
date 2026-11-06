@@ -1315,8 +1315,19 @@ impl From<Outbound> for AccOutbound {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum AccStatus {
-    Alive { pid: u32, size: u64 },
-    Exited { code: Option<i32>, size: u64 },
+    Alive {
+        pid: u32,
+        size: u64,
+    },
+    Exited {
+        code: Option<i32>,
+        size: u64,
+    },
+    /// Gone without recording an exit (the host rebooted): see
+    /// `AccSession.revive`.
+    Interrupted {
+        size: u64,
+    },
     Missing,
 }
 
@@ -1325,6 +1336,7 @@ impl From<Status> for AccStatus {
         match s {
             Status::Alive { pid, size } => Self::Alive { pid, size },
             Status::Exited { code, size } => Self::Exited { code, size },
+            Status::Interrupted { size } => Self::Interrupted { size },
             Status::Missing => Self::Missing,
         }
     }

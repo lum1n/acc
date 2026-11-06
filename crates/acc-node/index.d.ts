@@ -273,6 +273,8 @@ export interface Availability {
 export type DetachedStatus =
   | { status: "alive"; pid: number; size: number }
   | { status: "exited"; code: number | null; size: number }
+  /** Gone without recording an exit (the host rebooted): `reviveSession` can start it again. */
+  | { status: "interrupted"; size: number }
   | { status: "missing" };
 
 /** What a detached session was started with (`~/.acc/s/<id>/spec.json`). */
@@ -404,6 +406,12 @@ export declare class SshHost {
   launchSession(id: string, config: SessionConfig): Promise<RemoteSession>;
   /** Joins a running session, replaying its log, then follows it live. */
   attachSession(id: string, config: SessionConfig): RemoteSession;
+  /**
+   * Starts a session again after it stopped running (the host rebooted, or it exited),
+   * resuming the harness's own session. Fails `[NotResumable]` when the harness never
+   * reported a session id, and while it still runs.
+   */
+  reviveSession(id: string, clientTag: string): Promise<RemoteSession>;
   /** Deletes an exited session's files. */
   removeSession(id: string): Promise<void>;
 }

@@ -8,7 +8,9 @@
 //! `research/daemonless-ssh-control.md` §2 and §4.
 //!
 //! Layout under `$HOME/.acc/s/<session>/`:
-//! `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json` (one line, a
+//! `in` (FIFO), `out.ndjson`, `err`, `pid`, `boot` (the host's boot id when
+//! `pid` was written, so a PID from before a reboot is never mistaken for a
+//! live harness), `exit`, `spec.json` (one line, a
 //! [`crate::session::SessionSpec`]), `sent` (ids of writes already
 //! delivered), `lock` (held while writing), and `events.ndjson`,
 //! `watch.pid` and `watch.tail` while a [`crate::watch`] follower runs.
@@ -34,6 +36,8 @@ pub const EXIT_INCOMPLETE: u32 = 4;
 /// Launch exit status when the harness could not start in its working
 /// directory (it does not exist, or is not enterable).
 pub const EXIT_NO_CWD: u32 = 5;
+/// Launch exit status when the session's harness is already running.
+pub const EXIT_RUNNING: u32 = 6;
 /// How many 20 ms ticks the launch script waits for the harness PID before
 /// giving up, so a wrapper that dies without a trace cannot hang the launch.
 pub const LAUNCH_WAIT_TICKS: u32 = 500;
@@ -68,9 +72,11 @@ impl SessionDir {
     /// The harness is found on the `PATH` of the user's login shell. The FIFO
     /// is opened read-write (`<>`) so the harness never sees EOF when a client
     /// disconnects, and `nohup` keeps it alive after SSH hangs up. Prints the
-    /// harness PID on success, then for a sandboxed spec a `B` line
+    /// harness PID on success, then an `L` line with the log's length before
+    /// this run ([`parse_log_start`]), then for a sandboxed spec a `B` line
     /// ([`parse_sandbox`]). Relaunching an existing id (to resume) keeps
-    /// appending to the same log, so client offsets stay valid.
+    /// appending to the same log, so client offsets stay valid; it fails
+    /// with [`EXIT_RUNNING`] while the harness still runs.
     pub fn launch_script(&self, spec: &LaunchSpec, cwd: &str) -> String {
         self.launch_script_with_spec(spec, cwd, None)
     }
@@ -124,10 +130,16 @@ impl SessionDir {
             "set -e\n\
              {LOGIN_PATH}\
              d={d}\n\
+             {RUNNING}\
+             if acc_running; then echo \"session is already running\" >&2; exit {EXIT_RUNNING}; fi\n\
              mkdir -p \"$d\"\n\
              [ -p \"$d/in\" ] || mkfifo \"$d/in\"\n\
              rm -f \"$d/pid\" \"$d/exit\" \"$d/sandbox\"\n\
+             rm -rf \"$d/lock\"\n\
+             if [ -f \"$d/watch.pid\" ] && [ \"$(cat \"$d/boot\" 2>/dev/null)\" != \"$(acc_boot)\" ]; then rm -f \"$d/watch.pid\" \"$d/watch.tail\"; fi\n\
+             acc_boot >\"$d/boot\"\n\
              : >>\"$d/out.ndjson\"\n\
+             acc_l=$(wc -c <\"$d/out.ndjson\" | tr -d ' ')\n\
              {write_spec}\
              nohup sh -c {wrapper} \"$d\" </dev/null >/dev/null 2>&1 &\n\
              i=0\n\
@@ -141,6 +153,7 @@ impl SessionDir {
              sleep 0.02\n\
              done\n\
              cat \"$d/pid\"\n\
+             echo \"L $acc_l\"\n\
              {print_sandbox}",
             wrapper = quote(&wrapper),
             cwd_text = quote(cwd),
@@ -170,17 +183,19 @@ impl SessionDir {
         let d = self.dir();
         format!(
             "d={d}\n\
-             pid=$(cat \"$d/pid\" 2>/dev/null) || exit {EXIT_NOT_RUNNING}\n\
+             [ -f \"$d/pid\" ] || exit {EXIT_NOT_RUNNING}\n\
+             {RUNNING}\
+             pid=; acc_running && pid=$p\n\
              tail -c +{start} -f \"$d/out.ndjson\" &\n\
              t=$!\n\
              trap 'kill $t 2>/dev/null' EXIT\n\
              trap 'exit 1' HUP INT TERM\n\
              trap '' PIPE\n\
-             while kill -0 \"$pid\" 2>/dev/null && kill -0 $t 2>/dev/null; do\n\
+             while [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && kill -0 $t 2>/dev/null; do\n\
              printf . >&2 || exit 1\n\
              sleep 1\n\
              done\n\
-             kill -0 \"$pid\" 2>/dev/null && exit 1\n\
+             [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null && exit 1\n\
              exit 0\n",
             start = offset + 1,
         )
@@ -223,7 +238,8 @@ impl SessionDir {
         format!(
             "d={d}\n\
              [ -p \"$d/in\" ] || {{ echo 'acc: no such session' >&2; exit {EXIT_NOT_RUNNING}; }}\n\
-             [ -f \"$d/exit\" ] && {{ echo 'acc: the session has exited' >&2; exit {EXIT_NOT_RUNNING}; }}\n\
+             {RUNNING}\
+             if [ -f \"$d/exit\" ] || {{ [ -f \"$d/pid\" ] && ! acc_running; }}; then echo 'acc: the session has exited' >&2; exit {EXIT_NOT_RUNNING}; fi\n\
              {LOCK}\
              cat 1<>\"$d/in\"\n"
         )
@@ -250,7 +266,8 @@ impl SessionDir {
              trap 'rm -f \"$t\"' EXIT\n\
              cat >\"$t\"\n\
              [ \"$(wc -c <\"$t\" | tr -d ' ')\" = {len} ] || exit {EXIT_INCOMPLETE}\n\
-             pid=$(cat \"$d/pid\" 2>/dev/null) && kill -0 \"$pid\" 2>/dev/null || exit {EXIT_NOT_RUNNING}\n\
+             {RUNNING}\
+             acc_running || exit {EXIT_NOT_RUNNING}\n\
              {LOCK}\
              trap 'rm -f \"$t\"; rm -rf \"$d/lock\"' EXIT\n\
              grep -qx {id} \"$d/sent\" 2>/dev/null && exit 0\n\
@@ -259,7 +276,9 @@ impl SessionDir {
         )
     }
 
-    /// Script printing `alive <pid> <size>`, `exited <code> <size>` or
+    /// Script printing `alive <pid> <size>`, `exited <code> <size>`,
+    /// `interrupted <size>` (the harness and its wrapper died without
+    /// recording an exit: the host rebooted, or they were killed) or
     /// `missing`, where `size` is the log's length in bytes, then for an
     /// exited session an `E` line with the last line it wrote to stderr, and
     /// for a sandboxed session a `B` line. Parse them with [`parse_status`],
@@ -268,11 +287,12 @@ impl SessionDir {
         let d = self.dir();
         format!(
             "d={d}\n\
+             {RUNNING}\
              s=$(wc -c <\"$d/out.ndjson\" 2>/dev/null | tr -d ' ' || echo 0)\n\
              if [ -f \"$d/exit\" ]; then echo \"exited $(cat \"$d/exit\") $s\";\n\
              e=$(grep -v '^[[:space:]]*$' \"$d/err\" 2>/dev/null | tail -n 1); [ -n \"$e\" ] && printf 'E %s\\n' \"$e\";\n\
-             elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then echo \"alive $(cat \"$d/pid\") $s\";\n\
-             elif [ -f \"$d/pid\" ]; then echo \"exited - $s\";\n\
+             elif acc_running; then echo \"alive $p $s\";\n\
+             elif [ -f \"$d/pid\" ]; then echo \"interrupted $s\";\n\
              else echo missing; fi\n\
              {SANDBOX_LINE}"
         )
@@ -284,7 +304,8 @@ impl SessionDir {
         let d = self.dir();
         format!(
             "d={d}\n\
-             pid=$(cat \"$d/pid\" 2>/dev/null) && kill \"$pid\" 2>/dev/null || exit {EXIT_NOT_RUNNING}\n"
+             {RUNNING}\
+             acc_running && kill \"$p\" 2>/dev/null || exit {EXIT_NOT_RUNNING}\n"
         )
     }
 
@@ -294,8 +315,8 @@ impl SessionDir {
         let tries = grace_ms.div_ceil(100).max(1);
         format!(
             "d={d}\n\
-             p=$(cat \"$d/pid\" 2>/dev/null || true)\n\
-             if [ -n \"$p\" ] && kill -TERM \"$p\" 2>/dev/null; then\n\
+             {RUNNING}\
+             if acc_running && kill -TERM \"$p\" 2>/dev/null; then\n\
              i=0; while kill -0 \"$p\" 2>/dev/null && [ $i -lt {tries} ]; do sleep 0.1; i=$((i+1)); done\n\
              kill -KILL \"$p\" 2>/dev/null || true\n\
              fi\n"
@@ -308,7 +329,8 @@ impl SessionDir {
         let d = self.dir();
         format!(
             "d={d}\n\
-             pid=$(cat \"$d/pid\" 2>/dev/null) && kill -0 \"$pid\" 2>/dev/null && exit 1\n\
+             {RUNNING}\
+             acc_running && exit 1\n\
              rm -rf \"$d\"\n"
         )
     }
@@ -318,6 +340,15 @@ impl SessionDir {
 /// (see [`parse_sandbox`]).
 const SANDBOX_LINE: &str =
     "[ -f \"$d/sandbox\" ] && printf 'B %s\\n' \"$(head -n 1 \"$d/sandbox\")\"; true\n";
+
+/// `acc_boot` prints the host's boot id (Linux, then macOS and the BSDs;
+/// nothing where neither exists). `acc_running` succeeds when `$d/pid`
+/// names a harness that runs now, leaving its PID in `$p`. Neither a PID
+/// whose exit was recorded nor one from before the host rebooted counts:
+/// it may belong to another process by now.
+pub(crate) const RUNNING: &str = r#"acc_boot() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || sysctl -n kern.boottime 2>/dev/null || true; }
+acc_running() { [ ! -f "$d/exit" ] || return 1; p=$(cat "$d/pid" 2>/dev/null) && [ -n "$p" ] || return 1; b=$(cat "$d/boot" 2>/dev/null) || b=; [ -z "$b" ] || [ "$b" = "$(acc_boot)" ] || return 1; kill -0 "$p" 2>/dev/null; }
+"#;
 
 /// Takes the session's write lock, stealing it from a holder that died
 /// (a client whose connection dropped while it was writing).
@@ -353,9 +384,14 @@ pub enum Status {
         pid: u32,
         size: u64,
     },
-    /// `code` is `None` when the process died without the wrapper recording it.
+    /// `code` is `None` when the exit code could not be read.
     Exited {
         code: Option<i32>,
+        size: u64,
+    },
+    /// The harness and its wrapper are gone without recording an exit: the
+    /// host rebooted, or they were killed. See [`crate::session::Session::revive`].
+    Interrupted {
         size: u64,
     },
     Missing,
@@ -365,7 +401,7 @@ impl Status {
     /// Bytes in the session's log.
     pub fn size(&self) -> u64 {
         match self {
-            Status::Alive { size, .. } | Status::Exited { size, .. } => *size,
+            Status::Alive { size, .. } | Status::Exited { size, .. } | Status::Interrupted { size } => *size,
             Status::Missing => 0,
         }
     }
@@ -384,6 +420,9 @@ pub fn parse_status(out: &str) -> Option<Status> {
             code: parts.next().and_then(|c| c.parse().ok()),
             size: num(parts.next()).unwrap_or(0),
         }),
+        "interrupted" => Some(Status::Interrupted {
+            size: num(parts.next()).unwrap_or(0),
+        }),
         "missing" => Some(Status::Missing),
         _ => None,
     }
@@ -396,6 +435,14 @@ pub fn parse_stderr(out: &str) -> Option<String> {
         .find_map(|l| l.strip_prefix("E "))
         .map(|l| crate::wire::one_line(l, 300))
         .filter(|l| !l.is_empty())
+}
+
+/// The log's length before the launch, from the output of
+/// [`SessionDir::launch_script_with_spec`]: where this run's output starts.
+pub fn parse_log_start(out: &str) -> Option<u64> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("L "))
+        .and_then(|n| n.trim().parse().ok())
 }
 
 /// What a sandboxed session's host applied, from the output of
@@ -421,14 +468,15 @@ pub struct Listing {
 /// Script listing every detached session on the host. Parse it with [`parse_list`].
 pub fn list_script() -> String {
     format!(
-        "for d in \"$HOME\"/{ROOT}/*/; do\n\
+        "{RUNNING}\
+         for d in \"$HOME\"/{ROOT}/*/; do\n\
          [ -d \"$d\" ] || continue\n\
          d=${{d%/}}; id=${{d##*/}}\n\
          s=$(wc -c <\"$d/out.ndjson\" 2>/dev/null | tr -d ' ')\n\
          m=$(stat -c %Y \"$d/out.ndjson\" 2>/dev/null || stat -f %m \"$d/out.ndjson\" 2>/dev/null || echo -)\n\
          if [ -f \"$d/exit\" ]; then st=\"exited $(cat \"$d/exit\")\";\n\
-         elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then st=\"alive $(cat \"$d/pid\")\";\n\
-         elif [ -f \"$d/pid\" ]; then st=\"exited -\";\n\
+         elif acc_running; then st=\"alive $p\";\n\
+         elif [ -f \"$d/pid\" ]; then st=interrupted;\n\
          else st=missing; fi\n\
          printf 'S\\t%s\\t%s %s\\t%s\\n' \"$id\" \"$st\" \"${{s:-0}}\" \"$m\"\n\
          [ -f \"$d/spec.json\" ] && printf 'J\\t%s\\n' \"$(head -n 1 \"$d/spec.json\")\"\n\
@@ -979,7 +1027,9 @@ mod sh_tests {
         assert_eq!(content, "{\"n\":1}\n{\"n\":2}\n");
         assert!(sh(&home, &dir.status_script(), b"").starts_with("alive"));
 
-        let _ = Command::new("kill").arg(pid.trim()).status();
+        let _ = Command::new("kill")
+            .arg(pid.lines().next().unwrap_or_default())
+            .status();
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1051,7 +1101,7 @@ mod sh_tests {
         assert_eq!(
             parse_status(&sh(&home, &dir.status_script(), b"")),
             Some(Status::Alive {
-                pid: pid.trim().parse().expect("pid"),
+                pid: pid.lines().next().expect("pid line").parse().expect("pid"),
                 size: 11
             })
         );
@@ -1078,6 +1128,94 @@ mod sh_tests {
         ));
         sh(&home, &dir.remove_script(), b"");
         assert!(parse_list(&sh(&home, &list_script(), b"")).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_reboot_interrupts_the_session_and_a_relaunch_appends_to_its_log() {
+        let home = std::env::temp_dir().join(format!("acc-test-reboot-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let dir = SessionDir::new("rb").expect("valid id");
+        let d = home.join(ROOT).join("rb");
+        let spec = LaunchSpec {
+            program: "cat".into(),
+            args: vec![],
+            env: vec![],
+            protocol: Protocol::Acp,
+            sandbox: None,
+        };
+        let out = sh(&home, &dir.launch_script(&spec, "~"), b"");
+        assert_eq!(parse_log_start(&out), Some(0));
+        assert!(d.join("boot").exists(), "the boot id is recorded");
+        let (_, code) = sh_code(&home, &dir.launch_script(&spec, "~"), b"");
+        assert_eq!(
+            code,
+            Some(EXIT_RUNNING as i32),
+            "a running session isn't launched twice"
+        );
+        sh(&home, &dir.input_script(), b"before\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && parse_status(&sh(&home, &dir.status_script(), b"")).map(|s| s.size()) != Some(7)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // A reboot: the wrapper and the harness die without recording an
+        // exit, and the PID now belongs to another process (this test).
+        sh(
+            &home,
+            &format!(
+                "p=$(cat {pid}); w=$(ps -o ppid= -p \"$p\" | tr -d ' '); kill -KILL \"$w\" \"$p\"",
+                pid = d.join("pid").display()
+            ),
+            b"",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            parse_status(&sh(&home, &dir.status_script(), b"")),
+            Some(Status::Interrupted { size: 7 })
+        );
+        std::fs::write(d.join("pid"), format!("{}\n", std::process::id())).expect("pid");
+        std::fs::write(d.join("boot"), "an-earlier-boot\n").expect("boot");
+        assert_eq!(
+            parse_status(&sh(&home, &dir.status_script(), b"")),
+            Some(Status::Interrupted { size: 7 }),
+            "a PID from before the reboot is not this session's"
+        );
+        assert!(matches!(
+            parse_list(&sh(&home, &list_script(), b""))[0].status,
+            Status::Interrupted { size: 7 }
+        ));
+        let (_, code) = sh_code(&home, &dir.stop_script(), b"");
+        assert_eq!(
+            code,
+            Some(EXIT_NOT_RUNNING as i32),
+            "stop leaves the other process alone"
+        );
+        let (_, code) = sh_code(&home, &dir.write_script(3, "w1"), b"hi\n");
+        assert_eq!(code, Some(EXIT_NOT_RUNNING as i32));
+        let (_, code) = sh_code(&home, &dir.input_script(), b"hi\n");
+        assert_eq!(code, Some(EXIT_NOT_RUNNING as i32));
+        // Followers stop at once, and clients read the rest of the log.
+        assert_eq!(sh_code(&home, &dir.attach_script(0), b"").1, Some(0));
+
+        // Relaunched under the same id: this run's output starts after the last.
+        let out = sh(&home, &dir.launch_script(&spec, "~"), b"");
+        assert_eq!(parse_log_start(&out), Some(7));
+        sh(&home, &dir.input_script(), b"after\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && parse_status(&sh(&home, &dir.status_script(), b"")).map(|s| s.size()) != Some(13)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(
+            parse_status(&sh(&home, &dir.status_script(), b"")),
+            Some(Status::Alive { size: 13, .. })
+        ));
+        assert_eq!(sh(&home, &dir.read_script(0), b""), "before\nafter\n");
+        sh(&home, &dir.kill_script(1_000), b"");
         let _ = std::fs::remove_dir_all(&home);
     }
 

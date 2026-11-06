@@ -105,6 +105,10 @@ pub enum AccError {
     /// The detached session's harness is not running.
     #[error("no harness is running in session {session_id}")]
     NotRunning { session_id: String },
+    /// The session can't be revived: its harness never reported its own
+    /// session id to resume.
+    #[error("session {session_id} can't be recovered: its harness never reported a session id")]
+    NotResumable { session_id: String },
     #[error("remote script failed (exit {exit_code:?}): {stderr}")]
     Remote { exit_code: Option<u32>, stderr: String },
     /// A detached session's spec, snapshot or agent record didn't read.

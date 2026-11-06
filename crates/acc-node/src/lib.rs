@@ -44,6 +44,7 @@ fn ssh_err(e: ssh::Error) -> Error {
         E::HostKey { .. } => "HostKeyRejected",
         E::Agent(_) => "Agent",
         E::NotRunning(_) => "NotRunning",
+        E::NotResumable(_) => "NotResumable",
         E::Remote { .. } => "Remote",
         E::Driver(_) => "Driver",
         E::Key(_) | E::InvalidId(_) | E::Invalid(_) => "InvalidArgument",
@@ -326,6 +327,20 @@ impl SshHost {
     pub async fn launch_session(&self, id: String, config: Value) -> Result<RemoteSession> {
         let config = session_config(config)?;
         let session = ssh::Session::launch(self.host.clone(), &id, config)
+            .await
+            .map_err(ssh_err)?;
+        Ok(RemoteSession {
+            inner: Arc::new(session),
+        })
+    }
+
+    /// Starts session `id` again after it stopped running (the host
+    /// rebooted, or it exited), resuming the harness's own session with what
+    /// the session recorded. `[NotResumable]` when the harness never
+    /// reported a session id.
+    #[napi]
+    pub async fn revive_session(&self, id: String, client_tag: String) -> Result<RemoteSession> {
+        let session = ssh::Session::revive(self.host.clone(), &id, &client_tag)
             .await
             .map_err(ssh_err)?;
         Ok(RemoteSession {

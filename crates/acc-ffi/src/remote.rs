@@ -24,6 +24,7 @@ impl From<ssh::Error> for AccError {
             E::HostKey { fingerprint } => Self::HostKeyRejected { fingerprint },
             E::Agent(reason) => Self::Agent { reason },
             E::NotRunning(session_id) => Self::NotRunning { session_id },
+            E::NotResumable(session_id) => Self::NotResumable { session_id },
             E::Remote { code, stderr } => Self::Remote {
                 exit_code: code,
                 stderr,
@@ -112,8 +113,15 @@ pub struct ExecOutput {
 /// Liveness of a detached session.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum DetachedStatus {
-    Alive { pid: u32 },
-    Exited { code: Option<i32> },
+    Alive {
+        pid: u32,
+    },
+    Exited {
+        code: Option<i32>,
+    },
+    /// Gone without recording an exit (the host rebooted): `revive_session`
+    /// can start it again.
+    Interrupted,
     Missing,
 }
 
@@ -136,6 +144,7 @@ impl From<ssh::Status> for DetachedStatus {
         match s {
             ssh::Status::Alive { pid, .. } => Self::Alive { pid },
             ssh::Status::Exited { code, .. } => Self::Exited { code },
+            ssh::Status::Interrupted { .. } => Self::Interrupted,
             ssh::Status::Missing => Self::Missing,
         }
     }
@@ -245,6 +254,16 @@ impl SshHost {
     pub async fn launch_session(&self, id: String, config: SessionConfig) -> Result<RemoteSession, AccError> {
         let config = core_session_config(config)?;
         let session = ssh::Session::launch(self.host.clone(), &id, config).await?;
+        Ok(RemoteSession { inner: session })
+    }
+
+    /// Starts session `id` again after it stopped running (the host
+    /// rebooted, or it exited), resuming the harness's own session with
+    /// what the session recorded. Output is appended to the same log; the
+    /// returned session reads this run's. Fails with `NotResumable` when the
+    /// harness never reported a session id, and while it still runs.
+    pub async fn revive_session(&self, id: String, client_tag: String) -> Result<RemoteSession, AccError> {
+        let session = ssh::Session::revive(self.host.clone(), &id, &client_tag).await?;
         Ok(RemoteSession { inner: session })
     }
 

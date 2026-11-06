@@ -625,7 +625,7 @@ impl DetachedSession {
         self.dir.input_script()
     }
 
-    /// Prints `alive <pid>`, `exited <code>` or `missing`.
+    /// Prints `alive <pid> <size>`, `exited <code> <size>`, `interrupted <size>` or `missing`.
     #[wasm_bindgen(js_name = statusScript)]
     pub fn status_script(&self) -> String {
         self.dir.status_script()

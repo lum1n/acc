@@ -32,7 +32,7 @@ use crate::acp::{AcpConfig, AcpDriver, Start, launch_spec as acp_launch};
 use crate::claude::{ClaudeConfig, ClaudeDriver};
 use crate::codex::{CodexConfig, CodexDriver};
 use crate::command::{Apply, Attachment, Command, CommandEntry, OptionDef, OptionId};
-use crate::detached::{SessionDir, Status, parse_sandbox, parse_status, parse_stderr};
+use crate::detached::{SessionDir, Status, parse_log_start, parse_sandbox, parse_status, parse_stderr};
 use crate::driver::{Driver, DriverError};
 use crate::event::{Event, ItemId, ItemKind, PermissionOption, Quota, Usage};
 use crate::exec::Exec;
@@ -218,6 +218,10 @@ pub enum SessionError {
     InvalidWorktree(String),
     #[error("the session has no worktree")]
     NoWorktree,
+    /// [`Session::revive`] needs the harness's own session id, and this
+    /// session stopped before the harness reported one.
+    #[error("session {0} can't be recovered: its harness never reported a session id")]
+    NotResumable(String),
     /// The snapshot is unreadable, from another version, or of another
     /// session. Attach afresh instead.
     #[error("unusable snapshot: {0}")]
@@ -353,7 +357,8 @@ fn prompt_before_session(h: Harness) -> bool {
 
 impl Session {
     /// Starts a new detached session. Run the returned exec on the host
-    /// (its stdout is the harness PID), then follow the log from offset 0.
+    /// (its stdout is the harness PID), pass its output to
+    /// [`Session::on_launched`], then follow the log from [`Session::offset`].
     pub fn launch(
         req: LaunchRequest,
         id: &str,
@@ -453,6 +458,45 @@ impl Session {
             spec,
         };
         Ok((session, exec))
+    }
+
+    /// Starts the harness of a session that is no longer running (its host
+    /// rebooted, or it exited) again under the same id, resuming the
+    /// harness's own session ([`SessionSpec::native_id`]) with the stored
+    /// model, permission, launcher, worktree, sandbox, title and labels.
+    /// Fails with [`SessionError::NotResumable`] when there is no native id.
+    ///
+    /// Check first that the session isn't running (`spec` from
+    /// [`crate::detached::list_script`], or [`Session::status_exec`]); the
+    /// launch exec also fails with [`crate::detached::EXIT_RUNNING`] if it
+    /// is. Continue as after [`Session::launch`]: the new run's output is
+    /// appended to the same log, and [`Session::on_launched`] moves
+    /// [`Session::offset`] past what the earlier run wrote. Other clients
+    /// keep their offsets and read on.
+    pub fn revive(spec: &SessionSpec, client_tag: &str) -> Result<(Self, Exec), SessionError> {
+        let native_id = spec
+            .native_id
+            .clone()
+            .ok_or_else(|| SessionError::NotResumable(spec.id.clone()))?;
+        let req = LaunchRequest {
+            harness: Some(spec.harness),
+            cwd: spec.cwd.clone(),
+            model: spec.model.clone(),
+            permission: spec.permission.clone(),
+            resume: Some(native_id),
+            fork: false,
+            title: spec.title.clone(),
+            prompt: None,
+            attachments: Vec::new(),
+            parent: spec.parent.clone(),
+            replaces_parent: false,
+            labels: spec.labels.clone(),
+            launcher: spec.launcher.clone(),
+            worktree: spec.worktree.clone(),
+            sandbox: spec.sandbox.clone(),
+        };
+        // The same session: snapshots taken before still match it.
+        Self::launch(req, &spec.id, client_tag, spec.created_ms)
     }
 
     /// Joins a session started earlier (by this client or another). Run
@@ -698,17 +742,28 @@ impl Session {
                 }
             }
             Status::Exited { code, .. } => self.exit(code, parse_stderr(stdout), now_ms, &mut out),
-            Status::Missing => self.exit(None, None, now_ms, &mut out),
+            Status::Interrupted { .. } | Status::Missing => self.exit(None, None, now_ms, &mut out),
         }
         self.police(&mut out);
         out
     }
 
-    /// Applies the output of the launch exec (the PID, then for a
-    /// sandboxed session what the host applied). A session that asked for a
-    /// sandbox but runs unconfined gets an [`Event::Notice`].
+    /// Applies the output of the launch exec (the PID, where this run's
+    /// output starts in the log, then for a sandboxed session what the host
+    /// applied). Follow the log from [`Session::offset`] afterwards: past
+    /// an earlier run's output when the session was relaunched
+    /// ([`Session::revive`]). A session that asked for a sandbox but runs
+    /// unconfined gets an [`Event::Notice`].
     pub fn on_launched(&mut self, stdout: &str) -> Vec<Update> {
         let mut out = Vec::new();
+        if let Some(start) = parse_log_start(stdout)
+            && self.offset == 0
+        {
+            // An earlier run's output belongs to its own process; this
+            // driver's requests would match its replies.
+            self.offset = start;
+            self.replay_until = Some(start);
+        }
         self.on_sandbox(stdout, &mut out);
         out
     }
@@ -1462,6 +1517,78 @@ mod tests {
         assert!(r.fork && !r.replaces_parent);
         assert_eq!(r.resume.as_deref(), Some("5f3c1a52-8a3e-4c1e-9d47-2b6f0e9a7c11"));
         assert_eq!(r.parent.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn revive_needs_the_harness_session_id() {
+        let (s, _) = Session::launch(req(Harness::Claude), "s1", "a", 1).unwrap();
+        assert_eq!(
+            Session::revive(s.spec(), "b").err(),
+            Some(SessionError::NotResumable("s1".into()))
+        );
+    }
+
+    #[test]
+    fn revive_resumes_the_same_session_after_the_earlier_runs_output() {
+        let mut r = req(Harness::Claude);
+        r.title = Some("Fix the build".into());
+        r.permission = Some("acceptEdits".into());
+        r.labels.insert("from".into(), "phone".into());
+        r.launcher = Some(Launcher {
+            prefix: vec!["nice".into()],
+            program: None,
+            args: vec![],
+        });
+        let (mut first, _) = Session::launch(r, "s1", "a", 1).unwrap();
+        first.feed(CLAUDE_HI.as_bytes(), 2);
+        let snapshot = first.snapshot().expect("snapshot");
+        let spec = first.spec().clone();
+        let native = spec.native_id.clone().expect("native id");
+
+        let (mut s, exec) = Session::revive(&spec, "b").unwrap();
+        assert_eq!(s.spec().id, "s1");
+        assert_eq!(s.spec().created_ms, 1);
+        assert_eq!(s.spec().native_id.as_deref(), Some(native.as_str()));
+        assert_eq!(s.spec().title.as_deref(), Some("Fix the build"));
+        assert_eq!(s.spec().labels, spec.labels);
+        assert!(!s.spec().fork && s.spec().parent.is_none());
+        assert!(exec.script.contains("nice claude"), "{}", exec.script);
+        assert!(
+            exec.script.contains(&format!("--resume {native}")),
+            "{}",
+            exec.script
+        );
+        assert!(exec.script.contains("acceptEdits"), "{}", exec.script);
+
+        s.on_launched(&format!("42\nL {}\n", CLAUDE_HI.len()));
+        assert_eq!(
+            s.offset(),
+            CLAUDE_HI.len() as u64,
+            "the earlier run's output is skipped"
+        );
+        s.feed(b"{\"type\":\"keep_alive\"}\n", 3);
+        assert!(s.offset() > CLAUDE_HI.len() as u64);
+        assert!(
+            Session::restore(&snapshot, s.spec().clone()).is_ok(),
+            "snapshots from before still match the session"
+        );
+    }
+
+    #[test]
+    fn revive_resumes_acp_in_protocol() {
+        let (s, _) = Session::launch(req(Harness::Cursor), "s1", "a", 1).unwrap();
+        let mut spec = s.spec().clone();
+        spec.native_id = Some("abc".into());
+        let (s, _) = Session::revive(&spec, "b").unwrap();
+        assert_eq!(s.spec().resume.as_deref(), Some("abc"));
+        assert_eq!(s.spec().launch, spec.launch, "no resume flag on the command line");
+    }
+
+    #[test]
+    fn a_fresh_launch_follows_from_the_start() {
+        let (mut s, _) = Session::launch(req(Harness::Claude), "s1", "a", 1).unwrap();
+        s.on_launched("42\nL 0\n");
+        assert_eq!(s.offset(), 0);
     }
 
     #[test]

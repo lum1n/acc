@@ -26,6 +26,10 @@ pub enum Error {
     /// The session's harness is not running (it exited, or never started).
     #[error("no harness is running in session {0}")]
     NotRunning(String),
+    /// The session can't be revived: it has no `spec.json`, or its harness
+    /// never reported its own session id to resume.
+    #[error("session {0} can't be recovered: its harness never reported a session id")]
+    NotResumable(String),
     #[error("remote script failed (exit {code:?}): {stderr}")]
     Remote { code: Option<u32>, stderr: String },
     #[error(transparent)]

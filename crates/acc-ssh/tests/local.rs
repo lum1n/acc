@@ -179,3 +179,105 @@ async fn exec_feeds_large_input_to_a_script_that_writes_as_it_reads() {
     assert_eq!(out.stdout.len(), input.len());
     assert_eq!(out.code, Some(0));
 }
+
+/// Kills a detached session's harness and its wrapper without either
+/// recording an exit, as a reboot does.
+async fn kill_like_a_reboot(host: &Host, id: &str) {
+    let d = format!("\"$HOME\"/.acc/s/{id}");
+    host.exec(
+        &format!(
+            "p=$(cat {d}/pid); w=$(ps -o ppid= -p \"$p\" | tr -d ' '); kill -KILL \"$w\" \"$p\"; sleep 0.2"
+        ),
+        b"",
+    )
+    .await
+    .expect("kill");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revives_an_interrupted_session_under_the_same_id() {
+    use acc_core::harness::{Harness, Launcher};
+    use acc_ssh::{Session, SessionSpec};
+
+    let host = Arc::new(Host::local());
+    let id = unique("revive");
+    // `cat` stands in for Claude: it echoes what the session writes.
+    let launcher = Launcher {
+        prefix: vec!["sh".into(), "-c".into(), "exec cat".into(), "x".into()],
+        program: None,
+        args: vec![],
+    };
+    let launch = launcher.wrap(Harness::Claude.launch(None));
+    let mut spec = SessionSpec::new(&id, Harness::Claude, "/tmp", launch.clone(), 7);
+    spec.launcher = Some(launcher);
+    spec.title = Some("Before the reboot".into());
+    let pipe = Detached::launch(host.clone(), &id, &launch, "/tmp", Some(&spec.to_json()))
+        .await
+        .expect("launch");
+    pipe.write(b"{\"type\":\"before\"}\n").await.expect("write");
+    while pipe.status().await.expect("status").size() < 18 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    kill_like_a_reboot(&host, &id).await;
+    let listed = list(&host).await.expect("list");
+    let me = listed.iter().find(|l| l.id == id).expect("listed");
+    assert_eq!(me.status, Status::Interrupted { size: 18 });
+
+    // The harness never reported its session id: nothing to resume.
+    assert!(matches!(
+        Session::revive(host.clone(), &id, "t").await,
+        Err(Error::NotResumable(_))
+    ));
+
+    spec.native_id = Some("abc".into());
+    host.exec(
+        &acc_core::detached::SessionDir::new(&id)
+            .expect("id")
+            .write_spec_script(&spec.to_json()),
+        b"",
+    )
+    .await
+    .expect("spec");
+    let revived = Session::revive(host.clone(), &id, "t").await.expect("revive");
+    assert_eq!(revived.pipe().offset(), 18, "reads only the new run");
+    assert!(matches!(
+        revived.pipe().status().await.expect("status"),
+        Status::Alive { .. }
+    ));
+    let listed = list(&host).await.expect("list");
+    let now = listed
+        .iter()
+        .find(|l| l.id == id)
+        .and_then(|l| l.spec_json.as_deref())
+        .and_then(SessionSpec::from_json)
+        .expect("spec");
+    assert_eq!(
+        (now.created_ms, now.title.as_deref()),
+        (7, Some("Before the reboot"))
+    );
+    assert!(
+        now.launch.args.windows(2).any(|w| w == ["--resume", "abc"]),
+        "{:?}",
+        now.launch.args
+    );
+    assert!(
+        now.launch.args.starts_with(&["-c".into(), "exec cat".into()]),
+        "the launcher is kept"
+    );
+
+    // Running again: not revived twice.
+    assert!(matches!(
+        Session::revive(host.clone(), &id, "t").await,
+        Err(Error::Remote { .. })
+    ));
+
+    revived.pipe().stop().await.expect("stop");
+    while !matches!(
+        revived.pipe().status().await.expect("status"),
+        Status::Exited { .. }
+    ) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    revived.pipe().remove().await.expect("remove");
+}

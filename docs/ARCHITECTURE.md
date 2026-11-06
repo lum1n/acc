@@ -215,15 +215,29 @@ attach with `tail -c +OFFSET -f` and write through a `mkdir` lock (FIFO writes a
 session.
 
 Every client reads and writes the same layout under `~/.acc/s/<id>/`, whichever layer started the
-session: `in` (FIFO), `out.ndjson`, `err`, `pid`, `exit`, `spec.json` (one line, a
+session: `in` (FIFO), `out.ndjson`, `err`, `pid`, `boot`, `exit`, `spec.json` (one line, a
 `session::SessionSpec`: harness, cwd, launch command, model, native id, title, labels, launcher),
 `sent` (write ids already delivered), `lock`, and `events.ndjson`, `watch.pid` and `watch.tail`
 while a follower runs (below). The status line is `alive <pid> <log bytes>`,
-`exited <code|-> <log bytes>` or `missing`; the list script prints one `S` line per session plus a
+`exited <code|-> <log bytes>`, `interrupted <log bytes>` or `missing`; the list script prints one `S` line per session plus a
 `J` line with its `spec.json`. Launches fail fast (`EXIT_NO_CWD`) when the directory is missing and
 give up after `LAUNCH_WAIT_TICKS`; `attach_script` heartbeats on stderr and ends when the harness
 does; `write_script` delivers a write whole and at most once per id; `input_script` and
 `write_script` exit `EXIT_NOT_RUNNING` once the harness is gone.
+
+**After a reboot.** The session folder outlasts a reboot, but the harness and its wrapper die without
+writing `exit`. `boot` holds the host's boot id (`/proc/sys/kernel/random/boot_id`, else
+`sysctl kern.boottime`) from when `pid` was written. A PID from another boot, or one whose exit was
+recorded, never counts as running, so status, stop, kill, input and write leave a process that reuses
+the PID alone. Such a session is `interrupted`. Nothing brings it back on its own: the embedder calls
+`Session::revive(spec)` (core, `AccSession.revive` in ffi and wasm) or
+`acc_ssh::Session::revive(host, id)` (`revive_session` in ffi, `reviveSession` in node). Revive
+relaunches the same id from `spec.json` and resumes the harness's own session (`native_id`) with the
+stored model, permission, launcher, worktree, sandbox, title and labels. It fails with
+`NotResumable` when the harness never reported its id, and with `EXIT_RUNNING` while it still runs.
+The new run appends to the same log. The launch output's `L <bytes>` line tells the launching client
+where its own run starts: `on_launched` moves `offset` there, so the new driver never matches the old
+process's replies. Clients that followed the earlier run saw it exit, and they attach again.
 
 **While no client is connected.** Any client can be away (a phone in the background, a closed
 laptop, a shut browser tab). `Session::watch_exec(hook)` starts `watch::watch_script` on the host,
