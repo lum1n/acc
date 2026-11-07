@@ -11,7 +11,7 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-acc-core.workspace = true
+acc-core = { workspace = true, features = ["drivers"] }
 js-sys.workspace = true
 serde.workspace = true
 serde-wasm-bindgen.workspace = true

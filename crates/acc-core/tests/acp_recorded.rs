@@ -2,6 +2,7 @@
 //! 1.18.35 (`acc acp` against a local mock model) and Cursor Agent 2026.10.01
 //! (its own default model), each one shell tool call that needs approval. `*.out.ndjson` is what the agent wrote, `*.in.ndjson` what
 //! ACC wrote back. Paths and request-id tags were normalized after recording.
+#![cfg(feature = "drivers")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use acc_core::Harness;

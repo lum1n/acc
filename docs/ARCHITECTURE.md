@@ -34,6 +34,17 @@
 out. The core never spawns, connects or sleeps, so it behaves identically on every platform and
 every protocol is tested by replaying recorded sessions.
 
+**Two sides.** The core has a host side and a driver side. The host side (`harness`, `detached`,
+`sandbox`, `worktree`, `watch`, `shell`, `exec`, `state`) is what an embedder needs to provision
+a workspace, launch a harness detached, confine it and read back what a host recorded, without
+ever parsing what the harness said; it is always built. The driver side (the protocol drivers,
+`session`, `live`, `policy`, `handoff`, `usage`, `loadout`) is behind the `drivers` feature, on by
+default. `acc-ssh` mirrors the split: `Host` and `Detached` are always there, `Session` needs
+`drivers`. A factory that provisions worktrees and sandboxes in one process and drives agents in
+another builds each with only the side it uses; the host side stays small enough to audit, and
+the boundary is the one a separate crate would get if the split ever needs to be stronger than a
+feature.
+
 ## Driving harnesses
 
 | Harness | Protocol |

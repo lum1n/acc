@@ -1216,7 +1216,7 @@ fn launch_specs() {
         (oc.program.as_str(), oc.args.as_slice()),
         ("opencode", ["acp".to_owned()].as_slice())
     );
-    assert_eq!(oc.protocol, Protocol::Acp);
+    assert_eq!(oc.protocol, crate::harness::Protocol::Acp);
 }
 
 #[test]
