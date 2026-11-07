@@ -27,9 +27,11 @@ use acc_core::state::SessionState;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "loadout")]
 pub mod loadout;
 pub mod session;
 
+#[cfg(feature = "loadout")]
 pub use loadout::*;
 pub use session::*;
 

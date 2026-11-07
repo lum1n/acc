@@ -8,11 +8,11 @@
 //! every protocol testable from recorded fixtures.
 //!
 //! Features:
-//! - `drivers` (default): the protocol drivers, sessions, policy, handoff,
-//!   usage and loadout. Without it the crate is the host side alone:
-//!   [`harness`], [`detached`], [`sandbox`], [`worktree`], [`watch`],
-//!   [`shell`], [`exec`] and [`state`], for an embedder that provisions
-//!   workspaces and inspects sessions but drives none.
+//! - `drivers` (default): the protocol drivers, sessions, policy, handoff and
+//!   usage. Without it the crate is the host side alone: [`harness`],
+//!   [`detached`], [`sandbox`], [`worktree`], [`watch`], [`shell`], [`exec`]
+//!   and [`state`], for an embedder that provisions workspaces and inspects
+//!   sessions but drives none.
 //! - `host`: code that spawns local processes. Off for wasm32 and mobile.
 //!
 //! Layout:
@@ -40,6 +40,9 @@
 //! - [`worktree`]: a git worktree per session, its diff, merge and discard.
 //! - [`sandbox`]: confining a harness with Seatbelt (macOS) or bubblewrap (Linux).
 //! - [`watch`]: session events recorded on the host while no client is connected.
+//!
+//! Skills and MCP servers for every harness live in `acc-loadout`, which
+//! depends on this crate and stays out of a session.
 
 // Host side: what an embedder needs to provision and inspect sessions
 // without driving one. Always built.
@@ -75,8 +78,6 @@ pub mod handoff;
 pub mod item;
 #[cfg(feature = "drivers")]
 pub mod live;
-#[cfg(feature = "drivers")]
-pub mod loadout;
 #[cfg(feature = "drivers")]
 pub mod ndjson;
 #[cfg(feature = "drivers")]

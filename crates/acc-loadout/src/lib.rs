@@ -1,10 +1,10 @@
 //! Skills and MCP servers for every harness, on any host.
 //!
 //! Harnesses read skills from directories of their own and MCP servers from
-//! config files of their own, in their own spellings. This module knows
+//! config files of their own, in their own spellings. This crate knows
 //! those places for every harness ACC drives, at user scope and per
 //! project, and keeps to the sans-IO rule: a client runs the POSIX shell
-//! scripts it hands out (locally or over SSH, like [`crate::worktree`]) and
+//! scripts it hands out (locally or over SSH, like [`acc_core::worktree`]) and
 //! passes the output back to pure functions.
 //!
 //! **Skills** live once in a store, `~/.agents/skills/<name>/SKILL.md` (or
@@ -27,10 +27,9 @@ pub mod mcp;
 pub mod skills;
 pub mod toml;
 
+use acc_core::harness::Harness;
+use acc_core::shell::quote;
 use serde::{Deserialize, Serialize};
-
-use crate::harness::Harness;
-use crate::shell::quote;
 
 /// User-wide configuration or one project's checkout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +47,7 @@ impl Scope {
     fn base(&self) -> String {
         match self {
             Self::User => "\"$HOME\"".to_owned(),
-            Self::Project { dir } => crate::detached::quote_path(dir),
+            Self::Project { dir } => acc_core::detached::quote_path(dir),
         }
     }
 

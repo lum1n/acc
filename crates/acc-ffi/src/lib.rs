@@ -22,12 +22,14 @@ use acc_core::driver::DriverError;
 use acc_core::live as core_session;
 
 pub mod acc_types;
+#[cfg(feature = "loadout")]
 pub mod loadout;
 mod remote;
 pub mod session;
 mod types;
 
 pub use acc_types::*;
+#[cfg(feature = "loadout")]
 pub use loadout::*;
 pub use remote::*;
 pub use session::*;

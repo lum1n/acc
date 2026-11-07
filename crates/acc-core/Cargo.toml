@@ -10,9 +10,10 @@ license.workspace = true
 [features]
 default = ["drivers"]
 # The protocol drivers and everything that reads what a harness says
-# (sessions, policy, handoff, usage, loadout). Off, only the host side is
-# built: harness catalogue, detached-session scripts, sandboxing, worktrees,
-# watch. For embedders that provision workspaces but never drive an agent.
+# (sessions, policy, handoff, usage). Off, only the host side is built:
+# harness catalogue, detached-session scripts, sandboxing, worktrees, watch.
+# For embedders that provision workspaces but never drive an agent.
+# Skills and MCP servers live in `acc-loadout`.
 drivers = []
 # Enables code that spawns local processes. Off for wasm32 and mobile clients.
 host = []

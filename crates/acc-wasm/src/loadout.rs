@@ -1,9 +1,9 @@
-//! Skills and MCP servers for every harness (`acc_core::loadout`): scripts
+//! Skills and MCP servers for every harness (`acc_loadout`): scripts
 //! to run on the host and pure functions over their output. Scopes,
-//! servers, skills and listings are plain objects in the core's serde
+//! servers, skills and listings are plain objects in acc-loadout's serde
 //! shapes (`{scope: "user"}` or `{scope: "project", dir}`).
 
-use acc_core::loadout::{LoadoutError, Scope, mcp, skills};
+use acc_loadout::{LoadoutError, Scope, mcp, skills};
 use wasm_bindgen::prelude::*;
 
 use crate::{AccExec, arg, error, harness, js};
