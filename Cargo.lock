@@ -28,11 +28,22 @@ name = "acc-ffi"
 version = "0.3.0"
 dependencies = [
  "acc-core",
+ "acc-loadout",
  "acc-ssh",
  "serde_json",
  "thiserror",
  "tokio",
  "uniffi",
+]
+
+[[package]]
+name = "acc-loadout"
+version = "0.3.0"
+dependencies = [
+ "acc-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -64,6 +75,7 @@ name = "acc-wasm"
 version = "0.3.0"
 dependencies = [
  "acc-core",
+ "acc-loadout",
  "js-sys",
  "serde",
  "serde-wasm-bindgen",

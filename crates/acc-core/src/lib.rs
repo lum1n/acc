@@ -32,6 +32,9 @@
 //! - [`worktree`]: a git worktree per session, its diff, merge and discard.
 //! - [`sandbox`]: confining a harness with Seatbelt (macOS) or bubblewrap (Linux).
 //! - [`watch`]: session events recorded on the host while no client is connected.
+//!
+//! Skills and MCP servers for every harness live in `acc-loadout`, which
+//! depends on this crate and stays out of a session.
 
 pub mod claude;
 pub mod codex;
@@ -44,7 +47,6 @@ pub mod handoff;
 pub mod harness;
 pub mod item;
 pub mod live;
-pub mod loadout;
 // Harness drivers.
 pub mod acp;
 pub mod ndjson;

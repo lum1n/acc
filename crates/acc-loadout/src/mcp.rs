@@ -14,12 +14,12 @@
 //! | opencode | `opencode.json(c)` | `mcp`, `type: local/remote`, `command` as an array, `enabled` |
 //! | pi | `~/.pi/agent/mcp.json`, `.pi/mcp.json` | `mcpServers`, `url` for HTTP (no SSE), `enabled` |
 
+use acc_core::harness::Harness;
 use serde::{Deserialize, Serialize};
 
 use super::json::{self, Json};
 use super::toml::{self, Toml};
 use super::{LoadoutError, Scope};
-use crate::harness::Harness;
 
 /// How a harness reaches an MCP server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

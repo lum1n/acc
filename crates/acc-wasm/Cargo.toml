@@ -1,6 +1,6 @@
 [package]
 name = "acc-wasm"
-description = "wasm-bindgen bindings (browser, Node) for acc-core"
+description = "wasm-bindgen bindings (browser, Node) for acc-core and acc-loadout"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,14 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["loadout"]
+# Skills and MCP servers. Off leaves them out of the library.
+loadout = ["dep:acc-loadout"]
+
 [dependencies]
 acc-core.workspace = true
+acc-loadout = { workspace = true, optional = true }
 js-sys.workspace = true
 serde.workspace = true
 serde-wasm-bindgen.workspace = true

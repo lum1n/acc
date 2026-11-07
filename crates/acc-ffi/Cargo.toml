@@ -1,6 +1,6 @@
 [package]
 name = "acc-ffi"
-description = "UniFFI bindings (Swift, Kotlin) for acc-core and the acc-ssh transport"
+description = "UniFFI bindings (Swift, Kotlin) for acc-core, acc-loadout, and the acc-ssh transport"
 version.workspace = true
 edition.workspace = true
 # acc-ssh (russh) needs 1.89.
@@ -19,10 +19,14 @@ path = "uniffi-bindgen.rs"
 required-features = ["bindgen"]
 
 [features]
+default = ["loadout"]
 bindgen = ["uniffi/cli"]
+# Skills and MCP servers. Off leaves them out of the library.
+loadout = ["dep:acc-loadout"]
 
 [dependencies]
 acc-core.workspace = true
+acc-loadout = { workspace = true, optional = true }
 acc-ssh.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

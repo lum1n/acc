@@ -28,6 +28,9 @@
    to a detached FIFO/log, or `sh` on this machine)
                 │
    bindings: acc-ffi (Swift, Kotlin) · acc-wasm (JS) · acc-node (Node) · acc-cli
+
+acc-loadout sits beside acc-core: skills and MCP config, still sans-IO.
+acc-ffi and acc-wasm include it unless built with `--no-default-features`.
 ```
 
 **Sans-IO.** Drivers are pure state machines: harness bytes in, `Event`s out; `Command`s in, bytes
@@ -401,8 +404,10 @@ every other; writing a native session file instead (pi's or Claude's JSONL) woul
 undocumented formats and their versions, so ACC doesn't. Drivers alone refuse the command
 (`Unsupported`); the original session keeps running until the client stops it.
 
-**Skills and MCP servers.** Every harness reads skills from a directory of its own and MCP
-servers from a config file of its own, in its own spelling; `loadout` knows those places at user
+**Skills and MCP servers.** `acc-loadout` owns these. It never reads a driver or a live session.
+`acc-ffi` and `acc-wasm` re-export it under the same names with the `loadout` feature, which is on
+by default. Every harness reads skills from a directory of its own and MCP
+servers from a config file of its own, in its own spelling; `acc-loadout` knows those places at user
 scope and per project and follows the script-plus-pure-function rule, so one client manages them on
 the Mac and on any SSH host alike. Skills live once in a store, `~/.agents/skills/<name>/SKILL.md`
 (or `<project>/.agents/skills`, the layout the `skills` CLI uses), and a harness has one when its
@@ -417,8 +422,8 @@ behind), `write_script` and `remove_script` change one thing each and exit `EXIT
 `EXIT_NO_SKILL` when they can't. `skills::issues` checks a `SKILL.md`'s front matter the way the
 spec does. MCP servers stay in the harnesses' files, read into one `McpServer` shape (stdio, HTTP or
 SSE, enabled, plus the harness-specific extras) by `mcp::servers` from `mcp::read_script`'s output,
-and edited by `mcp::upsert`, `mcp::remove` and `mcp::set_enabled` in place: `loadout::json` splices
-one value of a JSON(C) file and `loadout::toml` one table of Codex's `config.toml`, so comments, key
+and edited by `mcp::upsert`, `mcp::remove` and `mcp::set_enabled` in place: `acc_loadout::json` splices
+one value of a JSON(C) file and `acc_loadout::toml` one table of Codex's `config.toml`, so comments, key
 order and the unrelated state those files carry survive. `mcp::write_script` writes the result back
 after a copy to `~/.acc/backups/`. Claude (`~/.claude.json`, `.mcp.json`, `type: stdio/http/sse`),
 Codex (`[mcp_servers.<name>]`), Cursor (`mcp.json`, `url`, `disabled`), Copilot

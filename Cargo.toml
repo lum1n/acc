@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/acc-core", "crates/acc-ssh", "crates/acc-ffi", "crates/acc-wasm", "crates/acc-node", "crates/acc-cli"]
+members = ["crates/acc-core", "crates/acc-loadout", "crates/acc-ssh", "crates/acc-ffi", "crates/acc-wasm", "crates/acc-node", "crates/acc-cli"]
 
 [workspace.package]
 version = "0.3.0"
@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 acc-core = { path = "crates/acc-core" }
+acc-loadout = { path = "crates/acc-loadout" }
 acc-ssh = { path = "crates/acc-ssh" }
 base64 = "0.23"
 serde = { version = "1", features = ["derive"] }

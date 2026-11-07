@@ -6,11 +6,11 @@
 //! other scripts change one thing each and exit [`EXIT_NO_SKILL`] or
 //! [`EXIT_CONFLICT`] when they can't.
 
+use acc_core::harness::Harness;
 use serde::{Deserialize, Serialize};
 
 use super::json::{self, Json};
 use super::{LoadoutError, Scope, SkillPlace, quoted};
-use crate::harness::Harness;
 
 /// Exit code when the skill (or the directory to adopt) isn't there.
 pub const EXIT_NO_SKILL: u32 = 9;
