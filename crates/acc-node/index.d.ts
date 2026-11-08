@@ -102,6 +102,10 @@ export interface Item {
   native: unknown;
   parent: string | null;
   seq: number;
+  /** When the harness says the item began, ms since the Unix epoch (absent where it doesn't time items). */
+  started_at_ms?: number;
+  /** When the harness says the item finished, ms since the Unix epoch. */
+  completed_at_ms?: number;
 }
 
 export interface Usage {
@@ -168,6 +172,8 @@ export interface Spend {
   cache_read_tokens: number;
   cache_write_tokens: number;
   cost_usd: number;
+  /** Cost in units other than US dollars (Copilot's AI Credits), by unit; never part of `cost_usd`. */
+  other_costs?: Record<string, number>;
 }
 
 /** One session's spending, from `AccSession.usageRecord()`. Keep it for sessions that are gone. */

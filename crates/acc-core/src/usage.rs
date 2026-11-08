@@ -23,13 +23,17 @@ pub const BUCKET_MS: u64 = 15 * 60 * 1000;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Tokens and cost spent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Spend {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_usd: f64,
+    /// Cost in units other than US dollars (Copilot's AI Credits), by unit
+    /// ([`crate::event::Cost::currency`]); never part of `cost_usd`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub other_costs: BTreeMap<String, f64>,
 }
 
 impl Spend {
@@ -39,6 +43,9 @@ impl Spend {
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
         self.cost_usd += other.cost_usd;
+        for (unit, amount) in &other.other_costs {
+            *self.other_costs.entry(unit.clone()).or_default() += amount;
+        }
     }
 
     pub fn is_zero(&self) -> bool {
@@ -103,6 +110,18 @@ impl Spending {
             (Some(v), Counting::Total) => growth_u64(last, v),
         };
         let last = &mut self.last;
+        let mut other_costs = BTreeMap::new();
+        if let Some(c) = &usage.other_cost {
+            let amount = match cost {
+                Counting::PerTurn => c.amount,
+                Counting::Total => {
+                    growth_f64(last.other_costs.entry(c.currency.clone()).or_default(), c.amount)
+                }
+            };
+            if amount != 0.0 {
+                other_costs.insert(c.currency.clone(), amount);
+            }
+        }
         let spent = Spend {
             input_tokens: token(&mut last.input_tokens, usage.input_tokens),
             output_tokens: token(&mut last.output_tokens, usage.output_tokens),
@@ -113,6 +132,7 @@ impl Spending {
                 (Some(c), Counting::PerTurn) => c,
                 (Some(c), Counting::Total) => growth_f64(&mut last.cost_usd, c),
             },
+            other_costs,
         };
         if spent.is_zero() {
             return;
@@ -138,13 +158,16 @@ impl Spending {
     pub fn buckets(&self) -> Vec<Bucket> {
         self.buckets
             .iter()
-            .map(|(&start_ms, &spend)| Bucket { start_ms, spend })
+            .map(|(&start_ms, spend)| Bucket {
+                start_ms,
+                spend: spend.clone(),
+            })
             .collect()
     }
 }
 
 /// What was spent in one [`BUCKET_MS`] window.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bucket {
     /// Start of the window, ms since the Unix epoch.
     pub start_ms: u64,
@@ -189,7 +212,7 @@ pub struct DayUsage {
 }
 
 /// What one harness spent.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HarnessSpend {
     pub harness: Harness,
     pub spend: Spend,
@@ -394,6 +417,47 @@ mod tests {
         let t = s.total();
         assert_eq!((t.input_tokens, t.output_tokens), (28, 410));
         assert!((t.cost_usd - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn other_costs_count_growth_per_unit_per_day_and_never_join_dollars() {
+        let credits = |amount: f64, usd: f64| Usage {
+            cost_usd: Some(usd),
+            other_cost: Some(crate::event::Cost {
+                amount,
+                currency: "AI Credits".into(),
+            }),
+            ..Usage::default()
+        };
+        let mut s = Spending::new(Harness::Copilot);
+        s.record(&credits(2.0, 0.0), 0);
+        s.record(&credits(2.0, 0.0), 1);
+        let next_day = DAY_MS as u64;
+        s.record(&credits(5.5, 0.0), next_day);
+        let t = s.total();
+        assert_eq!(t.other_costs.get("AI Credits"), Some(&5.5));
+        assert_eq!(t.cost_usd, 0.0);
+        assert!(!t.is_zero());
+
+        let record = UsageRecord {
+            session_id: "s".into(),
+            harness: Harness::Copilot,
+            buckets: s.buckets(),
+            quota: None,
+            quota_at_ms: None,
+        };
+        let r = roll_up(&[record.clone(), record], 0);
+        assert_eq!(r.total.other_costs.get("AI Credits"), Some(&11.0));
+        let per_day: Vec<_> = r.days.iter().map(|d| d.spend.other_costs["AI Credits"]).collect();
+        assert_eq!(per_day, vec![4.0, 7.0]);
+        assert_eq!(r.accounts[0].spend.other_costs["AI Credits"], 11.0);
+        // Older ledgers without the field still read.
+        let old: Spend = serde_json::from_str(
+            r#"{"input_tokens":1,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.5}"#,
+        )
+        .unwrap();
+        assert!(old.other_costs.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("other_costs"));
     }
 
     #[test]
