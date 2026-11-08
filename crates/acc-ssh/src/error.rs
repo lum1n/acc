@@ -1,3 +1,4 @@
+#[cfg(feature = "drivers")]
 use acc_core::driver::DriverError;
 
 /// Errors from the SSH transport.
@@ -32,6 +33,7 @@ pub enum Error {
     NotResumable(String),
     #[error("remote script failed (exit {code:?}): {stderr}")]
     Remote { code: Option<u32>, stderr: String },
+    #[cfg(feature = "drivers")]
     #[error(transparent)]
     Driver(#[from] DriverError),
     /// A script on this machine couldn't be started ([`crate::Host::local`]).

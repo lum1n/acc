@@ -7,6 +7,14 @@
 //! keeps the core identical on iOS, Android, wasm32 and desktop, and makes
 //! every protocol testable from recorded fixtures.
 //!
+//! Features:
+//! - `drivers` (default): the protocol drivers, sessions, policy, handoff,
+//!   usage and loadout. Without it the crate is the host side alone:
+//!   [`harness`], [`detached`], [`sandbox`], [`worktree`], [`watch`],
+//!   [`shell`], [`exec`] and [`state`], for an embedder that provisions
+//!   workspaces and inspects sessions but drives none.
+//! - `host`: code that spawns local processes. Off for wasm32 and mobile.
+//!
 //! Layout:
 //! - [`harness`]: the six supported CLI harnesses and how to launch them headless.
 //! - [`state`]: canonical session state (OSC 7501 vocabulary) and ranked sources.
@@ -33,34 +41,58 @@
 //! - [`sandbox`]: confining a harness with Seatbelt (macOS) or bubblewrap (Linux).
 //! - [`watch`]: session events recorded on the host while no client is connected.
 
-pub mod claude;
-pub mod codex;
-pub mod command;
+// Host side: what an embedder needs to provision and inspect sessions
+// without driving one. Always built.
 pub mod detached;
-pub mod driver;
-pub mod event;
 pub mod exec;
-pub mod handoff;
 pub mod harness;
-pub mod item;
-pub mod live;
-pub mod loadout;
-// Harness drivers.
-pub mod acp;
-pub mod ndjson;
-pub mod pi;
-pub mod policy;
-pub mod question;
 pub mod sandbox;
-pub mod session;
 pub mod shell;
 pub mod state;
-pub mod transcript;
-pub mod usage;
 pub mod watch;
+// Only `one_line` is used without the drivers.
+#[cfg_attr(not(feature = "drivers"), allow(dead_code))]
 mod wire;
 pub mod worktree;
 
+// Driver side (feature `drivers`, on by default): the protocol drivers and
+// everything that reads what a harness says.
+#[cfg(feature = "drivers")]
+pub mod acp;
+#[cfg(feature = "drivers")]
+pub mod claude;
+#[cfg(feature = "drivers")]
+pub mod codex;
+#[cfg(feature = "drivers")]
+pub mod command;
+#[cfg(feature = "drivers")]
+pub mod driver;
+#[cfg(feature = "drivers")]
+pub mod event;
+#[cfg(feature = "drivers")]
+pub mod handoff;
+#[cfg(feature = "drivers")]
+pub mod item;
+#[cfg(feature = "drivers")]
+pub mod live;
+#[cfg(feature = "drivers")]
+pub mod loadout;
+#[cfg(feature = "drivers")]
+pub mod ndjson;
+#[cfg(feature = "drivers")]
+pub mod pi;
+#[cfg(feature = "drivers")]
+pub mod policy;
+#[cfg(feature = "drivers")]
+pub mod question;
+#[cfg(feature = "drivers")]
+pub mod session;
+#[cfg(feature = "drivers")]
+pub mod transcript;
+#[cfg(feature = "drivers")]
+pub mod usage;
+
+#[cfg(feature = "drivers")]
 pub use event::Event;
 pub use exec::Exec;
 pub use harness::Harness;

@@ -16,7 +16,7 @@ test = false
 doctest = false
 
 [dependencies]
-acc-core.workspace = true
+acc-core = { workspace = true, features = ["drivers"] }
 acc-ssh = { workspace = true, features = ["local"] }
 napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt", "serde-json"] }
 napi-derive = "3"

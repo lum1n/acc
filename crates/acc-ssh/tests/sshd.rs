@@ -6,6 +6,7 @@
 //! unique ids and are removed afterwards.
 
 #![cfg(unix)]
+#![cfg(feature = "drivers")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};

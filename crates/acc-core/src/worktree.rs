@@ -172,7 +172,7 @@ mod tests {
 }
 
 /// The scripts against a real `git`. Unix only.
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "drivers"))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod git_tests {
     use super::*;

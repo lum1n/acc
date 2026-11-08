@@ -9,7 +9,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-acc-core.workspace = true
+acc-core = { workspace = true, default-features = false }
 # Pure-Rust SSH; ring instead of the default aws-lc-rs so iOS and Android
 # builds need no CMake or extra C toolchain.
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
@@ -19,6 +19,11 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [features]
+default = ["drivers"]
+# `Session`: drive a harness over SSH. Off, the crate is `Host` and
+# `Detached` alone: run scripts and follow logs, for embedders that use
+# acc-core's host side only.
+drivers = ["acc-core/drivers"]
 # `Host::local`: this machine's sessions, with `sh` instead of SSH.
 local = ["tokio/process"]
 

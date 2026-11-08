@@ -189,7 +189,7 @@ impl Harness {
                 (a, vec![("PI_PROGRAM_STATUS".into(), "1".into())])
             }
             h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode) => {
-                return crate::acp::launch_spec(h, None);
+                return acp_launch_spec(h, None);
             }
         };
         LaunchSpec {
@@ -316,6 +316,37 @@ pub fn parse_probe(out: &str) -> Vec<Availability> {
         .collect()
 }
 
+/// How to start a harness's ACP server (Cursor, Copilot, opencode). Lives
+/// here rather than in [`crate::acp`] so launching needs no driver. Cursor takes global flags before
+/// the subcommand (`agent --model X acp`).
+pub fn acp_launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
+    let mut args: Vec<String> = Vec::new();
+    let model_flag = |args: &mut Vec<String>| {
+        if let Some(m) = model {
+            args.extend(["--model".to_owned(), m.to_owned()]);
+        }
+    };
+    match harness {
+        Harness::Cursor => {
+            model_flag(&mut args);
+            args.push("acp".into());
+        }
+        Harness::Copilot => {
+            args.push("--acp".into());
+            model_flag(&mut args);
+        }
+        // opencode acp has no model flag; the model is a config option.
+        _ => args.push("acp".into()),
+    }
+    LaunchSpec {
+        program: harness.program().to_owned(),
+        args,
+        env: Vec::new(),
+        protocol: Protocol::Acp,
+        sandbox: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,7 +461,7 @@ mod tests {
     fn acp_harnesses_launch_over_acp() {
         for h in Harness::ALL.into_iter().filter(|h| h.native_acp()) {
             let spec = h.launch(None);
-            assert_eq!(spec, crate::acp::launch_spec(h, None));
+            assert_eq!(spec, acp_launch_spec(h, None));
             assert_eq!(spec.protocol, h.preferred_protocol());
         }
         assert_eq!(Harness::Opencode.launch(None).args, ["acp"]);

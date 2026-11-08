@@ -22,7 +22,7 @@ required-features = ["bindgen"]
 bindgen = ["uniffi/cli"]
 
 [dependencies]
-acc-core.workspace = true
+acc-core = { workspace = true, features = ["drivers"] }
 acc-ssh.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

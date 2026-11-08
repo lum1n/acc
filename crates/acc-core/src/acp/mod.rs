@@ -39,7 +39,7 @@ use crate::command::{
 };
 use crate::driver::{Driver, DriverError};
 use crate::event::{Cost, Event, ItemId, ItemKind, PermissionOption, PermissionOptionKind, Plan, Usage};
-use crate::harness::{Harness, LaunchSpec, Protocol};
+use crate::harness::{Harness, LaunchSpec};
 use crate::item::ItemFeed;
 use crate::ndjson::{Frame, LineFramer};
 use crate::state::{BlockKind, RunState, SessionState, StateSource};
@@ -1796,35 +1796,7 @@ impl AcpDriver {
     }
 }
 
-/// How to start a harness's ACP server. Cursor takes global flags before
-/// the subcommand (`agent --model X acp`).
-pub fn launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
-    let mut args: Vec<String> = Vec::new();
-    let model_flag = |args: &mut Vec<String>| {
-        if let Some(m) = model {
-            args.extend(["--model".to_owned(), m.to_owned()]);
-        }
-    };
-    match harness {
-        Harness::Cursor => {
-            model_flag(&mut args);
-            args.push("acp".into());
-        }
-        Harness::Copilot => {
-            args.push("--acp".into());
-            model_flag(&mut args);
-        }
-        // opencode acp has no model flag; the model is a config option.
-        _ => args.push("acp".into()),
-    }
-    LaunchSpec {
-        program: harness.program().to_owned(),
-        args,
-        env: Vec::new(),
-        protocol: Protocol::Acp,
-        sandbox: None,
-    }
-}
+pub use crate::harness::acp_launch_spec as launch_spec;
 
 fn push_prompt(items: &mut ItemFeed, id: ItemId, text: &str, out: &mut Vec<Event>) {
     items.start(id.clone(), ItemKind::UserMessage, None, Value::Null, out);

@@ -11,7 +11,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-acc-core = { path = "crates/acc-core" }
+acc-core = { path = "crates/acc-core", default-features = false }
 acc-ssh = { path = "crates/acc-ssh" }
 base64 = "0.23"
 serde = { version = "1", features = ["derive"] }

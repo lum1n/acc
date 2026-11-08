@@ -28,18 +28,22 @@ mod detached;
 mod error;
 mod host;
 mod keys;
+#[cfg(feature = "drivers")]
 mod session;
 
 pub use detached::{Detached, Read, Retry, list};
 pub use error::Error;
 pub use host::{AgentSocket, Auth, Host, HostKeyCheck, Output, SshConfig, Stream, StreamMsg};
 pub use keys::{KeyPair, generate_key};
+#[cfg(feature = "drivers")]
 pub use session::Session;
 
 /// Re-exported so callers can name session listings, statuses and specs.
 pub use acc_core::detached::{Listing, Status};
 /// Re-exported so callers can configure a [`Session`] without naming acc-core.
+#[cfg(feature = "drivers")]
 pub use acc_core::live::{Opening, SessionConfig};
+#[cfg(feature = "drivers")]
 pub use acc_core::session::SessionSpec;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

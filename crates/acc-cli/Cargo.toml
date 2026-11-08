@@ -12,7 +12,7 @@ name = "acc"
 path = "src/main.rs"
 
 [dependencies]
-acc-core = { workspace = true, features = ["host"] }
+acc-core = { workspace = true, features = ["drivers", "host"] }
 acc-ssh.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }

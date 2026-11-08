@@ -24,6 +24,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The host side alone (no drivers) must build and lint clean.
+      - run: cargo clippy -p acc-core -p acc-ssh --no-default-features --all-targets -- -D warnings
 
   test:
     strategy:
@@ -36,6 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - run: cargo test -p acc-core -p acc-ssh --no-default-features
 
   # Drives a real OpenSSH server through a proxy that drops connections.
   ssh:
