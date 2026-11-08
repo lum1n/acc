@@ -116,7 +116,9 @@ items through an `item::ItemFeed`, which merges the native frames of an item and
 far (a client replaces the detail it had, never merges), and `ItemCompleted` with its
 `ItemStatus`. Where the harness times its items (Codex 0.166's `startedAtMs`/`completedAtMs`),
 `ItemStarted` carries `started_at_ms` and `ItemCompleted` `completed_at_ms`, in epoch milliseconds;
-elsewhere they are `None`. The detail is the same shape on every harness:
+elsewhere they are `None`. The transcript's `Item` keeps both (a later frame without a time
+keeps the earlier one), so snapshots keep them, and `Item::duration_ms` gives the run time when
+both ends are known. The detail is the same shape on every harness:
 
 | Detail | Carries |
 |---|---|
@@ -394,7 +396,9 @@ running total for cost. `usage::Spending` turns a session's `Usage` events into 
 quarter-hour buckets (every UTC offset in use is a multiple of 15 minutes), and
 `Session::usage_record` hands it out with the newest quota the session reported. `usage::roll_up`
 adds records up per account (or plan, when the harness names no account), keeping each quota
-window's newest reading, and per local day in the time zone the client gives. Clients keep records
+window's newest reading, and per local day in the time zone the client gives. Cost in other units
+(`Usage::other_cost`, Copilot's AI Credits) is counted the same way into `Spend::other_costs`, one
+total per unit, and never added to `cost_usd`. Clients keep records
 of removed sessions to count them. The log has no times, so usage replayed on attach is dated to the
 session's start; usage read live is dated by the client's clock, and snapshots keep the dates.
 Those dates can't order quota readings across sessions, so `roll_up` orders them by the readings

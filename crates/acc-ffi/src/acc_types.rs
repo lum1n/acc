@@ -662,6 +662,10 @@ pub struct AccItem {
     pub native_json: String,
     pub parent: Option<String>,
     pub seq: u64,
+    /// When the harness says the item began, ms since the Unix epoch.
+    pub started_at_ms: Option<u64>,
+    /// When the harness says the item finished, ms since the Unix epoch.
+    pub completed_at_ms: Option<u64>,
 }
 
 pub fn item(i: &Item) -> AccItem {
@@ -674,6 +678,8 @@ pub fn item(i: &Item) -> AccItem {
         native_json: json(&i.native),
         parent: i.parent.clone(),
         seq: i.seq,
+        started_at_ms: i.started_at_ms,
+        completed_at_ms: i.completed_at_ms,
     }
 }
 
@@ -1437,13 +1443,16 @@ impl From<Availability> for AccAvailability {
 }
 
 /// Tokens and cost spent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, uniffi::Record)]
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
 pub struct AccSpend {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_usd: f64,
+    /// Cost in units other than US dollars (Copilot's AI Credits), one per
+    /// unit; never part of `cost_usd`.
+    pub other_costs: Vec<AccCost>,
 }
 
 impl From<Spend> for AccSpend {
@@ -1454,6 +1463,11 @@ impl From<Spend> for AccSpend {
             cache_read_tokens: s.cache_read_tokens,
             cache_write_tokens: s.cache_write_tokens,
             cost_usd: s.cost_usd,
+            other_costs: s
+                .other_costs
+                .into_iter()
+                .map(|(currency, amount)| AccCost { amount, currency })
+                .collect(),
         }
     }
 }
@@ -1466,12 +1480,17 @@ impl From<AccSpend> for Spend {
             cache_read_tokens: s.cache_read_tokens,
             cache_write_tokens: s.cache_write_tokens,
             cost_usd: s.cost_usd,
+            other_costs: s
+                .other_costs
+                .into_iter()
+                .map(|c| (c.currency, c.amount))
+                .collect(),
         }
     }
 }
 
 /// What was spent in one quarter of an hour.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct AccBucket {
     /// Start of the window, ms since the Unix epoch.
     pub start_ms: u64,
@@ -1553,7 +1572,7 @@ impl From<AccountUsage> for AccAccountUsage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct AccHarnessSpend {
     pub harness: AccHarness,
     pub spend: AccSpend,

@@ -33,6 +33,21 @@ pub struct Item {
     pub parent: Option<ItemId>,
     /// Position in the session, for stable ordering across reloads.
     pub seq: u64,
+    /// When the harness says the item began, ms since the Unix epoch;
+    /// `None` where it doesn't time items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    /// When the harness says the item finished, ms since the Unix epoch;
+    /// `None` until then, and where it doesn't time items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+impl Item {
+    /// How long the item ran, when the harness timed both ends.
+    pub fn duration_ms(&self) -> Option<u64> {
+        Some(self.completed_at_ms?.saturating_sub(self.started_at_ms?))
+    }
 }
 
 /// What an event did to the transcript.
@@ -223,6 +238,8 @@ impl Transcript {
             native: Value::Null,
             parent: None,
             seq: self.next_seq,
+            started_at_ms: None,
+            completed_at_ms: None,
         });
         let last = self.items.len() - 1;
         (&mut self.items[last], true)
@@ -237,11 +254,14 @@ impl Transcript {
                 kind,
                 parent,
                 detail,
+                started_at_ms,
                 native,
-                ..
             } => {
                 let (item, new) = self.slot(id, *kind);
                 item.kind = *kind;
+                if started_at_ms.is_some() {
+                    item.started_at_ms = *started_at_ms;
+                }
                 item.detail = detail.clone();
                 merge(&mut item.native, native);
                 if parent.is_some() {
@@ -272,12 +292,15 @@ impl Transcript {
                 id,
                 status,
                 detail,
+                completed_at_ms,
                 native,
-                ..
             } => {
                 let &i = self.index.get(id)?;
                 let item = &mut self.items[i];
                 item.status = *status;
+                if completed_at_ms.is_some() {
+                    item.completed_at_ms = *completed_at_ms;
+                }
                 item.detail = detail.clone();
                 merge(&mut item.native, native);
                 Some(ItemChange::Completed { id: id.clone() })
@@ -413,6 +436,39 @@ mod tests {
         assert!(f.t.settle(&Event::TurnCompleted).is_empty());
         assert_eq!(f.t.get("bg").unwrap().status, ItemStatus::Running);
         assert_eq!(f.t.settle(&Event::Exited { code: Some(0) }).len(), 1);
+    }
+
+    #[test]
+    fn items_keep_the_harness_times_through_a_snapshot() {
+        let mut t = Transcript::new();
+        let started = |at: Option<u64>| Event::ItemStarted {
+            id: "c1".into(),
+            kind: ItemKind::CommandExecution,
+            parent: None,
+            detail: ItemDetail::Text,
+            started_at_ms: at,
+            native: Value::Null,
+        };
+        t.apply(&started(Some(1_000)));
+        // A later start frame without a time keeps the first one.
+        t.apply(&started(None));
+        assert_eq!(t.get("c1").unwrap().duration_ms(), None);
+        t.apply(&Event::ItemCompleted {
+            id: "c1".into(),
+            status: ItemStatus::Completed,
+            detail: ItemDetail::Text,
+            completed_at_ms: Some(3_500),
+            native: Value::Null,
+        });
+        let item = t.get("c1").unwrap();
+        assert_eq!(
+            (item.started_at_ms, item.completed_at_ms),
+            (Some(1_000), Some(3_500))
+        );
+        assert_eq!(item.duration_ms(), Some(2_500));
+
+        let back: Transcript = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.get("c1").unwrap().duration_ms(), Some(2_500));
     }
 
     #[test]
