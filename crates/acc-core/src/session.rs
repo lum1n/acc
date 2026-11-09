@@ -64,7 +64,9 @@ pub struct LaunchRequest {
     /// Copilot, opencode); see [`resolve_dir_script`].
     pub cwd: String,
     pub model: Option<String>,
-    /// Claude permission mode, or Codex permission profile.
+    /// Permission / yolo mode for the harness: Claude permission mode, Codex
+    /// permission profile (`:workspace`) or approval policy (`never`), Cursor
+    /// `yolo`/`auto-review`, opencode `auto`, Copilot `allow_all`.
     pub permission: Option<String>,
     /// Harness session to resume (Claude session id, Codex thread id, ACP
     /// session id, pi session file).
@@ -315,15 +317,18 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
             // when the embedder named it.
             auto_title: !attach && spec.resume.is_none() && spec.title.is_none(),
         })),
-        Harness::Codex => Box::new(CodexDriver::new(CodexConfig {
-            resume,
-            // The process already runs in the session's directory.
-            cwd: None,
-            model: spec.model.clone(),
-            approval_policy: None,
-            permissions: spec.permission.clone(),
-            client_tag: Some(tag.to_owned()),
-        })),
+        Harness::Codex => {
+            let (approval_policy, permissions) = codex_permission_split(spec.permission.as_deref());
+            Box::new(CodexDriver::new(CodexConfig {
+                resume,
+                // The process already runs in the session's directory.
+                cwd: None,
+                model: spec.model.clone(),
+                approval_policy,
+                permissions,
+                client_tag: Some(tag.to_owned()),
+            }))
+        }
         Harness::Pi => Box::new(PiDriver::with_id_prefix(tag)),
         h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode) => {
             let start = match (attach, resume) {
@@ -334,8 +339,22 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
             let mut cfg = AcpConfig::new(spec.cwd.clone(), start);
             cfg.client_tag = tag.to_owned();
             cfg.model = spec.model.clone();
+            cfg.permission = spec.permission.clone();
             Box::new(AcpDriver::new(h, cfg))
         }
+    }
+}
+
+/// Splits a launch permission into Codex `approvalPolicy` vs profile id.
+/// Profiles are `:read-only`, `:workspace`, `:danger-full-access` (and custom
+/// ones). Approval policies are `untrusted`, `on-request`, `never`.
+fn codex_permission_split(permission: Option<&str>) -> (Option<String>, Option<String>) {
+    match permission.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) if matches!(p, "untrusted" | "on-request" | "never") => {
+            (Some(p.to_owned()), None)
+        }
+        Some(p) => (None, Some(p.to_owned())),
+        None => (None, None),
     }
 }
 
@@ -404,7 +423,9 @@ impl Session {
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
-            h if h.native_acp() => acp_launch(h, spec.model.as_deref()),
+            h if h.native_acp() => {
+                acp_launch(h, spec.model.as_deref(), spec.permission.as_deref())
+            }
             Harness::Codex => Harness::Codex.launch(None),
             _ => driver.launch(spec.resume.as_deref()),
         };

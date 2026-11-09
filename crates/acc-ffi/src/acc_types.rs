@@ -1184,7 +1184,8 @@ pub struct AccLaunchRequest {
     /// Absolute for Cursor, Copilot and opencode (see `resolve_dir_exec`).
     pub cwd: String,
     pub model: Option<String>,
-    /// Claude permission mode, or Codex permission profile.
+    /// Permission / yolo mode: Claude mode, Codex profile or approval policy,
+    /// Cursor `yolo`/`auto-review`, opencode `auto`, Copilot `allow_all`.
     pub permission: Option<String>,
     pub resume: Option<String>,
     pub fork: bool,

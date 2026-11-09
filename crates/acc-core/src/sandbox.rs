@@ -533,7 +533,7 @@ mod tests {
         };
         let cursor = argv_script(
             &rules(Harness::Cursor, &Sandbox::default()),
-            &launcher.wrap(crate::harness::acp_launch_spec(Harness::Cursor, Some("gpt-5"))),
+            &launcher.wrap(crate::harness::acp_launch_spec(Harness::Cursor, Some("gpt-5"), None)),
         );
         assert!(cursor.contains(
             "set -- \"$@\" nice agent --model gpt-5\n\

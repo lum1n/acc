@@ -88,6 +88,10 @@ pub struct AcpConfig {
     /// Model passed on the command line (`--model`), for agents that only
     /// take it at spawn (Cursor) or to pick the first turn's model.
     pub model: Option<String>,
+    /// Permission / yolo mode at spawn: Cursor `--yolo`/`--auto-review`,
+    /// opencode `--auto`, or Copilot `allow_all` after the session opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<String>,
 }
 
 impl AcpConfig {
@@ -97,6 +101,7 @@ impl AcpConfig {
             start,
             client_tag: "acc".into(),
             model: None,
+            permission: None,
         }
     }
 }
@@ -228,6 +233,8 @@ impl AcpDriver {
             spawn_model: cfg.model.clone(),
             ..OptionState::default()
         };
+        opts.spawn_model = cfg.model.clone();
+        opts.spawn_permission = cfg.permission.as_ref().map(|p| normalize_permission(harness, p));
         opts.rebuild(harness);
         let attach = cfg.start == Start::Attach;
         let mut d = Self {
@@ -422,9 +429,13 @@ impl AcpDriver {
     /// Sends `/name args` if the agent advertises one of `names`, or if the
     /// harness is known to handle the first name without advertising it.
     fn slash(&mut self, names: &[&str], args: &str, what: &'static str) -> Result<Vec<u8>, DriverError> {
-        let advertised = names
-            .iter()
-            .find(|n| self.harness_commands.iter().any(|c| c.name == **n));
+        let advertised = names.iter().find(|n| {
+            self.harness_commands.iter().any(|c| c.name == **n)
+                || self
+                    .commands
+                    .iter()
+                    .any(|c| c.name == **n && c.exec == Exec::Text)
+        });
         // opencode 1.18.35 runs `/compact` over ACP without listing it.
         let known = names
             .first()
@@ -672,6 +683,8 @@ impl AcpDriver {
         self.opts.rebuild(self.harness);
         self.session_id = Some(session_id.clone());
         let bytes = self.apply_startup_model();
+        self.outgoing.extend(bytes);
+        let bytes = self.apply_startup_permission();
         self.outgoing.extend(bytes);
         out.push(Event::SessionStarted {
             harness: self.harness,
@@ -1445,6 +1458,11 @@ impl AcpDriver {
     /// then pickers for the options the agent reports.
     fn rebuild_commands(&mut self) {
         let mut all = self.harness_commands.clone();
+        // TUI builtins the agent does not advertise over ACP (Cursor skills-
+        // only updates; sparse opencode lists). Overlay without replacing ads.
+        for entry in static_builtins(self.harness) {
+            offer(&mut all, entry);
+        }
         let rpc =
             |name: &str, description: &str, method: &str| CommandEntry::rpc(name, description, None, method);
         offer(
@@ -1481,7 +1499,137 @@ impl AcpDriver {
                 CommandEntry::rpc(name, description, Some("<value>"), method),
             );
         }
+        // Wire known names to option pickers even when listed as Text.
+        for (id, name, _) in OPTION_COMMANDS {
+            if self.opts.route(id).is_none() {
+                continue;
+            }
+            if let Some(e) = all.iter_mut().find(|e| e.name == *name) {
+                e.input = CommandInput::Option { id };
+            }
+        }
+        if self.harness == Harness::Cursor {
+            for name in ["plan", "ask"] {
+                if let Some(e) = all.iter_mut().find(|e| e.name == name) {
+                    e.exec = Exec::Rpc {
+                        method: "session/set_mode".into(),
+                    };
+                }
+            }
+            if let Some(e) = all.iter_mut().find(|e| e.name == "summarize") {
+                e.exec = Exec::Text;
+            }
+            if let Some(e) = all.iter_mut().find(|e| e.name == "clear") {
+                e.exec = Exec::Rpc {
+                    method: "session/new".into(),
+                };
+            }
+        }
+        // Upgrade static Terminal stubs once we have a live route / capability.
+        for (id, name, _) in OPTION_COMMANDS {
+            if self.opts.route(id).is_none() {
+                continue;
+            }
+            if let Some(e) = all.iter_mut().find(|e| e.name == *name) {
+                if matches!(e.exec, Exec::Terminal) {
+                    e.exec = Exec::Rpc {
+                        method: match self.opts.route(id) {
+                            Some(Route::SpawnFlag) => "restart".into(),
+                            Some(Route::Config { .. }) => "session/set_config_option".into(),
+                            Some(Route::LegacyMode) => "session/set_mode".into(),
+                            Some(Route::LegacyModel) => "session/set_model".into(),
+                            None => continue,
+                        },
+                    };
+                }
+                e.input = CommandInput::Option { id };
+            }
+        }
+        if self.fork_session
+            && let Some(e) = all.iter_mut().find(|e| e.name == "fork")
+        {
+            e.exec = Exec::Rpc {
+                method: "session/fork".into(),
+            };
+        }
         self.commands = all;
+    }
+}
+
+/// Built-in TUI slash commands ACP does not list (or under-lists).
+fn static_builtins(harness: Harness) -> Vec<CommandEntry> {
+    let term = |name: &str, description: &str| CommandEntry {
+        name: name.into(),
+        description: description.into(),
+        arg_hint: None,
+        source: CommandSource::Builtin,
+        exec: Exec::Terminal,
+        input: CommandInput::None,
+    };
+    match harness {
+        Harness::Cursor => vec![
+            term("ask", "Toggle ask mode (Q&A, read-only)"),
+            term("btw", "Ask on the side without disrupting the main chat"),
+            term("clear", "Start a new chat session"),
+            term("config", "Configure CLI settings interactively"),
+            term("copy", "Copy a previous message to the clipboard"),
+            term("copy-conversation-id", "Copy current conversation ID"),
+            term("copy-request-id", "Copy last request ID"),
+            term("debug", "Toggle debug mode"),
+            term("exit", "Exit"),
+            term("fork", "Fork the current chat into a new session"),
+            term("goal", "Start a durable goal that continues while idle"),
+            term("logout", "Sign out from Cursor"),
+            term("logs", "Show the current debug log file path"),
+            term("mcp", "Manage MCP servers"),
+            term("model", "Select model"),
+            term("plan", "Create a plan or show the existing plan"),
+            term("plugin", "Manage plugins"),
+            term("quit", "Exit"),
+            term("rewind", "Jump back to a previous message"),
+            term("summarize", "Summarize the conversation to free context"),
+            term("team", "Switch the active team"),
+            term("update", "Update Cursor Agent"),
+        ],
+        Harness::Opencode => vec![
+            CommandEntry {
+                source: CommandSource::Builtin,
+                exec: Exec::Text,
+                ..CommandEntry::rpc("compact", "Summarize the conversation to free context", None, "")
+            },
+            term("new", "Start a new session"),
+            term("sessions", "Browse sessions"),
+            term("model", "Select model"),
+            term("agent", "Select agent / mode"),
+            term("theme", "Change theme"),
+            term("editor", "Open external editor"),
+            term("help", "Show help"),
+            term("exit", "Exit"),
+            term("share", "Share the session"),
+            term("export", "Export the session"),
+            term("undo", "Undo the last message"),
+            term("redo", "Redo an undone message"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn normalize_permission(harness: Harness, raw: &str) -> String {
+    let p = raw.trim().to_ascii_lowercase();
+    match harness {
+        Harness::Cursor => match p.as_str() {
+            "yolo" | "force" | "unrestricted" | "run-everything" | "bypass" => "yolo".into(),
+            "auto-review" | "auto_review" | "auto" => "auto-review".into(),
+            _ => "default".into(),
+        },
+        Harness::Opencode => {
+            if crate::harness::opencode_auto(Some(&p)) {
+                "auto".into()
+            } else {
+                "default".into()
+            }
+        }
+        _ => raw.to_owned(),
     }
 }
 
@@ -1509,7 +1657,11 @@ impl Driver for AcpDriver {
     /// The ACP entry point. Resume happens in-protocol ([`Start::Resume`]),
     /// so `resume` doesn't change the command line.
     fn launch(&self, _resume: Option<&str>) -> LaunchSpec {
-        launch_spec(self.harness, self.opts.spawn_model.as_deref())
+        launch_spec(
+            self.harness,
+            self.opts.spawn_model.as_deref(),
+            self.opts.spawn_permission.as_deref(),
+        )
     }
 
     fn handshake(&mut self) -> Vec<u8> {
@@ -1710,12 +1862,23 @@ impl AcpDriver {
     /// agent's are sent as `/name args` prompt text.
     fn invoke(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
         let name = name.trim_start_matches('/');
+        let entry = self.commands.iter().find(|e| e.name == name);
+        if entry.is_some_and(|e| e.exec == Exec::Terminal) {
+            return Err(self.unsupported("this command outside its terminal UI"));
+        }
         match name {
             "interrupt" => self.command(Command::Interrupt),
-            "new" => self.command(Command::New),
+            "new" | "clear" => self.command(Command::New),
             "fork" => self.command(Command::Fork),
+            "summarize" if self.harness == Harness::Cursor => self.command(Command::Compact {
+                hint: Some(args.to_owned()).filter(|a| !a.trim().is_empty()),
+            }),
+            "plan" | "ask" if self.harness == Harness::Cursor => self.command(Command::SetOption {
+                id: OptionId::Mode,
+                value: name.to_owned(),
+            }),
             // An option picker the agent doesn't list as its own command.
-            _ if !self.harness_commands.iter().any(|c| c.name == name)
+            _ if entry.is_some_and(|e| matches!(e.input, CommandInput::Option { .. }))
                 && let Some((id, ..)) = OPTION_COMMANDS.iter().find(|(_, n, _)| *n == name) =>
             {
                 let value = args.trim();
@@ -1730,7 +1893,9 @@ impl AcpDriver {
             "compact" if self.harness == Harness::Opencode => self.command(Command::Compact {
                 hint: Some(args.to_owned()).filter(|a| !a.trim().is_empty()),
             }),
-            _ if self.harness_commands.iter().any(|c| c.name == name) => {
+            _ if self.harness_commands.iter().any(|c| c.name == name)
+                || entry.is_some_and(|e| e.exec == Exec::Text) =>
+            {
                 let text = if args.is_empty() {
                     format!("/{name}")
                 } else {
@@ -1757,6 +1922,33 @@ impl AcpDriver {
         self.set_option(OptionId::Model, model).unwrap_or_default()
     }
 
+    /// Copilot's `allow_all` is a live config option; honour launch permission.
+    fn apply_startup_permission(&mut self) -> Vec<u8> {
+        if self.harness != Harness::Copilot {
+            return Vec::new();
+        }
+        let Some(raw) = self.cfg.permission.clone() else {
+            return Vec::new();
+        };
+        let on = matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "auto" | "yolo" | "allow_all" | "allow-all" | "on" | "true"
+        );
+        let value = if on { "true" } else { "false" };
+        if self
+            .opts
+            .defs
+            .iter()
+            .find(|d| d.id == OptionId::Permission)
+            .and_then(|d| d.current.as_deref())
+            == Some(value)
+        {
+            return Vec::new();
+        }
+        self.set_option(OptionId::Permission, value.into())
+            .unwrap_or_default()
+    }
+
     fn set_option(&mut self, id: OptionId, value: String) -> Result<Vec<u8>, DriverError> {
         let route = self
             .opts
@@ -1768,6 +1960,13 @@ impl AcpDriver {
         if self.harness == Harness::Cursor && id == OptionId::Model {
             self.opts.spawn_model = Some(value.clone());
             self.opts.rebuild(self.harness);
+        }
+        if matches!(self.harness, Harness::Cursor | Harness::Opencode) && id == OptionId::Permission
+        {
+            self.opts.spawn_permission = Some(normalize_permission(self.harness, &value));
+            self.cfg.permission = self.opts.spawn_permission.clone();
+            self.opts.rebuild(self.harness);
+            self.rebuild_commands();
         }
         match route {
             Route::SpawnFlag => Ok(Vec::new()),

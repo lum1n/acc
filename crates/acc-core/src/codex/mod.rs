@@ -115,6 +115,8 @@ struct Overrides {
     effort: Option<String>,
     mode: Option<String>,
     permissions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<String>,
 }
 
 /// Codex app-server driver. See the module docs.
@@ -1184,9 +1186,17 @@ impl CodexDriver {
             },
             OptionDef {
                 id: OptionId::Permission,
-                values: self.profiles.clone(),
+                values: {
+                    let mut v = self.profiles.clone();
+                    for p in ["untrusted", "on-request", "never"] {
+                        if !v.iter().any(|x| x == p) {
+                            v.push(p.into());
+                        }
+                    }
+                    v
+                },
                 labels: Vec::new(),
-                current: permission,
+                current: permission.or_else(|| self.config.approval_policy.clone()),
                 apply: Apply::NextTurn,
             },
         ];
@@ -1241,6 +1251,10 @@ impl CodexDriver {
         if let Some(p) = &o.permissions {
             params["permissions"] = json!(p);
             self.permission = Some(p.clone());
+        }
+        if let Some(p) = &o.approval_policy {
+            params["approvalPolicy"] = json!(p);
+            self.config.approval_policy = Some(p.clone());
         }
         if let Some(mode) = &o.mode {
             params["collaborationMode"] = json!({
@@ -1396,7 +1410,13 @@ impl Driver for CodexDriver {
                     }
                     OptionId::Effort => self.overrides.effort = Some(value),
                     OptionId::Mode => self.overrides.mode = Some(value),
-                    OptionId::Permission => self.overrides.permissions = Some(value),
+                    OptionId::Permission => {
+                        if matches!(value.as_str(), "untrusted" | "on-request" | "never") {
+                            self.overrides.approval_policy = Some(value);
+                        } else {
+                            self.overrides.permissions = Some(value);
+                        }
+                    }
                 }
                 self.rebuild_options();
                 Ok(Vec::new())
