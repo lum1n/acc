@@ -91,10 +91,11 @@ resize first. Transcripts show a prompt's text, or `[image]` when it had none.
 sends `initialize`, then opens the session itself (`session/new`, or `session/load` / `session/resume`
 to resume), so transports write `Driver::poll_transmit()` after every `on_output`. Options come from
 the agent's `configOptions` (categories `model`, `mode`, `thought_level`, Copilot's `allow_all`), with the
-legacy `modes`/`models` fields and `session/set_mode`/`session/set_model` as fallback. Cursor's model is a
-spawn flag (`agent --model X acp`), reported as `Apply::Restart`. Slash commands are prompt text, taken
-from `available_commands_update`; rename uses `session/set_title` and `/new` closes the old session
-(`session/close`) when the agent offers them. Form elicitations (`elicitation/create`, opencode's
+legacy `modes`/`models` fields and `session/set_mode`/`session/set_model` as fallback. Cursor's model and
+permission (`--yolo` / `--auto-review`) and opencode's `--auto` are spawn flags, reported as
+`Apply::Restart`. Slash commands come from `available_commands_update`, plus ACC's static TUI catalogs
+for Cursor and opencode (Rpc/Text where headless, else `Exec::Terminal`); rename uses `session/set_title`
+and `/new` closes the old session (`session/close`) when the agent offers them. Form elicitations (`elicitation/create`, opencode's
 question tool) are `BlockKind::Question` requests whose `native` carries the form's fields as
 `questions`; `$/cancel_request` withdraws a waiting permission or question. A cost in a unit other
 than dollars (Copilot's AI Credits) is `Usage::other_cost`, never summed with `cost_usd`. Request ids carry a per-client tag, and `Start::Attach` lets a second
@@ -157,12 +158,18 @@ describe what a client has to draw:
   `/plan [<description>]` is `set_permission_mode` into plan mode, the description sent as the first
   prompt once Claude confirms, and `get_plan` as a panel when already planning.
 
-| Harness | Pickers | Panels |
-|---|---|---|
-| Claude | model, effort, mode (permission mode), output-style | mcp (reconnect, enable, disable), status, permissions, memory, hooks, plan (the session plan); reload-plugins |
-| Codex | model, effort, mode, permissions | mcp (reload, OAuth login), status, experimental (toggle) |
-| Cursor, Copilot, opencode | whatever `configOptions` reports | none: ACP has no such requests |
-| pi | model, thinking | session, settings (auto-compaction, queueing), fork (pick a message); export |
+| Harness | Pickers | Panels | Permission / yolo |
+|---|---|---|---|
+| Claude | model, effort, mode (permission mode), output-style | mcp (reconnect, enable, disable), status, permissions, memory, hooks, plan (the session plan); reload-plugins | live `set_permission_mode` (`auto`, `dontAsk`, …) |
+| Codex | model, effort, mode, permissions (profiles + `untrusted`/`on-request`/`never`) | mcp (reload, OAuth login), status, experimental (toggle) | profiles on next turn; approval policy at thread start / next turn |
+| Cursor | `configOptions` plus spawn model/permission | none: ACP has no such requests; TUI builtins listed as Rpc/Text/Terminal | spawn `--yolo` / `--auto-review` (`Apply::Restart`) |
+| Copilot | `configOptions` including `allow_all` | none | live `allow_all`; launch permission applied after `session/new` |
+| opencode | `configOptions` plus spawn permission | none; injects `/compact` and other TUI stubs | spawn `--auto` (`Apply::Restart`) |
+| pi | model, thinking | session, settings, fork, tree, copy; export | no harness gate (tools run freely; ACC `Policy` auto-answers extension dialogs) |
+
+Slash palettes follow Claude's model: discover what the harness lists, upgrade interactive
+entries to protocol/pickers/panels, inject known TUI builtins the protocol omits, and mark the
+rest `Exec::Terminal`.
 
 ## Bindings
 

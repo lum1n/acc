@@ -189,7 +189,7 @@ impl Harness {
                 (a, vec![("PI_PROGRAM_STATUS".into(), "1".into())])
             }
             h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode) => {
-                return acp_launch_spec(h, None);
+                return acp_launch_spec(h, None, None);
             }
         };
         LaunchSpec {
@@ -318,8 +318,8 @@ pub fn parse_probe(out: &str) -> Vec<Availability> {
 
 /// How to start a harness's ACP server (Cursor, Copilot, opencode). Lives
 /// here rather than in [`crate::acp`] so launching needs no driver. Cursor takes global flags before
-/// the subcommand (`agent --model X acp`).
-pub fn acp_launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
+/// the subcommand (`agent --model X [--yolo|--auto-review] acp`).
+pub fn acp_launch_spec(harness: Harness, model: Option<&str>, permission: Option<&str>) -> LaunchSpec {
     let mut args: Vec<String> = Vec::new();
     let model_flag = |args: &mut Vec<String>| {
         if let Some(m) = model {
@@ -329,13 +329,22 @@ pub fn acp_launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
     match harness {
         Harness::Cursor => {
             model_flag(&mut args);
+            if let Some(flag) = cursor_permission_flag(permission) {
+                args.push(flag.into());
+            }
             args.push("acp".into());
         }
         Harness::Copilot => {
             args.push("--acp".into());
             model_flag(&mut args);
         }
-        // opencode acp has no model flag; the model is a config option.
+        // opencode: model is a config option; `--auto` is a global flag.
+        Harness::Opencode => {
+            if opencode_auto(permission) {
+                args.push("--auto".into());
+            }
+            args.push("acp".into());
+        }
         _ => args.push("acp".into()),
     }
     LaunchSpec {
@@ -345,6 +354,23 @@ pub fn acp_launch_spec(harness: Harness, model: Option<&str>) -> LaunchSpec {
         protocol: Protocol::Acp,
         sandbox: None,
     }
+}
+
+/// Cursor CLI flag for a permission / yolo mode, if any.
+pub fn cursor_permission_flag(permission: Option<&str>) -> Option<&'static str> {
+    match permission?.trim().to_ascii_lowercase().as_str() {
+        "yolo" | "force" | "unrestricted" | "run-everything" | "bypass" => Some("--yolo"),
+        "auto-review" | "auto_review" | "auto" => Some("--auto-review"),
+        _ => None,
+    }
+}
+
+/// Whether opencode should start with `--auto`.
+pub fn opencode_auto(permission: Option<&str>) -> bool {
+    matches!(
+        permission.map(|p| p.trim().to_ascii_lowercase()).as_deref(),
+        Some("auto" | "yolo" | "allow_all" | "allow-all" | "on" | "true")
+    )
 }
 
 #[cfg(test)]
@@ -461,7 +487,7 @@ mod tests {
     fn acp_harnesses_launch_over_acp() {
         for h in Harness::ALL.into_iter().filter(|h| h.native_acp()) {
             let spec = h.launch(None);
-            assert_eq!(spec, acp_launch_spec(h, None));
+            assert_eq!(spec, acp_launch_spec(h, None, None));
             assert_eq!(spec.protocol, h.preferred_protocol());
         }
         assert_eq!(Harness::Opencode.launch(None).args, ["acp"]);

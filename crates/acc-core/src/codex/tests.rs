@@ -151,7 +151,17 @@ fn recorded_handshake_starts_session_and_fills_options() {
     assert!(effort.current.is_some(), "falls back to the model default");
     assert_eq!(option(&d, OptionId::Mode).values, ["plan", "default"]);
     let perm = option(&d, OptionId::Permission);
-    assert_eq!(perm.values, [":read-only", ":workspace", ":danger-full-access"]);
+    assert_eq!(
+        perm.values,
+        [
+            ":read-only",
+            ":workspace",
+            ":danger-full-access",
+            "untrusted",
+            "on-request",
+            "never"
+        ]
+    );
     assert_eq!(perm.current.as_deref(), Some(":read-only"));
 }
 

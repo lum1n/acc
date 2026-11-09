@@ -4,9 +4,11 @@
 //! that their `response` echoes; session events carry none. Built-in TUI
 //! commands (`/compact`, `/name`, ...) are not expanded in RPC mode, so the
 //! driver maps them to their RPC equivalents; extension, prompt-template and
-//! skill commands are sent as prompt text and pi expands them. pi has no
-//! approval gate of its own: "blocked" means an extension dialog
-//! (`extension_ui_request`), which ACC surfaces as a permission request.
+//! skill commands are sent as prompt text and pi expands them. Built-in TUI
+//! commands absent from `get_commands` are listed in the palette (Rpc/panel
+//! or `Exec::Terminal`). pi has no approval / yolo mode of its own: tools run
+//! freely, and "blocked" means an extension dialog (`extension_ui_request`),
+//! which ACC surfaces as a permission request (or auto-answers via `Policy`).
 //!
 //! Checked against pi 1.4.0 (`@earendil-works/pi-coding-agent`); the fixtures
 //! in `tests/fixtures/pi/` are recorded from 1.1.0. See
@@ -718,13 +720,26 @@ impl PiDriver {
             Some((n, a)) => (n, a.trim()),
             None => (rest, ""),
         };
+        if self
+            .commands
+            .iter()
+            .any(|e| e.name == name && e.exec == Exec::Terminal)
+        {
+            return None;
+        }
         let bytes = match (name, arg) {
             ("compact", hint) => self.compact(Some(hint).filter(|h| !h.is_empty())),
             ("new", "") => self.simple("new_session"),
             ("clone", "") => self.simple("clone"),
             ("session", "") => self.simple("get_session_stats"),
+            ("tree", "") => self.simple("get_tree"),
+            ("copy", "") => self.simple("get_last_assistant_text"),
             ("name", name) if !name.is_empty() => self.request(
                 obj(json!({ "type": "set_session_name", "name": name })),
+                Pending::Plain,
+            ),
+            ("resume", id) if !id.is_empty() => self.request(
+                obj(json!({ "type": "switch_session", "sessionPath": id })),
                 Pending::Plain,
             ),
             ("model", model) if !model.is_empty() => self.set_model(model).ok()?,
@@ -737,11 +752,26 @@ impl PiDriver {
     /// Runs a palette entry. Built-in names go through `builtin` or a
     /// panel; pi expands the rest.
     fn invoke(&mut self, name: &str, args: &str) -> Result<Vec<u8>, DriverError> {
+        let name = name.trim_start_matches('/');
+        let entry = self.commands.iter().find(|e| e.name == name);
+        if entry.is_some_and(|e| e.exec == Exec::Terminal) {
+            return Err(DriverError::Unsupported {
+                harness: Harness::Pi,
+                what: "this command outside its terminal UI",
+            });
+        }
         let (verb, rest) = split_verb(args);
         Ok(match (name, args) {
             // pi would send these to the model as text.
-            ("model" | "thinking" | "name", "") => return Err(DriverError::MissingArgument("a value")),
+            ("model" | "thinking" | "name" | "resume", "") => {
+                return Err(DriverError::MissingArgument("a value"));
+            }
             ("session", "") => self.open_panel("session"),
+            ("tree", "") => self.open_panel("tree"),
+            ("copy", "") => self.request(
+                obj(json!({ "type": "get_last_assistant_text" })),
+                Pending::Panel("copy"),
+            ),
             ("settings", "") => self.open_panel("settings"),
             ("settings", _) => {
                 let body = match (verb, rest) {
@@ -760,6 +790,10 @@ impl PiDriver {
             }
             ("fork", "") => self.open_panel("fork"),
             ("fork", entry) => self.request(obj(json!({ "type": "fork", "entryId": entry })), Pending::Plain),
+            ("resume", id) => self.request(
+                obj(json!({ "type": "switch_session", "sessionPath": id })),
+                Pending::Plain,
+            ),
             ("export", path) => {
                 let mut body = obj(json!({ "type": "export_html" }));
                 if !path.is_empty() {
@@ -777,6 +811,7 @@ impl PiDriver {
             "session" => "get_session_stats",
             "settings" => "get_state",
             "fork" => "get_fork_messages",
+            "tree" => "get_tree",
             _ => return Vec::new(),
         };
         self.request(obj(json!({ "type": kind })), Pending::Panel(id))
@@ -924,55 +959,70 @@ impl Driver for PiDriver {
     }
 }
 
-/// Built-in pi commands ACC runs through RPC.
+/// Built-in pi TUI commands. RPC mode does not expand these as `/name` text
+/// ([slash-commands.md](https://github.com/earendil-works/pi)); ACC maps what
+/// has a protocol path and marks the rest [`Exec::Terminal`].
 fn canonical_commands() -> Vec<CommandEntry> {
-    let e = |name: &str, description: &str, arg: Option<&str>, method: &str| CommandEntry {
+    let rpc = |name: &str, description: &str, arg: Option<&str>, method: &str| CommandEntry {
         source: CommandSource::Builtin,
         ..CommandEntry::rpc(name, description, arg, method)
     };
+    let term = |name: &str, description: &str, arg: Option<&str>| CommandEntry {
+        name: name.into(),
+        description: description.into(),
+        arg_hint: arg.map(str::to_owned),
+        source: CommandSource::Builtin,
+        exec: Exec::Terminal,
+        input: CommandInput::None,
+    };
     let option = |id| CommandInput::Option { id };
     vec![
-        e(
-            "compact",
-            "Summarize older history",
-            Some("[instructions]"),
-            "compact",
-        ),
-        e("new", "Start a new session", None, "new_session"),
-        e("clone", "Copy this session into a new one", None, "clone"),
-        e(
-            "fork",
-            "Continue from an earlier message in a new session",
-            None,
-            "fork",
-        ),
-        e("name", "Name this session", Some("<name>"), "set_session_name"),
-        e("model", "Switch model", Some("<provider/model>"), "set_model").with_input(option(OptionId::Model)),
-        e(
+        // Models and settings
+        rpc("settings", "Auto-compaction and message queueing", None, "get_state"),
+        rpc("model", "Switch model", Some("<provider/model>"), "set_model")
+            .with_input(option(OptionId::Model)),
+        rpc(
             "thinking",
             "Set thinking level",
             Some("<level>"),
             "set_thinking_level",
         )
         .with_input(option(OptionId::Effort)),
-        e(
-            "session",
-            "Session info, tokens and cost",
+        term("scoped-models", "Configure models for interactive cycling", None),
+        term("login", "Add provider authentication", Some("[provider]")),
+        term("logout", "Remove provider authentication", None),
+        term("llama", "Manage llama.cpp router models", None),
+        // Sessions and context
+        rpc("new", "Start a new session", None, "new_session"),
+        rpc("resume", "Switch to another saved session", Some("[path|id]"), "switch_session"),
+        rpc("name", "Name this session", Some("[name]"), "set_session_name"),
+        rpc("session", "Session info, tokens and cost", None, "get_session_stats"),
+        rpc("tree", "Navigate the session tree", None, "get_tree"),
+        rpc(
+            "fork",
+            "Continue from an earlier message in a new session",
             None,
-            "get_session_stats",
+            "fork",
         ),
-        e(
-            "settings",
-            "Auto-compaction and message queueing",
-            None,
-            "get_state",
+        rpc("clone", "Copy this session into a new one", None, "clone"),
+        rpc(
+            "compact",
+            "Summarize older history",
+            Some("[instructions]"),
+            "compact",
         ),
-        e(
-            "export",
-            "Export the session to HTML",
-            Some("[path]"),
-            "export_html",
-        ),
+        term("import", "Import and resume a JSONL session", Some("<path>")),
+        // Export and share
+        rpc("copy", "Copy the last assistant message", None, "get_last_assistant_text"),
+        rpc("export", "Export the session to HTML", Some("[path]"), "export_html"),
+        term("share", "Upload the session and return a viewer link", None),
+        term("bug", "Prepare a private bug report", Some("[description]")),
+        // Runtime and project
+        term("trust", "Save a project trust decision", None),
+        term("reload", "Reload keybindings, extensions, skills, templates, themes", None),
+        term("hotkeys", "Show active keyboard shortcuts", None),
+        term("changelog", "Show changelog entries", None),
+        term("quit", "Quit pi", None),
     ]
 }
 
@@ -1076,6 +1126,25 @@ fn panel(id: &str, data: &Value) -> Panel {
                 })
                 .collect(),
         ),
+        "tree" => (
+            "Session tree",
+            flatten_tree(data.get("tree"), 0)
+                .into_iter()
+                .map(|(depth, label)| {
+                    row(
+                        if depth == 0 { "Root" } else { "Child" },
+                        Some(format!("{}{label}", "  ".repeat(depth))),
+                    )
+                })
+                .collect(),
+        ),
+        "copy" => (
+            "Last assistant message",
+            vec![row(
+                "Text",
+                data.get("text").and_then(Value::as_str).map(str::to_owned),
+            )],
+        ),
         _ => ("", Vec::new()),
     };
     Panel {
@@ -1096,6 +1165,28 @@ fn obj(v: Value) -> Map<String, Value> {
         Value::Object(m) => m,
         _ => Map::new(),
     }
+}
+
+/// Flattens `get_tree`'s nested `{entry, children}` nodes for a panel.
+fn flatten_tree(tree: Option<&Value>, depth: usize) -> Vec<(usize, String)> {
+    let mut rows = Vec::new();
+    for node in tree.and_then(Value::as_array).into_iter().flatten() {
+        let text = content_text(node.pointer("/entry/message/content"));
+        let label = text
+            .lines()
+            .next()
+            .map(|l| l.chars().take(80).collect())
+            .filter(|s: &String| !s.is_empty())
+            .or_else(|| {
+                node.pointer("/entry/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "entry".into());
+        rows.push((depth, label));
+        rows.extend(flatten_tree(node.get("children"), depth + 1));
+    }
+    rows
 }
 
 fn str_field(v: &Value, key: &str) -> String {
@@ -1275,6 +1366,15 @@ mod tests {
         assert_eq!(d.options()[1].values, ["off"]);
         let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"compact") && names.contains(&"mcp"), "{names:?}");
+        for need in [
+            "settings", "model", "thinking", "scoped-models", "login", "logout", "llama", "new",
+            "resume", "name", "session", "tree", "fork", "clone", "compact", "import", "copy",
+            "export", "share", "bug", "trust", "reload", "hotkeys", "changelog", "quit",
+        ] {
+            assert!(names.contains(&need), "missing built-in /{need} in {names:?}");
+        }
+        let hotkeys = d.commands().iter().find(|c| c.name == "hotkeys").unwrap();
+        assert_eq!(hotkeys.exec, Exec::Terminal);
         let mcp = d.commands().iter().find(|c| c.name == "mcp").unwrap();
         assert_eq!(mcp.exec, Exec::Text);
     }

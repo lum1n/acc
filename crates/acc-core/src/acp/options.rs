@@ -188,6 +188,9 @@ pub(crate) struct OptionState {
     pub models: Option<Legacy>,
     /// Model passed on the command line at the next (re)start.
     pub spawn_model: Option<String>,
+    /// Permission / yolo mode for the next (re)start (Cursor, opencode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_permission: Option<String>,
     /// Derived view, rebuilt on every change.
     pub defs: Vec<OptionDef>,
     pub routes: Vec<(OptionId, Route)>,
@@ -300,6 +303,40 @@ impl OptionState {
             });
             self.routes.push((OptionId::Model, Route::SpawnFlag));
         }
+        // Cursor and opencode take yolo / auto at spawn; Copilot lists allow_all live.
+        if matches!(harness, Harness::Cursor | Harness::Opencode)
+            && !self.routes.iter().any(|(r, _)| *r == OptionId::Permission)
+        {
+            let (values, labels) = match harness {
+                Harness::Cursor => (
+                    vec![
+                        "default".into(),
+                        "auto-review".into(),
+                        "yolo".into(),
+                    ],
+                    vec![
+                        "Allowlist".into(),
+                        "Auto-review".into(),
+                        "Run everything".into(),
+                    ],
+                ),
+                _ => (
+                    vec!["default".into(), "auto".into()],
+                    vec!["Ask".into(), "Auto-approve".into()],
+                ),
+            };
+            self.defs.push(OptionDef {
+                id: OptionId::Permission,
+                values,
+                labels,
+                current: self
+                    .spawn_permission
+                    .clone()
+                    .or_else(|| Some("default".into())),
+                apply: Apply::Restart,
+            });
+            self.routes.push((OptionId::Permission, Route::SpawnFlag));
+        }
     }
 
     pub fn route(&self, id: OptionId) -> Option<&Route> {
@@ -403,6 +440,14 @@ mod tests {
         assert_eq!(s.route(OptionId::Model), Some(&Route::SpawnFlag));
         let model = s.defs.iter().find(|d| d.id == OptionId::Model).expect("model");
         assert_eq!(model.apply, Apply::Restart);
+        assert_eq!(s.route(OptionId::Permission), Some(&Route::SpawnFlag));
+        let perm = s
+            .defs
+            .iter()
+            .find(|d| d.id == OptionId::Permission)
+            .expect("permission");
+        assert_eq!(perm.values, ["default", "auto-review", "yolo"]);
+        assert_eq!(perm.apply, Apply::Restart);
     }
 
     #[test]

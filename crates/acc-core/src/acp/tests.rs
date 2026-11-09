@@ -1206,15 +1206,23 @@ fn garbage_is_kept_not_fatal() {
 
 #[test]
 fn launch_specs() {
-    assert_eq!(launch_spec(Harness::Cursor, None).args, ["acp"]);
+    assert_eq!(launch_spec(Harness::Cursor, None, None).args, ["acp"]);
     assert_eq!(
-        launch_spec(Harness::Copilot, Some("gpt-5.4")).args,
+        launch_spec(Harness::Cursor, None, Some("yolo")).args,
+        ["--yolo", "acp"]
+    );
+    assert_eq!(
+        launch_spec(Harness::Cursor, Some("gpt-5"), Some("auto-review")).args,
+        ["--model", "gpt-5", "--auto-review", "acp"]
+    );
+    assert_eq!(
+        launch_spec(Harness::Copilot, Some("gpt-5.4"), None).args,
         ["--acp", "--model", "gpt-5.4"]
     );
-    let oc = launch_spec(Harness::Opencode, Some("ignored"));
+    let oc = launch_spec(Harness::Opencode, Some("ignored"), Some("auto"));
     assert_eq!(
         (oc.program.as_str(), oc.args.as_slice()),
-        ("opencode", ["acp".to_owned()].as_slice())
+        ("opencode", ["--auto".to_owned(), "acp".to_owned()].as_slice())
     );
     assert_eq!(oc.protocol, crate::harness::Protocol::Acp);
 }
@@ -1880,4 +1888,54 @@ fn advertised_title_and_close_are_used() {
         one(&d.command(Command::New).expect("new"))["method"],
         "session/new"
     );
+}
+
+#[test]
+fn cursor_lists_tui_builtins_and_yolo_permission() {
+    let mut d = driver(Harness::Cursor, Start::New);
+    let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
+    for need in ["model", "plan", "ask", "mcp", "summarize", "btw", "config", "clear"] {
+        assert!(names.contains(&need), "missing {need} in {names:?}");
+    }
+    let perm = d
+        .options()
+        .iter()
+        .find(|o| o.id == OptionId::Permission)
+        .expect("permission");
+    assert_eq!(perm.values, ["default", "auto-review", "yolo"]);
+    assert_eq!(perm.apply, Apply::Restart);
+    assert_eq!(perm.current.as_deref(), Some("default"));
+
+    d.command(Command::SetOption {
+        id: OptionId::Permission,
+        value: "force".into(),
+    })
+    .expect("set");
+    assert_eq!(d.launch(None).args, ["--yolo", "acp"]);
+
+    let mcp = d.commands().iter().find(|c| c.name == "mcp").unwrap();
+    assert_eq!(mcp.exec, Exec::Terminal);
+    assert!(matches!(
+        d.command(Command::Invoke {
+            name: "mcp".into(),
+            args: String::new()
+        }),
+        Err(DriverError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn opencode_auto_permission_is_a_spawn_flag() {
+    let mut cfg = AcpConfig::new("/tmp", Start::New);
+    cfg.permission = Some("auto".into());
+    let d = AcpDriver::new(Harness::Opencode, cfg);
+    let perm = d
+        .options()
+        .iter()
+        .find(|o| o.id == OptionId::Permission)
+        .expect("permission");
+    assert_eq!(perm.current.as_deref(), Some("auto"));
+    assert_eq!(d.launch(None).args, ["--auto", "acp"]);
+    let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"compact") && names.contains(&"undo"), "{names:?}");
 }
