@@ -1,0 +1,18 @@
+[package]
+name = "acc-loadout"
+description = "Skills and MCP servers for the harnesses acc-core drives, on any host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# Host side only (harness catalogue, shell quoting, path helpers).
+acc-core = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

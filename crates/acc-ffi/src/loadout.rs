@@ -1,7 +1,7 @@
-//! Skills and MCP servers for every harness (`acc_core::loadout`): scripts
+//! Skills and MCP servers for every harness (`acc_loadout`): scripts
 //! to run on the host and pure functions over their output.
 
-use acc_core::loadout::{self, LoadoutError, Scope, mcp, skills};
+use acc_loadout::{LoadoutError, Scope, mcp, skills};
 
 use crate::AccError;
 use crate::acc_types::{AccExec, AccHarness};
@@ -128,9 +128,9 @@ impl TryFrom<AccMcpServer> for mcp::McpServer {
 
     fn try_from(s: AccMcpServer) -> Result<Self, AccError> {
         let extras = if s.extras_json.trim().is_empty() {
-            loadout::json::Json::Object(vec![])
+            acc_loadout::json::Json::Object(vec![])
         } else {
-            loadout::json::parse(&s.extras_json).map_err(|e| AccError::InvalidArgument {
+            acc_loadout::json::parse(&s.extras_json).map_err(|e| AccError::InvalidArgument {
                 reason: format!("extras: {e}"),
             })?
         };
