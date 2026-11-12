@@ -281,3 +281,36 @@ async fn revives_an_interrupted_session_under_the_same_id() {
     }
     revived.pipe().remove().await.expect("remove");
 }
+
+/// `cargo test` sets `CARGO_MANIFEST_DIR` for this process: a variable outside the login
+/// set, so it stands in for a caller's credential.
+#[tokio::test]
+async fn a_named_variable_reaches_the_script_and_an_unnamed_one_does_not() {
+    let script = r#"printf %s "${CARGO_MANIFEST_DIR-unset}""#;
+    let plain = Host::local().exec(script, b"").await.expect("exec");
+    assert_eq!(plain.stdout_str(), "unset");
+
+    let keeping = Host::local_keeping(["CARGO_MANIFEST_DIR", "NOT_SET_ANYWHERE"]);
+    let out = keeping.exec(script, b"").await.expect("exec");
+    assert_eq!(out.stdout_str(), env!("CARGO_MANIFEST_DIR"));
+    let missing = keeping
+        .exec(r#"printf %s "${NOT_SET_ANYWHERE-unset}""#, b"")
+        .await
+        .expect("exec");
+    assert_eq!(missing.stdout_str(), "unset");
+
+    // A stream gets the same environment as a one-shot script.
+    let mut stream = keeping.open(script).await.expect("open");
+    let mut seen = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(10), stream.recv())
+            .await
+            .expect("recv in time")
+        {
+            StreamMsg::Stdout(bytes) => seen.extend(bytes),
+            StreamMsg::Stderr(_) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&seen), env!("CARGO_MANIFEST_DIR"));
+}

@@ -136,6 +136,8 @@ pub struct Host {
     config: SshConfig,
     /// Scripts run on this machine with `sh` rather than over SSH (see [`Host::local`]).
     local: bool,
+    /// Variables of this process a local script also gets (see [`Host::local_keeping`]).
+    local_env: Vec<String>,
     conn: Mutex<Option<Conn>>,
     fingerprint: Arc<StdMutex<Option<String>>>,
     dials: AtomicU64,
@@ -184,6 +186,7 @@ impl Host {
         Self {
             config,
             local: false,
+            local_env: Vec::new(),
             conn: Mutex::new(None),
             fingerprint: Arc::new(StdMutex::new(None)),
             dials: AtomicU64::new(0),
@@ -209,6 +212,23 @@ impl Host {
         Self {
             local: true,
             ..Self::new(config)
+        }
+    }
+
+    /// [`Host::local`], whose scripts also get the named variables of this process when
+    /// they are set. For a caller that holds a credential its scripts need (a forge token
+    /// for `git push`, a model key for the agent): it names the variable, and the value
+    /// reaches the script by inheritance, never in the script's text or its arguments.
+    /// Everything not named stays out, as with [`Host::local`].
+    #[cfg(feature = "local")]
+    pub fn local_keeping<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            local_env: names.into_iter().map(Into::into).collect(),
+            ..Self::local()
         }
     }
 
@@ -371,7 +391,7 @@ impl Host {
     pub async fn exec(&self, script: &str, stdin: &[u8]) -> Result<Output> {
         #[cfg(feature = "local")]
         if self.local {
-            return local::exec(script, stdin).await;
+            return local::exec(script, stdin, &self.local_env).await;
         }
         let mut ch = self.channel(script).await?;
         if !stdin.is_empty() {
@@ -402,7 +422,7 @@ impl Host {
         #[cfg(feature = "local")]
         if self.local {
             return Ok(Stream {
-                inner: Inner::Local(Box::new(local::open(script)?)),
+                inner: Inner::Local(Box::new(local::open(script, &self.local_env)?)),
             });
         }
         let ch = self.channel(script).await?;
@@ -519,13 +539,13 @@ mod local {
         "SSH_AUTH_SOCK",
     ];
 
-    fn command(script: &str) -> Command {
+    fn command(script: &str, also: &[String]) -> Command {
         let mut command = Command::new("sh");
         command.arg("-c").arg(script).env_clear();
         for (name, value) in std::env::vars_os() {
             let keep = name
                 .to_str()
-                .is_some_and(|n| KEEP.contains(&n) || n.starts_with("LC_"));
+                .is_some_and(|n| KEEP.contains(&n) || n.starts_with("LC_") || also.iter().any(|a| a == n));
             if keep {
                 command.env(name, value);
             }
@@ -534,8 +554,8 @@ mod local {
         command
     }
 
-    fn spawn(script: &str) -> Result<Child> {
-        command(script)
+    fn spawn(script: &str, also: &[String]) -> Result<Child> {
+        command(script, also)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -547,8 +567,8 @@ mod local {
         status.code().and_then(|c| u32::try_from(c).ok())
     }
 
-    pub(super) async fn exec(script: &str, stdin: &[u8]) -> Result<Output> {
-        let mut child = spawn(script)?;
+    pub(super) async fn exec(script: &str, stdin: &[u8], also: &[String]) -> Result<Output> {
+        let mut child = spawn(script, also)?;
         let input = child.stdin.take();
         // Fed while the output is drained: a script that writes as it reads would otherwise
         // block on a full pipe while its input waits on it.
@@ -575,8 +595,8 @@ mod local {
         stdin: Mutex<Option<ChildStdin>>,
     }
 
-    pub(super) fn open(script: &str) -> Result<Process> {
-        let mut child = spawn(script)?;
+    pub(super) fn open(script: &str, also: &[String]) -> Result<Process> {
+        let mut child = spawn(script, also)?;
         Ok(Process {
             stdout: child.stdout.take(),
             stderr: child.stderr.take(),
