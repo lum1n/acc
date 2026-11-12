@@ -137,6 +137,7 @@ pub struct Host {
     /// Scripts run on this machine with `sh` rather than over SSH (see [`Host::local`]).
     local: bool,
     /// Variables of this process a local script also gets (see [`Host::local_keeping`]).
+    #[cfg(feature = "local")]
     local_env: Vec<String>,
     conn: Mutex<Option<Conn>>,
     fingerprint: Arc<StdMutex<Option<String>>>,
@@ -186,6 +187,7 @@ impl Host {
         Self {
             config,
             local: false,
+            #[cfg(feature = "local")]
             local_env: Vec::new(),
             conn: Mutex::new(None),
             fingerprint: Arc::new(StdMutex::new(None)),
