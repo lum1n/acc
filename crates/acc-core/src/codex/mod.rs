@@ -1599,6 +1599,8 @@ fn turn_error(err: &Value) -> Option<String> {
     let label = match kind {
         Some("modelNotFound") => "Model not available",
         Some("policyCapacityUnavailable") => "No capacity for this model",
+        // The API's `budget_reached` (0.168): terminal, retrying cannot help.
+        Some("sessionBudgetExceeded") => "Session budget reached",
         _ => return msg.map(|m| wire::one_line(m, 200)),
     };
     Some(wire::one_line(

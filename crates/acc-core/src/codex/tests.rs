@@ -363,6 +363,8 @@ fn model_not_found_is_final_and_named() {
     assert_eq!(turn_error(&err).as_deref(), Some("connection reset"));
     let err = json!({"message": "", "codexErrorInfo": "policyCapacityUnavailable"});
     assert_eq!(turn_error(&err).as_deref(), Some("No capacity for this model"));
+    let err = json!({"message": "", "codexErrorInfo": "sessionBudgetExceeded"});
+    assert_eq!(turn_error(&err).as_deref(), Some("Session budget reached"));
 }
 
 #[test]
