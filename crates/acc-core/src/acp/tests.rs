@@ -1939,3 +1939,41 @@ fn opencode_auto_permission_is_a_spawn_flag() {
     let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"compact") && names.contains(&"undo"), "{names:?}");
 }
+
+#[test]
+fn background_work_reporting_after_a_cancel_does_not_resume_the_run() {
+    let mut d = ready_copilot();
+    let prompt = one(&d.command(Command::prompt("start the server")).expect("prompt"));
+    let prompt_id = prompt["id"].clone();
+    feed(
+        &mut d,
+        &[update(
+            "s1",
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "bg1", "title": "npm start",
+                    "kind": "execute", "status": "in_progress", "rawInput": { "command": "npm start" } }),
+        )],
+    );
+    d.command(Command::Interrupt).expect("interrupt");
+    let events = feed(&mut d, &[result(prompt_id, json!({ "stopReason": "cancelled" }))]);
+    assert_eq!(states(&events), [RunState::Idle]);
+
+    // The background shell goes on: its updates reach the item only.
+    let events = feed(
+        &mut d,
+        &[
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "bg1", "status": "in_progress",
+                        "content": [{ "type": "content", "content": { "type": "text", "text": "listening" } }] }),
+            ),
+            update(
+                "s1",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "bg1", "status": "completed" }),
+            ),
+        ],
+    );
+    assert!(states(&events).is_empty(), "{events:?}");
+    assert!(events.iter().any(|e| matches!(e, Event::ItemUpdated { id, .. } if id == "bg1")));
+    assert!(events.iter().any(|e| matches!(e, Event::ItemCompleted { id, .. } if id == "bg1")));
+    assert!(!events.iter().any(|e| matches!(e, Event::ItemStarted { .. })));
+}

@@ -198,6 +198,11 @@ pub struct AcpDriver {
     /// The message or thought currently streaming in chunks.
     open_item: Option<(ItemId, ItemKind)>,
     open_tools: BTreeSet<String>,
+    /// Tool calls a cancelled turn left unfinished. `session/cancel` stops
+    /// only the foreground turn (Copilot 1.0.106, ACP v2), so a background
+    /// shell goes on and reports through `tool_call_update`s after the
+    /// turn ended; those update the item but don't mean the agent works.
+    detached_tools: BTreeSet<String>,
     /// Subagent tool calls that haven't been matched to a child session
     /// yet, oldest first, with the child session they run in themselves
     /// (`None` for the main conversation's).
@@ -265,6 +270,7 @@ impl AcpDriver {
             queued_prompts: Vec::new(),
             open_item: None,
             open_tools: BTreeSet::new(),
+            detached_tools: BTreeSet::new(),
             unclaimed_subagents: Vec::new(),
             subagent_tools: BTreeSet::new(),
             child_sessions: BTreeMap::new(),
@@ -711,6 +717,7 @@ impl AcpDriver {
         self.permissions.clear();
         self.open_item = None;
         self.open_tools.clear();
+        self.detached_tools.clear();
         self.unclaimed_subagents.clear();
         self.subagent_tools.clear();
         self.child_sessions.clear();
@@ -738,6 +745,9 @@ impl AcpDriver {
 
     fn on_turn_end(&mut self, r: &Value, out: &mut Vec<Event>) {
         self.turn_open = false;
+        if r.get("stopReason").and_then(Value::as_str) == Some("cancelled") {
+            self.detached_tools.extend(self.open_tools.iter().cloned());
+        }
         self.close_turn_items(out);
         if let Some(u) = r.get("usage").filter(|u| u.is_object()) {
             let n = |k: &str| u.get(k).and_then(Value::as_u64);
@@ -1365,6 +1375,9 @@ impl AcpDriver {
             out.push(native("tool_call", update));
             return;
         };
+        if self.on_detached_tool(id, update, out) {
+            return;
+        }
         self.working(out);
         if self.open_tools.contains(id) {
             self.upgrade_to_subagent(id, update, None, out);
@@ -1393,6 +1406,9 @@ impl AcpDriver {
             self.permissions.remove(&request_id);
             out.push(Event::PermissionResolved { request_id });
         }
+        if self.on_detached_tool(id, update, out) {
+            return;
+        }
         self.working(out);
         if !self.open_tools.contains(id) {
             self.start_tool(id.to_owned(), update, None, out);
@@ -1403,6 +1419,21 @@ impl AcpDriver {
             }
         }
         self.finish_tool_if_done(id, update, out);
+    }
+
+    /// A report on a tool call that outlived its cancelled turn: it updates
+    /// its item, and leaves the run state alone.
+    fn on_detached_tool(&mut self, id: &str, update: &Value, out: &mut Vec<Event>) -> bool {
+        if !self.detached_tools.contains(id) {
+            return false;
+        }
+        if is_final(update) {
+            self.detached_tools.remove(id);
+            self.items.complete(id.to_owned(), strip_tag(update), out);
+        } else {
+            self.items.update(id.to_owned(), strip_tag(update), out);
+        }
+        true
     }
 
     fn finish_tool_if_done(&mut self, id: &str, update: &Value, out: &mut Vec<Event>) {
