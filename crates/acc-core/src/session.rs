@@ -1477,6 +1477,47 @@ mod tests {
     }
 
     #[test]
+    fn claude_exit_1_after_a_result_is_error_with_the_stderr_line() {
+        // `claude -p` can exit 1 after a clean `result` (a deferred tool call
+        // whose MCP server is gone, refused actions, a lost transcript).
+        let result = CLAUDE_HI.lines().position(|l| l.contains("\"type\":\"result\""));
+        let result = result.expect("the fixture ends a turn with a result");
+        let log: String = CLAUDE_HI
+            .lines()
+            .take(result + 1)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let (s, _) = Session::launch(req(Harness::Claude), "s1", "first", 1).unwrap();
+        let mut a = Session::attach(s.spec().clone(), "second").unwrap();
+        let status = format!("exited 1 {}\nE Error: MCP server missing\n", log.len());
+        a.on_status(&status, 2);
+        a.feed(log.as_bytes(), 3);
+        let state = a.state().expect("a state");
+        assert_eq!(state.state, RunState::Error);
+        assert_eq!(
+            state.message.as_deref(),
+            Some("Exited with code 1: Error: MCP server missing")
+        );
+
+        // Live: the result arrives first (Done), then the process exits 1.
+        let (s, _) = Session::launch(req(Harness::Claude), "s2", "first", 1).unwrap();
+        let mut b = Session::attach(s.spec().clone(), "third").unwrap();
+        b.on_status(&format!("alive 7 {}", log.len()), 2);
+        b.feed(log.as_bytes(), 3);
+        assert_eq!(b.state().map(|s| &s.state), Some(&RunState::Done));
+        b.on_status(
+            &format!("exited 1 {}\nE Error: MCP server missing\n", log.len()),
+            4,
+        );
+        let state = b.state().expect("a state");
+        assert_eq!(state.state, RunState::Error);
+        assert_eq!(
+            state.message.as_deref(),
+            Some("Exited with code 1: Error: MCP server missing")
+        );
+    }
+
+    #[test]
     fn exit_known_before_replay_stays_exited() {
         let (a, _) = attached(Harness::Claude, CLAUDE_HI, false);
         assert_eq!(a.state().map(|s| &s.state), Some(&RunState::Exited));
