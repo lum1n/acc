@@ -1479,6 +1479,11 @@ impl ClaudeDriver {
             (_, Some(_)) if dismissed && !self.unanswered_annotations => deny,
             (_, Some(question)) => {
                 let mut input = p.input.clone();
+                // Claude Code 2.1.321 denies an answer that echoes the
+                // undocumented `afkTimeoutMs` field back.
+                if let Some(o) = input.as_object_mut() {
+                    o.remove("afkTimeoutMs");
+                }
                 let answers = if dismissed {
                     Vec::new()
                 } else {
