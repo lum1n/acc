@@ -297,7 +297,7 @@ fn settings_path(harness: Harness, cwd: &str) -> Option<String> {
         Harness::Codex => Some("\"$HOME\"/.codex/rules/default.rules".to_owned()),
         Harness::Cursor => Some(format!("{dir}/.cursor/cli.json")),
         Harness::Opencode => Some(format!("{dir}/opencode.json")),
-        Harness::Copilot | Harness::Pi => None,
+        Harness::Copilot | Harness::Pi | Harness::Antigravity => None,
     }
 }
 
@@ -423,7 +423,7 @@ pub fn merge_settings(
             }
             Ok((out, skipped))
         }
-        h @ (Harness::Copilot | Harness::Pi) => Err(SettingsError::Unsupported(h)),
+        h @ (Harness::Copilot | Harness::Pi | Harness::Antigravity) => Err(SettingsError::Unsupported(h)),
     }
 }
 

@@ -118,7 +118,8 @@ fn dialect(harness: Harness) -> Option<(Dialect, &'static str)> {
         Harness::Copilot => (Dialect::Copilot, "mcpServers"),
         Harness::Opencode => (Dialect::Opencode, "mcp"),
         Harness::Pi => (Dialect::Pi, "mcpServers"),
-        Harness::Codex => return None,
+        // Antigravity's MCP config location isn't known to ACC.
+        Harness::Codex | Harness::Antigravity => return None,
     })
 }
 

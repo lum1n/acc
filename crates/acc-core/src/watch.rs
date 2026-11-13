@@ -181,7 +181,7 @@ pub fn watch_script(dir: &SessionDir, harness: Harness, hook: Option<&Hook>) -> 
             Harness::Claude => "claude",
             Harness::Codex => "codex",
             Harness::Pi => "pi",
-            Harness::Cursor | Harness::Copilot | Harness::Opencode => "acp",
+            Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity => "acp",
         },
         program = quote(PROGRAM),
     );

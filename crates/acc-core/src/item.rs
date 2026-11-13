@@ -505,7 +505,9 @@ fn detail(harness: Harness, kind: ItemKind, ext: &Value, text: &str) -> ItemDeta
             Harness::Claude => claude(kind, ext, text),
             Harness::Codex => codex(kind, ext, text),
             Harness::Pi => pi(kind, ext, text),
-            Harness::Cursor | Harness::Copilot | Harness::Opencode => acp(kind, ext, text),
+            Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity => {
+                acp(kind, ext, text)
+            }
         },
     }
 }

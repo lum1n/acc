@@ -127,6 +127,7 @@ pub fn state_paths(harness: Harness) -> &'static [&'static str] {
             "~/.local/state/opencode",
             "~/.cache/opencode",
         ],
+        Harness::Antigravity => &["~/.gemini", "~/.antigravity", "~/.config/antigravity"],
     }
 }
 
@@ -138,7 +139,7 @@ fn nested_off(harness: Harness) -> &'static [&'static str] {
         // Copilot 1.0.103+ applies its saved sandbox setting in ACP mode too.
         Harness::Copilot => &["--no-sandbox"],
         Harness::Cursor => &["--sandbox", "disabled"],
-        Harness::Pi | Harness::Opencode => &[],
+        Harness::Pi | Harness::Opencode | Harness::Antigravity => &[],
     }
 }
 
@@ -533,7 +534,11 @@ mod tests {
         };
         let cursor = argv_script(
             &rules(Harness::Cursor, &Sandbox::default()),
-            &launcher.wrap(crate::harness::acp_launch_spec(Harness::Cursor, Some("gpt-5"), None)),
+            &launcher.wrap(crate::harness::acp_launch_spec(
+                Harness::Cursor,
+                Some("gpt-5"),
+                None,
+            )),
         );
         assert!(cursor.contains(
             "set -- \"$@\" nice agent --model gpt-5\n\

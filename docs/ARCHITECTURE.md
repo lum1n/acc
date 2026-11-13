@@ -58,6 +58,7 @@ the split ever needs to be stronger than a feature.
 | Copilot CLI | ACP (`--acp`) |
 | pi | `--mode rpc` |
 | opencode | ACP (`opencode acp`) |
+| Antigravity CLI | ACP (`agy acp`) |
 
 ACC drives whatever version is installed. `Harness::tested_versions` is the range each driver was
 run against (live, or the recordings under `tests/fixtures`), and `parse_probe` grades each

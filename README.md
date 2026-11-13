@@ -1,14 +1,14 @@
 # ACC: Agent Control Core
 
 One embeddable Rust core that **controls, observes and configures** the major CLI agent harnesses:
-Claude Code, Codex, Cursor Agent, Copilot CLI, pi and opencode.
+Claude Code, Codex, Cursor Agent, Copilot CLI, pi, opencode and Google Antigravity CLI.
 
 It ships as a native library for iOS and Android (UniFFI → Swift/Kotlin), the browser and Node
 (wasm-bindgen), Node servers with the SSH transport (napi), and desktop (plain Rust). It needs **nothing installed on the hosts** it controls:
 everything runs over an SSH exec channel using the harnesses' own headless protocols and standard
 POSIX tools.
 
-> Status: drivers for all six harnesses (Claude Code stream-json, Codex app-server, ACP for Cursor,
+> Status: drivers for all seven harnesses (Claude Code stream-json, Codex app-server, ACP for Cursor, Antigravity,
 > Copilot and opencode, pi RPC), detached sessions with replay and multi-client attach, and the
 > Swift/Kotlin surface for all of it. Used by [Sessh](https://github.com/lum1n/sessh-swift) to
 > drive agents natively from iOS.
@@ -95,7 +95,7 @@ acc doctor                             # harnesses found here and their versions
 ```
 
 **Drive a harness.** `acc run <harness> [dir]` starts it headlessly through its ACC driver
-(`claude`, `codex`, `pi`, `cursor`, `copilot`, `opencode`). Type prompts; events print as
+(`claude`, `codex`, `pi`, `cursor`, `copilot`, `opencode`, `agy`). Type prompts; events print as
 readable lines (`--json` prints the raw event stream, `--program PATH` runs another binary than
 the one on `PATH`). `:help` lists the commands: `:answer allow` for a permission prompt,
 `:interrupt`, `:compact`, `:new`, `:fork`, `:refresh`, `:set model <m>`, `:invoke <name>`,

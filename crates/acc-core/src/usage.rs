@@ -63,7 +63,7 @@ enum Counting {
 /// How `harness` counts (tokens, cost).
 fn counting(harness: Harness) -> (Counting, Counting) {
     match harness {
-        Harness::Claude | Harness::Cursor | Harness::Copilot | Harness::Opencode => {
+        Harness::Claude | Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity => {
             (Counting::PerTurn, Counting::Total)
         }
         Harness::Codex | Harness::Pi => (Counting::Total, Counting::Total),
@@ -351,6 +351,7 @@ fn harness_order(h: Harness) -> u8 {
         Harness::Copilot => 3,
         Harness::Pi => 4,
         Harness::Opencode => 5,
+        Harness::Antigravity => 6,
     }
 }
 

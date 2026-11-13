@@ -104,6 +104,10 @@ fn codex_home() -> &'static str {
 /// `.agents/skills` directly, and pi reads `~/.agents/skills` too.
 pub fn skill_place(harness: Harness, scope: &Scope) -> Option<SkillPlace> {
     let own = |dir: String| SkillPlace { dir, native: false };
+    // Where agy reads skills isn't known to ACC.
+    if harness == Harness::Antigravity {
+        return None;
+    }
     let place = match scope {
         Scope::User => match harness {
             Harness::Claude => own(format!("{}/skills", claude_home())),
@@ -111,6 +115,7 @@ pub fn skill_place(harness: Harness, scope: &Scope) -> Option<SkillPlace> {
             Harness::Cursor => own("\"$HOME\"/.cursor/skills".into()),
             Harness::Copilot => own("\"$HOME\"/.copilot/skills".into()),
             Harness::Opencode => own(format!("{}/opencode/skills", config_home())),
+            Harness::Antigravity => return None,
             Harness::Pi => SkillPlace {
                 dir: "\"$HOME\"/.pi/agent/skills".into(),
                 native: true,
@@ -124,6 +129,7 @@ pub fn skill_place(harness: Harness, scope: &Scope) -> Option<SkillPlace> {
                     dir: store,
                     native: true,
                 },
+                Harness::Antigravity => return None,
                 Harness::Pi => SkillPlace {
                     dir: format!("{}/.pi/skills", scope.base()),
                     native: true,
@@ -144,6 +150,7 @@ pub(crate) fn mcp_config_script(harness: Harness, scope: &Scope) -> Option<Strin
         (Scope::User, Harness::Cursor) => "f=\"$HOME\"/.cursor/mcp.json".to_owned(),
         (Scope::User, Harness::Copilot) => "f=\"$HOME\"/.copilot/mcp-config.json".to_owned(),
         (Scope::User, Harness::Pi) => "f=\"$HOME\"/.pi/agent/mcp.json".to_owned(),
+        (_, Harness::Antigravity) => return None,
         (Scope::User, Harness::Opencode) => opencode_file(&format!("{}/opencode", config_home())),
         (Scope::Project { .. }, Harness::Claude) => format!("f={base}/.mcp.json"),
         (Scope::Project { .. }, Harness::Codex) => format!("f={base}/.codex/config.toml"),
