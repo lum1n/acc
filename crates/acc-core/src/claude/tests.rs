@@ -295,6 +295,26 @@ fn ask_user_question_is_a_question_answered_by_allowing() {
 }
 
 #[test]
+fn ask_user_question_answer_drops_afk_timeout() {
+    let mut d = ClaudeDriver::default();
+    let req = json!({"type":"control_request","request_id":"q3","request":{
+        "subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"toolu_q",
+        "input":{"afkTimeoutMs":30000,"questions":[{"question":"Which DB?","header":"DB","multiSelect":false,
+            "options":[{"label":"Postgres","description":""},{"label":"SQLite","description":""}]}]}}});
+    d.on_output(&wire::line(&req));
+    let bytes = d
+        .command(Command::AnswerPermission {
+            request_id: "q3".into(),
+            option_id: "SQLite".into(),
+        })
+        .unwrap();
+    let result = &sent(&bytes)[0]["response"]["response"];
+    assert_eq!(result["behavior"], "allow");
+    assert!(result["updatedInput"].get("afkTimeoutMs").is_none());
+    assert_eq!(result["updatedInput"]["answers"]["Which DB?"], "SQLite");
+}
+
+#[test]
 fn ask_user_question_answers_every_question() {
     let mut d = ClaudeDriver::default();
     let req = json!({"type":"control_request","request_id":"q2","request":{
