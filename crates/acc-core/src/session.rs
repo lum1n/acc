@@ -100,6 +100,15 @@ pub struct LaunchRequest {
     /// is the opinionated preset; `None` runs it unconfined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
+    /// Instructions added to the harness's own system prompt for this
+    /// session (always append, never replace). Claude and pi take it as
+    /// `--append-system-prompt`, Codex as the thread's developer
+    /// instructions, ACP agents as `systemPrompt` when they advertise
+    /// `sessionCapabilities.systemPrompt` (a session that can't apply it
+    /// fails to open instead of running without it). Kept in `spec.json`
+    /// and carried over to relaunches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 /// Everything another client needs to attach; stored as `spec.json`.
@@ -135,6 +144,9 @@ pub struct SessionSpec {
     /// for this harness are in `launch.sandbox`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
+    /// See [`LaunchRequest::system_prompt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 impl SessionSpec {
@@ -159,6 +171,7 @@ impl SessionSpec {
             launcher: None,
             worktree: None,
             sandbox: None,
+            system_prompt: None,
         }
     }
 
@@ -326,6 +339,7 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
                 model: spec.model.clone(),
                 approval_policy,
                 permissions,
+                developer_instructions: spec.system_prompt.clone(),
                 client_tag: Some(tag.to_owned()),
             }))
         }
@@ -340,6 +354,7 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
             cfg.client_tag = tag.to_owned();
             cfg.model = spec.model.clone();
             cfg.permission = spec.permission.clone();
+            cfg.system_prompt = spec.system_prompt.clone();
             Box::new(AcpDriver::new(h, cfg))
         }
     }
@@ -420,6 +435,7 @@ impl Session {
             launcher: req.launcher.clone(),
             worktree: req.worktree.clone(),
             sandbox: req.sandbox.clone(),
+            system_prompt: req.system_prompt.clone().filter(|p| !p.trim().is_empty()),
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
@@ -429,6 +445,13 @@ impl Session {
             Harness::Codex => Harness::Codex.launch(None),
             _ => driver.launch(spec.resume.as_deref()),
         };
+        // Claude and pi take it on the command line (the others get it in
+        // their protocol, see `driver_for`).
+        if let (Harness::Claude | Harness::Pi, Some(prompt)) = (harness, &spec.system_prompt) {
+            spec.launch
+                .args
+                .extend(["--append-system-prompt".to_owned(), prompt.clone()]);
+        }
         if let Some(launcher) = &spec.launcher {
             spec.launch = launcher.wrap(spec.launch);
         }
@@ -515,6 +538,7 @@ impl Session {
             launcher: spec.launcher.clone(),
             worktree: spec.worktree.clone(),
             sandbox: spec.sandbox.clone(),
+            system_prompt: spec.system_prompt.clone(),
         };
         // The same session: snapshots taken before still match it.
         Self::launch(req, &spec.id, client_tag, spec.created_ms)
@@ -910,6 +934,7 @@ impl Session {
             launcher: self.spec.launcher.clone(),
             worktree: self.spec.worktree.clone(),
             sandbox: self.spec.sandbox.clone(),
+            system_prompt: self.spec.system_prompt.clone(),
         }
     }
 
@@ -941,6 +966,7 @@ impl Session {
             // rules for the new harness.
             launcher: self.spec.launcher.clone(),
             sandbox: self.spec.sandbox.clone(),
+            system_prompt: self.spec.system_prompt.clone(),
             ..LaunchRequest::default()
         })
     }
@@ -1370,6 +1396,38 @@ mod tests {
         assert!(!s.is_replaying());
         let spec = SessionSpec::from_json(&s.spec().to_json()).unwrap();
         assert_eq!(spec.launch.program, "claude");
+    }
+
+    #[test]
+    fn system_prompt_maps_per_harness_and_survives_relaunch() {
+        let with = |h: Harness| {
+            let mut r = req(h);
+            r.system_prompt = Some("Be brief.".into());
+            Session::launch(r, "sp1", "t", 0).unwrap()
+        };
+        for h in [Harness::Claude, Harness::Pi] {
+            let (s, _) = with(h);
+            let args = &s.spec().launch.args;
+            let i = args.iter().position(|a| a == "--append-system-prompt").unwrap();
+            assert_eq!(args[i + 1], "Be brief.");
+            assert_eq!(
+                s.relaunch(false, None).system_prompt.as_deref(),
+                Some("Be brief.")
+            );
+        }
+        let (mut s, _) = with(Harness::Codex);
+        let t = String::from_utf8(s.take_transmit()).unwrap();
+        assert!(t.contains("\"developerInstructions\":\"Be brief.\""), "{t}");
+        let (s, _) = with(Harness::Opencode);
+        assert_eq!(s.spec().system_prompt.as_deref(), Some("Be brief."));
+        let spec = SessionSpec::from_json(&s.spec().to_json()).unwrap();
+        assert_eq!(spec.system_prompt.as_deref(), Some("Be brief."));
+        // Blank means none.
+        let mut r = req(Harness::Claude);
+        r.system_prompt = Some("  ".into());
+        let (s, _) = Session::launch(r, "sp2", "t", 0).unwrap();
+        assert!(s.spec().system_prompt.is_none());
+        assert!(!s.spec().launch.args.iter().any(|a| a == "--append-system-prompt"));
     }
 
     #[test]

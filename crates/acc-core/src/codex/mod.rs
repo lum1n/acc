@@ -67,6 +67,10 @@ pub struct CodexConfig {
     pub approval_policy: Option<String>,
     /// Permission profile id such as `:workspace` (see `permissionProfile/list`).
     pub permissions: Option<String>,
+    /// `developerInstructions` of the thread: added to Codex's own
+    /// instructions (the launch system prompt).
+    #[serde(default)]
+    pub developer_instructions: Option<String>,
     /// Prefix for this client's request ids. With a tag, ids are strings
     /// (`<tag>-<n>`) so clients sharing one detached session never mistake
     /// each other's responses in the shared log. Without one, ids are numbers.
@@ -237,6 +241,7 @@ impl CodexDriver {
             ("model", &c.model),
             ("approvalPolicy", &c.approval_policy),
             ("permissions", &c.permissions),
+            ("developerInstructions", &c.developer_instructions),
         ] {
             if let Some(v) = value {
                 p.insert(key.into(), Value::String(v.clone()));
@@ -1376,7 +1381,12 @@ impl Driver for CodexDriver {
             Command::New => Ok(self.request("thread/start", self.thread_params(), Req::Thread)),
             Command::Fork => {
                 let thread = self.thread()?;
-                Ok(self.request("thread/fork", json!({"threadId": thread}), Req::Thread))
+                let mut p = Map::new();
+                p.insert("threadId".into(), json!(thread));
+                if let Some(i) = &self.config.developer_instructions {
+                    p.insert("developerInstructions".into(), json!(i));
+                }
+                Ok(self.request("thread/fork", Value::Object(p), Req::Thread))
             }
             Command::Rename { name } => {
                 let thread = self.thread()?;

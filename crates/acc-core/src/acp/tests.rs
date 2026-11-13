@@ -1894,7 +1894,16 @@ fn advertised_title_and_close_are_used() {
 fn cursor_lists_tui_builtins_and_yolo_permission() {
     let mut d = driver(Harness::Cursor, Start::New);
     let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
-    for need in ["model", "plan", "ask", "mcp", "summarize", "btw", "config", "clear"] {
+    for need in [
+        "model",
+        "plan",
+        "ask",
+        "mcp",
+        "summarize",
+        "btw",
+        "config",
+        "clear",
+    ] {
         assert!(names.contains(&need), "missing {need} in {names:?}");
     }
     let perm = d
@@ -1938,4 +1947,74 @@ fn opencode_auto_permission_is_a_spawn_flag() {
     assert_eq!(d.launch(None).args, ["--auto", "acp"]);
     let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"compact") && names.contains(&"undo"), "{names:?}");
+}
+
+#[test]
+fn system_prompt_rides_on_session_requests_when_advertised() {
+    let mut cfg = AcpConfig::new("/tmp", Start::New);
+    cfg.system_prompt = Some("Answer in Norwegian.".into());
+    let mut d = AcpDriver::new(Harness::Opencode, cfg);
+    let init = one(&d.handshake());
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(json!({ "sessionCapabilities": { "systemPrompt": {} } })),
+        )],
+    );
+    let new = one(&d.poll_transmit());
+    assert_eq!(new["method"], "session/new");
+    assert_eq!(
+        new["params"]["systemPrompt"],
+        json!({ "mode": "append", "content": [{ "type": "text", "text": "Answer in Norwegian." }] })
+    );
+    // /new keeps it.
+    feed(
+        &mut d,
+        &[result(new["id"].clone(), opencode_session("s1", "mock/mock-1"))],
+    );
+    let _ = d.poll_transmit();
+    let again = one(&d.command(Command::New).unwrap());
+    assert_eq!(again["params"]["systemPrompt"]["mode"], "append");
+}
+
+#[test]
+fn system_prompt_on_resume_and_not_without_one() {
+    let mut cfg = AcpConfig::new(
+        "/tmp",
+        Start::Resume {
+            session_id: "s9".into(),
+        },
+    );
+    cfg.system_prompt = Some("Be brief.".into());
+    let mut d = AcpDriver::new(Harness::Opencode, cfg);
+    let init = one(&d.handshake());
+    feed(
+        &mut d,
+        &[result(
+            init["id"].clone(),
+            init_result(json!({ "loadSession": true, "sessionCapabilities": { "systemPrompt": {} } })),
+        )],
+    );
+    let load = one(&d.poll_transmit());
+    assert_eq!(load["method"], "session/load");
+    assert_eq!(load["params"]["sessionId"], "s9");
+    assert_eq!(load["params"]["systemPrompt"]["content"][0]["text"], "Be brief.");
+
+    let mut d = driver(Harness::Opencode, Start::New);
+    let init = one(&d.handshake());
+    feed(&mut d, &[result(init["id"].clone(), init_result(json!({})))]);
+    let new = one(&d.poll_transmit());
+    assert!(new["params"].get("systemPrompt").is_none());
+}
+
+#[test]
+fn system_prompt_fails_the_session_when_the_agent_cant_take_it() {
+    let mut cfg = AcpConfig::new("/tmp", Start::New);
+    cfg.system_prompt = Some("Be brief.".into());
+    let mut d = AcpDriver::new(Harness::Opencode, cfg);
+    let init = one(&d.handshake());
+    let events = feed(&mut d, &[result(init["id"].clone(), init_result(json!({})))]);
+    assert!(states(&events).contains(&RunState::Error));
+    assert!(d.poll_transmit().is_empty());
 }

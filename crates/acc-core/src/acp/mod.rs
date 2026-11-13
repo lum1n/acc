@@ -6,11 +6,11 @@
 //! `session/resume`), sends `session/prompt` per turn and answers the agent's
 //! `session/request_permission` requests. Everything else arrives as
 //! `session/update` notifications. Targets protocol version 1, checked
-//! against the ACP schema 1.29 (`@agentclientprotocol/sdk` 2.2.0), Cursor
+//! against the ACP schema 1.30, Cursor
 //! 2026.10.22, Copilot 1.0.105 and opencode 2.2.5. Besides the stable
 //! protocol it uses `configOptions`, session compaction, form elicitation
 //! (questions), `$/cancel_request`, and, when the agent offers them,
-//! `session/set_title` and `session/close`.
+//! `session/set_title`, `session/close` and the client system prompt.
 //!
 //! Several clients can share one detached agent (desktop and phone on the
 //! same FIFO and log, see [`crate::detached`]). For that, request ids carry a
@@ -92,6 +92,11 @@ pub struct AcpConfig {
     /// opencode `--auto`, or Copilot `allow_all` after the session opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<String>,
+    /// Client system prompt (`systemPrompt`, `append` mode) sent when the
+    /// session opens; the session fails to open if the agent doesn't
+    /// advertise `sessionCapabilities.systemPrompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 impl AcpConfig {
@@ -102,6 +107,7 @@ impl AcpConfig {
             client_tag: "acc".into(),
             model: None,
             permission: None,
+            system_prompt: None,
         }
     }
 }
@@ -176,6 +182,10 @@ pub struct AcpDriver {
     /// `sessionCapabilities.close`: `session/close` frees a session left behind.
     #[serde(default)]
     close_session: bool,
+    /// `sessionCapabilities.systemPrompt`: `systemPrompt` (append mode) is
+    /// accepted by the session requests.
+    #[serde(default)]
+    system_prompt: bool,
     auth_methods: Vec<(String, String)>,
 
     session_id: Option<String>,
@@ -253,6 +263,7 @@ impl AcpDriver {
             list_sessions: false,
             set_title: false,
             close_session: false,
+            system_prompt: false,
             auth_methods: Vec::new(),
             session_id: None,
             titled: false,
@@ -345,16 +356,30 @@ impl AcpDriver {
         line(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }
 
+    /// Params of a `session/new`, `session/load` or `session/resume`: the
+    /// launch system prompt rides along in `append` mode.
+    fn session_params(&self, session_id: Option<&str>) -> Value {
+        let mut p = json!({ "cwd": self.cfg.cwd, "mcpServers": [] });
+        if let Some(id) = session_id {
+            p["sessionId"] = json!(id);
+        }
+        if let Some(text) = &self.cfg.system_prompt {
+            p["systemPrompt"] = json!({
+                "mode": "append",
+                "content": [{ "type": "text", "text": text }],
+            });
+        }
+        p
+    }
+
     fn open_session(&mut self) -> Vec<u8> {
-        let cwd = self.cfg.cwd.clone();
         match self.cfg.start.clone() {
-            Start::New | Start::Attach => self.request(
-                "session/new",
-                json!({ "cwd": cwd, "mcpServers": [] }),
-                Pending::NewSession,
-            ),
+            Start::New | Start::Attach => {
+                let params = self.session_params(None);
+                self.request("session/new", params, Pending::NewSession)
+            }
             Start::Resume { session_id } => {
-                let params = json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] });
+                let params = self.session_params(Some(&session_id));
                 if self.load_session {
                     self.replaying = true;
                     self.request("session/load", params, Pending::Load { session_id })
@@ -638,6 +663,13 @@ impl AcpDriver {
             self.fail("agent can't load or resume sessions", out);
             return;
         }
+        if self.cfg.system_prompt.is_some() && self.cfg.start != Start::Attach && !self.system_prompt {
+            self.fail(
+                "agent doesn't advertise sessionCapabilities.systemPrompt, so it can't take a system prompt",
+                out,
+            );
+            return;
+        }
         self.phase = Phase::Opening;
         let bytes = self.open_session();
         self.outgoing.extend(bytes);
@@ -657,6 +689,7 @@ impl AcpDriver {
         self.list_sessions = has("list");
         self.set_title = has("title");
         self.close_session = has("close");
+        self.system_prompt = has("systemPrompt");
         self.auth_methods = r
             .get("authMethods")
             .and_then(Value::as_array)
@@ -1773,12 +1806,9 @@ impl Driver for AcpDriver {
                     }
                     _ => Vec::new(),
                 };
-                let cwd = self.cfg.cwd.clone();
-                bytes.extend(self.request(
-                    "session/new",
-                    json!({ "cwd": cwd, "mcpServers": [] }),
-                    Pending::NewSession,
-                ));
+                // The new session keeps the launch system prompt.
+                let params = self.session_params(None);
+                bytes.extend(self.request("session/new", params, Pending::NewSession));
                 Ok(bytes)
             }
             Command::Fork => {
