@@ -292,6 +292,7 @@ export interface SessionSpec {
   launch: LaunchSpec;
   model: string | null;
   permission: string | null;
+  agent?: string;
   resume: string | null;
   fork: boolean;
   native_id: string | null;
@@ -319,6 +320,8 @@ export interface SessionConfig {
   /** The harness's own id of a session to resume. */
   resume?: string | null;
   model?: string | null;
+  /** Agent persona to start with (Copilot `--agent`); other harnesses ignore it. */
+  agent?: string | null;
   /** Unique among clients sharing one harness process. Defaults to "acc". */
   client_tag?: string | null;
   /** Confine the harness (Seatbelt on macOS, bubblewrap on Linux). `{}` is the opinionated preset. */

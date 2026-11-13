@@ -167,6 +167,8 @@ struct SessionConfigJs {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
     client_tag: Option<String>,
     #[serde(default)]
     sandbox: Option<acc_core::sandbox::Sandbox>,
@@ -176,6 +178,7 @@ fn session_config(value: Value) -> Result<SessionConfig> {
     let c: SessionConfigJs = from_js(value, "session config")?;
     let mut config = SessionConfig::new(c.harness, c.cwd);
     config.model = c.model;
+    config.agent = c.agent;
     config.sandbox = c.sandbox;
     if let Some(native_id) = c.resume {
         config.opening = Opening::Resume { native_id };

@@ -59,6 +59,8 @@ export interface SessionConfig {
   /** Defaults to `{ type: "new" }`. */
   opening?: Opening;
   model?: string | null;
+  /** Agent persona to start with (Copilot `--agent`); other harnesses ignore it. */
+  agent?: string | null;
   /** Unique among clients sharing one harness process. Defaults to "acc". */
   client_tag?: string | null;
   /** Confine the harness; `launchSpec()` then carries the rules. */
@@ -429,6 +431,8 @@ struct SessionConfigJs {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
     client_tag: Option<String>,
     #[serde(default)]
     sandbox: Option<acc_core::sandbox::Sandbox>,
@@ -483,6 +487,7 @@ impl Session {
                 cwd: c.cwd,
                 opening,
                 model: c.model,
+                agent: c.agent,
                 client_tag: tag,
                 sandbox: c.sandbox,
             }),

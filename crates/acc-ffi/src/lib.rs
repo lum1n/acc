@@ -175,6 +175,10 @@ pub struct SessionConfig {
     pub opening: Opening,
     #[uniffi(default = None)]
     pub model: Option<String>,
+    /// Agent persona to start with (Copilot `--agent`); other harnesses
+    /// ignore it.
+    #[uniffi(default = None)]
+    pub agent: Option<String>,
     /// Tag for this client's request ids, unique among clients sharing one
     /// harness process (`[A-Za-z0-9_-]`). Defaults to `acc`.
     #[uniffi(default = None)]
@@ -205,6 +209,7 @@ fn core_session_config(config: SessionConfig) -> Result<core_session::SessionCon
         cwd: config.cwd,
         opening,
         model: config.model,
+        agent: config.agent,
         client_tag: tag,
         sandbox: config.sandbox.map(Into::into),
     })
@@ -405,6 +410,7 @@ mod tests {
             cwd: "/tmp".into(),
             opening: Opening::New,
             model: None,
+            agent: None,
             client_tag: None,
         }
     }
