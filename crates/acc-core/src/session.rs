@@ -330,7 +330,7 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
             }))
         }
         Harness::Pi => Box::new(PiDriver::with_id_prefix(tag)),
-        h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode) => {
+        h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity) => {
             let start = match (attach, resume) {
                 (true, _) => Start::Attach,
                 (false, Some(session_id)) => Start::Resume { session_id },
@@ -350,9 +350,7 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
 /// ones). Approval policies are `untrusted`, `on-request`, `never`.
 fn codex_permission_split(permission: Option<&str>) -> (Option<String>, Option<String>) {
     match permission.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) if matches!(p, "untrusted" | "on-request" | "never") => {
-            (Some(p.to_owned()), None)
-        }
+        Some(p) if matches!(p, "untrusted" | "on-request" | "never") => (Some(p.to_owned()), None),
         Some(p) => (None, Some(p.to_owned())),
         None => (None, None),
     }
@@ -363,7 +361,7 @@ fn restore_driver(harness: Harness, state: Value) -> Result<Box<dyn Driver>, ser
         Harness::Claude => Box::new(serde_json::from_value::<ClaudeDriver>(state)?),
         Harness::Codex => Box::new(serde_json::from_value::<CodexDriver>(state)?),
         Harness::Pi => Box::new(serde_json::from_value::<PiDriver>(state)?),
-        Harness::Cursor | Harness::Copilot | Harness::Opencode => {
+        Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity => {
             Box::new(serde_json::from_value::<AcpDriver>(state)?)
         }
     })
@@ -423,9 +421,7 @@ impl Session {
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
-            h if h.native_acp() => {
-                acp_launch(h, spec.model.as_deref(), spec.permission.as_deref())
-            }
+            h if h.native_acp() => acp_launch(h, spec.model.as_deref(), spec.permission.as_deref()),
             Harness::Codex => Harness::Codex.launch(None),
             _ => driver.launch(spec.resume.as_deref()),
         };

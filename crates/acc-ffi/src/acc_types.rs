@@ -47,7 +47,7 @@ macro_rules! mirror_enum {
 
 mirror_enum!(
     /// A supported agent harness.
-    AccHarness <=> Harness { Claude, Codex, Cursor, Copilot, Pi, Opencode }
+    AccHarness <=> Harness { Claude, Codex, Cursor, Copilot, Pi, Opencode, Antigravity }
 );
 mirror_enum!(AccBlockKind <=> BlockKind { Permission, Question, Auth });
 mirror_enum!(AccStateSource <=> StateSource { Heuristic, ScreenMatch, Transcript, Osc7501, Native });

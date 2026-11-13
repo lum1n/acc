@@ -129,7 +129,7 @@ pub fn run(harness: Harness, args: &[&str]) -> Result<ExitCode, String> {
             let spec = d.launch(resume.as_deref());
             (Box::new(d), spec)
         }
-        Harness::Cursor | Harness::Copilot | Harness::Opencode => {
+        Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity => {
             let start = match (&attach, resume.clone()) {
                 // Adopt the running agent from its log instead of opening a session.
                 (Some(_), _) => Start::Attach,

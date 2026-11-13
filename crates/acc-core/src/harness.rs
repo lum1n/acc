@@ -15,6 +15,8 @@ pub enum Harness {
     Copilot,
     Pi,
     Opencode,
+    /// Google Antigravity CLI (`agy`).
+    Antigravity,
 }
 
 /// The wire protocol a driver speaks to a harness.
@@ -85,13 +87,14 @@ impl Launcher {
 }
 
 impl Harness {
-    pub const ALL: [Harness; 6] = [
+    pub const ALL: [Harness; 7] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Cursor,
         Harness::Copilot,
         Harness::Pi,
         Harness::Opencode,
+        Harness::Antigravity,
     ];
 
     /// Executable name looked up on the host's `PATH` (via the login shell).
@@ -103,6 +106,7 @@ impl Harness {
             Harness::Copilot => "copilot",
             Harness::Pi => "pi",
             Harness::Opencode => "opencode",
+            Harness::Antigravity => "agy",
         }
     }
 
@@ -115,6 +119,7 @@ impl Harness {
             Harness::Copilot => "copilot",
             Harness::Pi => "pi",
             Harness::Opencode => "opencode",
+            Harness::Antigravity => "antigravity",
         }
     }
 
@@ -127,12 +132,16 @@ impl Harness {
             Harness::Copilot => "Copilot CLI",
             Harness::Pi => "pi",
             Harness::Opencode => "opencode",
+            Harness::Antigravity => "Antigravity CLI",
         }
     }
 
     /// Whether the harness speaks ACP natively (used as the fallback driver).
     pub fn native_acp(self) -> bool {
-        matches!(self, Harness::Cursor | Harness::Copilot | Harness::Opencode)
+        matches!(
+            self,
+            Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity
+        )
     }
 
     /// The richest protocol ACC drives this harness with.
@@ -140,7 +149,7 @@ impl Harness {
         match self {
             Harness::Claude => Protocol::ClaudeStreamJson,
             Harness::Codex => Protocol::CodexAppServer,
-            Harness::Cursor | Harness::Copilot | Harness::Opencode => Protocol::Acp,
+            Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity => Protocol::Acp,
             Harness::Pi => Protocol::PiRpc,
         }
     }
@@ -188,7 +197,7 @@ impl Harness {
                 }
                 (a, vec![("PI_PROGRAM_STATUS".into(), "1".into())])
             }
-            h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode) => {
+            h @ (Harness::Cursor | Harness::Copilot | Harness::Opencode | Harness::Antigravity) => {
                 return acp_launch_spec(h, None, None);
             }
         };
@@ -217,6 +226,8 @@ impl Harness {
             Harness::Copilot => ("1.0.94", "1.0.105"),
             Harness::Pi => ("0.82.1", "1.4.0"),
             Harness::Opencode => ("1.18.30", "2.2.4"),
+            // agy gained `agy acp` in 1.5.0; not yet run against a recording.
+            Harness::Antigravity => ("1.5.0", "1.5.0"),
         }
     }
 
@@ -345,6 +356,7 @@ pub fn acp_launch_spec(harness: Harness, model: Option<&str>, permission: Option
             }
             args.push("acp".into());
         }
+        // agy: `agy acp`; login and mode are session-level.
         _ => args.push("acp".into()),
     }
     LaunchSpec {
@@ -467,6 +479,7 @@ mod tests {
         assert_eq!(Harness::Cursor.compat("2026.10.01-e373342"), Compat::Tested);
         assert_eq!(Harness::Opencode.compat("opencode v2.0.14"), Compat::Tested);
         assert_eq!(Harness::Opencode.compat("opencode v2.3.0"), Compat::Newer);
+        assert_eq!(Harness::Antigravity.compat("agy 1.5.0"), Compat::Tested);
         assert_eq!(Harness::Pi.compat("1.1.0"), Compat::Tested);
         assert_eq!(
             Harness::Copilot.compat("GitHub Copilot CLI 1.0.95."),
@@ -491,6 +504,8 @@ mod tests {
             assert_eq!(spec.protocol, h.preferred_protocol());
         }
         assert_eq!(Harness::Opencode.launch(None).args, ["acp"]);
+        let agy = Harness::Antigravity.launch(None);
+        assert_eq!((agy.program.as_str(), agy.args), ("agy", vec!["acp".to_owned()]));
     }
 
     #[test]

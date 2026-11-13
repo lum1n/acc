@@ -37,7 +37,7 @@ pub use session::*;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_TYPES: &str = r#"
-export type HarnessId = "claude" | "codex" | "cursor" | "copilot" | "pi" | "opencode";
+export type HarnessId = "claude" | "codex" | "cursor" | "copilot" | "pi" | "opencode" | "antigravity";
 
 export interface HarnessInfo {
   harness: HarnessId;

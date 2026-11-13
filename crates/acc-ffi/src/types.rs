@@ -21,6 +21,7 @@ pub enum Harness {
     Copilot,
     Pi,
     Opencode,
+    Antigravity,
 }
 
 impl From<core_h::Harness> for Harness {
@@ -32,6 +33,7 @@ impl From<core_h::Harness> for Harness {
             core_h::Harness::Copilot => Self::Copilot,
             core_h::Harness::Pi => Self::Pi,
             core_h::Harness::Opencode => Self::Opencode,
+            core_h::Harness::Antigravity => Self::Antigravity,
         }
     }
 }
@@ -45,6 +47,7 @@ impl From<Harness> for core_h::Harness {
             Harness::Copilot => Self::Copilot,
             Harness::Pi => Self::Pi,
             Harness::Opencode => Self::Opencode,
+            Harness::Antigravity => Self::Antigravity,
         }
     }
 }
