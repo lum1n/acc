@@ -1894,7 +1894,16 @@ fn advertised_title_and_close_are_used() {
 fn cursor_lists_tui_builtins_and_yolo_permission() {
     let mut d = driver(Harness::Cursor, Start::New);
     let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
-    for need in ["model", "plan", "ask", "mcp", "summarize", "btw", "config", "clear"] {
+    for need in [
+        "model",
+        "plan",
+        "ask",
+        "mcp",
+        "summarize",
+        "btw",
+        "config",
+        "clear",
+    ] {
         assert!(names.contains(&need), "missing {need} in {names:?}");
     }
     let perm = d

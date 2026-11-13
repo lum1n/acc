@@ -309,16 +309,8 @@ impl OptionState {
         {
             let (values, labels) = match harness {
                 Harness::Cursor => (
-                    vec![
-                        "default".into(),
-                        "auto-review".into(),
-                        "yolo".into(),
-                    ],
-                    vec![
-                        "Allowlist".into(),
-                        "Auto-review".into(),
-                        "Run everything".into(),
-                    ],
+                    vec!["default".into(), "auto-review".into(), "yolo".into()],
+                    vec!["Allowlist".into(), "Auto-review".into(), "Run everything".into()],
                 ),
                 _ => (
                     vec!["default".into(), "auto".into()],
@@ -329,10 +321,7 @@ impl OptionState {
                 id: OptionId::Permission,
                 values,
                 labels,
-                current: self
-                    .spawn_permission
-                    .clone()
-                    .or_else(|| Some("default".into())),
+                current: self.spawn_permission.clone().or_else(|| Some("default".into())),
                 apply: Apply::Restart,
             });
             self.routes.push((OptionId::Permission, Route::SpawnFlag));

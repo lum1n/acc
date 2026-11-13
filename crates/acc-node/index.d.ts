@@ -300,6 +300,7 @@ export interface SessionSpec {
   parent: string | null;
   labels?: Record<string, string>;
   worktree?: string;
+  deny_instead_of_prompting?: boolean;
 }
 
 /** A detached session on a host. */

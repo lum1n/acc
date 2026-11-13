@@ -100,6 +100,11 @@ pub struct LaunchRequest {
     /// is the opinionated preset; `None` runs it unconfined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
+    /// Claude only: a tool call that would wait on a permission prompt is
+    /// denied and the turn continues (`permissions.denyInsteadOfPrompting`),
+    /// for sessions nobody is watching.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deny_instead_of_prompting: bool,
 }
 
 /// Everything another client needs to attach; stored as `spec.json`.
@@ -135,6 +140,9 @@ pub struct SessionSpec {
     /// for this harness are in `launch.sandbox`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
+    /// See [`LaunchRequest::deny_instead_of_prompting`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deny_instead_of_prompting: bool,
 }
 
 impl SessionSpec {
@@ -159,6 +167,7 @@ impl SessionSpec {
             launcher: None,
             worktree: None,
             sandbox: None,
+            deny_instead_of_prompting: false,
         }
     }
 
@@ -316,6 +325,7 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
             // Only the client that launches a fresh session asks, and not
             // when the embedder named it.
             auto_title: !attach && spec.resume.is_none() && spec.title.is_none(),
+            deny_instead_of_prompting: spec.deny_instead_of_prompting,
         })),
         Harness::Codex => {
             let (approval_policy, permissions) = codex_permission_split(spec.permission.as_deref());
@@ -350,9 +360,7 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
 /// ones). Approval policies are `untrusted`, `on-request`, `never`.
 fn codex_permission_split(permission: Option<&str>) -> (Option<String>, Option<String>) {
     match permission.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) if matches!(p, "untrusted" | "on-request" | "never") => {
-            (Some(p.to_owned()), None)
-        }
+        Some(p) if matches!(p, "untrusted" | "on-request" | "never") => (Some(p.to_owned()), None),
         Some(p) => (None, Some(p.to_owned())),
         None => (None, None),
     }
@@ -420,12 +428,11 @@ impl Session {
             launcher: req.launcher.clone(),
             worktree: req.worktree.clone(),
             sandbox: req.sandbox.clone(),
+            deny_instead_of_prompting: req.deny_instead_of_prompting,
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
-            h if h.native_acp() => {
-                acp_launch(h, spec.model.as_deref(), spec.permission.as_deref())
-            }
+            h if h.native_acp() => acp_launch(h, spec.model.as_deref(), spec.permission.as_deref()),
             Harness::Codex => Harness::Codex.launch(None),
             _ => driver.launch(spec.resume.as_deref()),
         };
@@ -515,6 +522,7 @@ impl Session {
             launcher: spec.launcher.clone(),
             worktree: spec.worktree.clone(),
             sandbox: spec.sandbox.clone(),
+            deny_instead_of_prompting: spec.deny_instead_of_prompting,
         };
         // The same session: snapshots taken before still match it.
         Self::launch(req, &spec.id, client_tag, spec.created_ms)
@@ -910,6 +918,7 @@ impl Session {
             launcher: self.spec.launcher.clone(),
             worktree: self.spec.worktree.clone(),
             sandbox: self.spec.sandbox.clone(),
+            deny_instead_of_prompting: self.spec.deny_instead_of_prompting,
         }
     }
 

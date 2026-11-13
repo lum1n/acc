@@ -1210,6 +1210,10 @@ pub struct AccLaunchRequest {
     /// Confine the harness; `None` runs it unconfined.
     #[uniffi(default = None)]
     pub sandbox: Option<AccSandbox>,
+    /// Claude: deny tool calls that would wait on a permission prompt
+    /// instead of asking, for unattended sessions.
+    #[uniffi(default = false)]
+    pub deny_instead_of_prompting: bool,
 }
 
 impl From<AccLaunchRequest> for LaunchRequest {
@@ -1230,6 +1234,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
             sandbox: r.sandbox.map(Into::into),
+            deny_instead_of_prompting: r.deny_instead_of_prompting,
         }
     }
 }
@@ -1252,6 +1257,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
             sandbox: r.sandbox.map(Into::into),
+            deny_instead_of_prompting: r.deny_instead_of_prompting,
         }
     }
 }
@@ -1276,6 +1282,8 @@ pub struct AccSessionSpec {
     pub worktree: Option<String>,
     /// The sandbox the session asked for.
     pub sandbox: Option<AccSandbox>,
+    /// See `AccLaunchRequest::deny_instead_of_prompting`.
+    pub deny_instead_of_prompting: bool,
     /// The full spec, to persist and pass back to `AccSession.attach`.
     pub json: String,
 }
@@ -1296,6 +1304,7 @@ impl From<&SessionSpec> for AccSessionSpec {
             launcher: s.launcher.clone().map(Into::into),
             worktree: s.worktree.clone(),
             sandbox: s.sandbox.clone().map(Into::into),
+            deny_instead_of_prompting: s.deny_instead_of_prompting,
             json: s.to_json(),
         }
     }
