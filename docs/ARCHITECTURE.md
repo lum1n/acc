@@ -111,6 +111,11 @@ ACP harnesses). A prompt sent before the driver has a session (`AcpDriver` befor
 flushed once it does, rather than dropped with `DriverError::NotStarted`; Claude, pi and the rest of
 ACP's commands have no such readiness gate.
 
+`Command::Interrupt` sends `session/cancel`, which stops only the foreground turn: background tasks and shell
+commands keep running (Copilot CLI 1.0.106, ACP v2). Tool calls the cancelled turn left open are closed with it,
+and their later `tool_call_update`s update the item (and complete it again when final) without moving the
+`RunState` back to `Working`.
+
 ## Items
 
 Every harness reports the same kinds of items (messages, reasoning, tool calls, commands, file
