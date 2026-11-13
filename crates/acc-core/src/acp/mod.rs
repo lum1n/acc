@@ -116,6 +116,12 @@ enum Pending {
     Resume { session_id: String },
     Fork,
     Prompt,
+    /// `_session/steering`, with the prompt to send as a normal one if the
+    /// turn had already ended.
+    Steer {
+        text: String,
+        attachments: Vec<Attachment>,
+    },
     SetConfig,
     SetMode { mode: String },
     SetModel { model: String },
@@ -176,6 +182,9 @@ pub struct AcpDriver {
     /// `sessionCapabilities.close`: `session/close` frees a session left behind.
     #[serde(default)]
     close_session: bool,
+    /// `_meta.steering.supported`: `_session/steering` redirects a running turn.
+    #[serde(default)]
+    steering: bool,
     auth_methods: Vec<(String, String)>,
 
     session_id: Option<String>,
@@ -253,6 +262,7 @@ impl AcpDriver {
             list_sessions: false,
             set_title: false,
             close_session: false,
+            steering: false,
             auth_methods: Vec::new(),
             session_id: None,
             titled: false,
@@ -371,13 +381,7 @@ impl AcpDriver {
     /// carries no text block.
     fn prompt(&mut self, text: &str, attachments: &[Attachment]) -> Result<Vec<u8>, DriverError> {
         let sid = self.require_session()?;
-        let mut prompt = Vec::new();
-        if !text.is_empty() || attachments.is_empty() {
-            prompt.push(json!({ "type": "text", "text": text }));
-        }
-        for a in attachments {
-            prompt.push(json!({ "type": "image", "mimeType": a.media_type, "data": a.data }));
-        }
+        let prompt = prompt_blocks(text, attachments);
         let bytes = self.request(
             "session/prompt",
             json!({ "sessionId": sid, "prompt": prompt }),
@@ -389,6 +393,30 @@ impl AcpDriver {
     /// Checks image support and sends, for a prompt whose session is ready
     /// (either immediately, or flushed from [`Self::queued_prompts`]).
     fn try_prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<Vec<u8>, DriverError> {
+        if self.steering
+            && self.turn_running()
+            && let Ok(sid) = self.require_session()
+        {
+            if !attachments.is_empty() && !self.prompt_images {
+                return Err(DriverError::Unsupported {
+                    harness: self.harness,
+                    what: "images (the agent did not advertise promptCapabilities.image)",
+                });
+            }
+            let prompt = prompt_blocks(&text, &attachments);
+            let shown = if text.is_empty() {
+                "[image]".to_owned()
+            } else {
+                text.clone()
+            };
+            let bytes = self.request(
+                "_session/steering",
+                json!({ "sessionId": sid, "prompt": prompt }),
+                Pending::Steer { text, attachments },
+            );
+            self.echo_steer(&shown);
+            return Ok(bytes);
+        }
         if !attachments.is_empty() && !self.prompt_images {
             return Err(DriverError::Unsupported {
                 harness: self.harness,
@@ -398,6 +426,24 @@ impl AcpDriver {
         let bytes = self.prompt(&text, &attachments)?;
         self.echo_prompt(if text.is_empty() { "[image]" } else { &text });
         Ok(bytes)
+    }
+
+    /// Whether a `session/prompt` is awaiting its response.
+    fn turn_running(&self) -> bool {
+        self.pending.values().any(|p| matches!(p, Pending::Prompt))
+    }
+
+    /// Shows a steering prompt. It belongs to the turn already running, so
+    /// unlike [`Self::echo_prompt`] it doesn't open another turn.
+    fn echo_steer(&mut self, text: &str) {
+        self.echo_seq += 1;
+        self.history_next += 1;
+        push_prompt(
+            &mut self.items,
+            format!("prompt-{}", self.echo_seq),
+            text,
+            &mut self.echoes,
+        );
     }
 
     fn echo_prompt(&mut self, text: &str) {
@@ -524,6 +570,16 @@ impl AcpDriver {
                 self.on_turn_end(&r, out);
                 self.ask_title();
             }
+            Pending::Steer { text, attachments } => {
+                // The turn ended before the agent could take the steer: it
+                // was shown as part of that turn, so send it as the next.
+                if r.get("outcome").and_then(Value::as_str) == Some("promptRequired") {
+                    self.history_next = self.history_next.saturating_sub(1);
+                    if let Ok(bytes) = self.try_prompt(text, attachments) {
+                        self.outgoing.extend(bytes);
+                    }
+                }
+            }
             Pending::ListSessions => self.listed_sessions(&r, out),
             Pending::SetConfig => {
                 if r.get("configOptions").is_some() {
@@ -596,12 +652,14 @@ impl AcpDriver {
             }
             // A rejected fork, setting or name leaves the session as it was.
             Pending::Fork
+            | Pending::Steer { .. }
             | Pending::SetConfig
             | Pending::SetMode { .. }
             | Pending::SetModel { .. }
             | Pending::SetTitle { .. } => {
                 let what = match kind {
                     Pending::Fork => "fork the session",
+                    Pending::Steer { .. } => "steer the turn",
                     Pending::SetMode { .. } => "change the mode",
                     Pending::SetModel { .. } => "change the model",
                     Pending::SetTitle { .. } => "rename the session",
@@ -657,6 +715,11 @@ impl AcpDriver {
         self.list_sessions = has("list");
         self.set_title = has("title");
         self.close_session = has("close");
+        // opencode 2.2.7 advertises it beside `agentCapabilities`.
+        self.steering = [r.get("_meta"), caps.get("_meta")]
+            .into_iter()
+            .flatten()
+            .any(|m| m.pointer("/steering/supported").and_then(Value::as_bool) == Some(true));
         self.auth_methods = r
             .get("authMethods")
             .and_then(Value::as_array)
@@ -1961,8 +2024,7 @@ impl AcpDriver {
             self.opts.spawn_model = Some(value.clone());
             self.opts.rebuild(self.harness);
         }
-        if matches!(self.harness, Harness::Cursor | Harness::Opencode) && id == OptionId::Permission
-        {
+        if matches!(self.harness, Harness::Cursor | Harness::Opencode) && id == OptionId::Permission {
             self.opts.spawn_permission = Some(normalize_permission(self.harness, &value));
             self.cfg.permission = self.opts.spawn_permission.clone();
             self.opts.rebuild(self.harness);
@@ -1996,6 +2058,19 @@ impl AcpDriver {
 }
 
 pub use crate::harness::acp_launch_spec as launch_spec;
+
+/// The content blocks of a prompt: text, then images. An image-only prompt
+/// carries no text block.
+fn prompt_blocks(text: &str, attachments: &[Attachment]) -> Vec<Value> {
+    let mut prompt = Vec::new();
+    if !text.is_empty() || attachments.is_empty() {
+        prompt.push(json!({ "type": "text", "text": text }));
+    }
+    for a in attachments {
+        prompt.push(json!({ "type": "image", "mimeType": a.media_type, "data": a.data }));
+    }
+    prompt
+}
 
 fn push_prompt(items: &mut ItemFeed, id: ItemId, text: &str, out: &mut Vec<Event>) {
     items.start(id.clone(), ItemKind::UserMessage, None, Value::Null, out);

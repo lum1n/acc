@@ -1939,3 +1939,84 @@ fn opencode_auto_permission_is_a_spawn_flag() {
     let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"compact") && names.contains(&"undo"), "{names:?}");
 }
+
+/// An opencode 2.2.7 driver with a session open; its `initialize` result
+/// advertises steering in the top-level `_meta`, beside `agentCapabilities`.
+fn ready_steerable(meta: Value) -> AcpDriver {
+    let mut d = driver(Harness::Opencode, Start::New);
+    let init = one(&d.handshake());
+    let mut r = init_result(json!({ "loadSession": true }));
+    r["_meta"] = meta;
+    feed(&mut d, &[result(init["id"].clone(), r)]);
+    let new = one(&d.poll_transmit());
+    feed(&mut d, &[result(new["id"].clone(), json!({ "sessionId": "s1" }))]);
+    d.take_events();
+    d
+}
+
+#[test]
+fn a_prompt_during_a_turn_steers_when_advertised() {
+    let mut d = ready_steerable(json!({ "steering": { "supported": true } }));
+    // Idle: a normal prompt.
+    let first = one(&d.command(Command::prompt("fix the build")).expect("prompt"));
+    assert_eq!(first["method"], "session/prompt");
+    d.take_events();
+    // Running: `_session/steering`.
+    let steer = one(&d.command(Command::prompt("also run clippy")).expect("steer"));
+    assert_eq!(steer["method"], "_session/steering");
+    assert_eq!(steer["params"]["sessionId"], "s1");
+    assert_eq!(
+        steer["params"]["prompt"],
+        json!([{ "type": "text", "text": "also run clippy" }])
+    );
+    assert_eq!(
+        prompts(&d.take_events()),
+        [("prompt-2".to_owned(), "also run clippy".to_owned())]
+    );
+    feed(
+        &mut d,
+        &[result(steer["id"].clone(), json!({ "outcome": "injected" }))],
+    );
+    assert!(d.poll_transmit().is_empty());
+    // The turn is still the first prompt's.
+    let events = feed(
+        &mut d,
+        &[result(first["id"].clone(), json!({ "stopReason": "end_turn" }))],
+    );
+    assert!(events.contains(&Event::TurnCompleted));
+    // Idle again: a normal prompt.
+    let next = one(&d.command(Command::prompt("thanks")).expect("prompt"));
+    assert_eq!(next["method"], "session/prompt");
+}
+
+#[test]
+fn a_steer_that_missed_the_turn_is_sent_as_a_prompt() {
+    let mut d = ready_steerable(json!({ "steering": { "supported": true } }));
+    let go = one(&d.command(Command::prompt("go")).expect("prompt"));
+    let steer = one(&d.command(Command::prompt("late")).expect("steer"));
+    // The turn ended while the steer was on its way.
+    feed(
+        &mut d,
+        &[result(go["id"].clone(), json!({ "stopReason": "end_turn" }))],
+    );
+    feed(
+        &mut d,
+        &[result(
+            steer["id"].clone(),
+            json!({ "outcome": "promptRequired", "reason": "noRunningTurn" }),
+        )],
+    );
+    let resent = one(&d.poll_transmit());
+    assert_eq!(resent["method"], "session/prompt");
+    assert_eq!(resent["params"]["prompt"][0]["text"], "late");
+}
+
+#[test]
+fn no_steering_without_the_capability() {
+    for meta in [Value::Null, json!({ "steering": { "supported": false } })] {
+        let mut d = ready_steerable(meta);
+        d.command(Command::prompt("go")).expect("prompt");
+        let second = one(&d.command(Command::prompt("more")).expect("prompt"));
+        assert_eq!(second["method"], "session/prompt");
+    }
+}
