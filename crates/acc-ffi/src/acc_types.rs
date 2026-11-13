@@ -1210,6 +1210,10 @@ pub struct AccLaunchRequest {
     /// Confine the harness; `None` runs it unconfined.
     #[uniffi(default = None)]
     pub sandbox: Option<AccSandbox>,
+    /// Instructions appended to the harness's own system prompt (Claude,
+    /// pi, Codex, and ACP agents that advertise it).
+    #[uniffi(default = None)]
+    pub system_prompt: Option<String>,
 }
 
 impl From<AccLaunchRequest> for LaunchRequest {
@@ -1230,6 +1234,7 @@ impl From<AccLaunchRequest> for LaunchRequest {
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
             sandbox: r.sandbox.map(Into::into),
+            system_prompt: r.system_prompt,
         }
     }
 }
@@ -1252,6 +1257,7 @@ impl From<LaunchRequest> for AccLaunchRequest {
             launcher: r.launcher.map(Into::into),
             worktree: r.worktree,
             sandbox: r.sandbox.map(Into::into),
+            system_prompt: r.system_prompt,
         }
     }
 }

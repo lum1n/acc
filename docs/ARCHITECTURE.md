@@ -256,7 +256,7 @@ the PID alone. Such a session is `interrupted`. Nothing brings it back on its ow
 `Session::revive(spec)` (core, `AccSession.revive` in ffi and wasm) or
 `acc_ssh::Session::revive(host, id)` (`revive_session` in ffi, `reviveSession` in node). Revive
 relaunches the same id from `spec.json` and resumes the harness's own session (`native_id`) with the
-stored model, permission, launcher, worktree, sandbox, title and labels. It fails with
+stored model, permission, system prompt, launcher, worktree, sandbox, title and labels. It fails with
 `NotResumable` when the harness never reported its id, and with `EXIT_RUNNING` while it still runs.
 The new run appends to the same log. The launch output's `L <bytes>` line tells the launching client
 where its own run starts: `on_launched` moves `offset` there, so the new driver never matches the old
@@ -353,6 +353,13 @@ gets `permissions.allow`/`deny` in `.claude/settings.local.json` (`Bash(npm test
 Cursor `Shell(...)`/`Read(...)`/`Write(...)` in `.cursor/cli.json`, and opencode `permission.bash`
 patterns and `edit`/`webfetch` in `opencode.json` (left alone when it has comments). Copilot and pi
 have no rules file.
+
+**System prompt.** `LaunchRequest::system_prompt` adds instructions to the harness's own system prompt (append
+only; replacing it is not offered). Claude and pi get `--append-system-prompt`, Codex the thread's
+`developerInstructions` (start, resume and fork), and ACP agents `systemPrompt` in `append` mode on
+`session/new`, `load` and `resume` when they advertise `sessionCapabilities.systemPrompt`. An ACP agent that
+doesn't makes the session fail to open (state `error`) rather than run without the instructions. The text is kept
+in `spec.json` and carried over by revive, fork, restart and handoff.
 
 **Worktrees.** Several agents can work on one repository at once, each in a git worktree of its
 own. `worktree::add_script(cwd, name, base)` (`worktree_add_exec` in the bindings; use the session
