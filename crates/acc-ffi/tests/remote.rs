@@ -40,6 +40,7 @@ fn session_config(harness: Harness) -> SessionConfig {
         cwd: "/tmp".into(),
         opening: Opening::New,
         model: None,
+        agent: None,
         client_tag: None,
     }
 }

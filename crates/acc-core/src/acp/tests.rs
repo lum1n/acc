@@ -1206,20 +1206,26 @@ fn garbage_is_kept_not_fatal() {
 
 #[test]
 fn launch_specs() {
-    assert_eq!(launch_spec(Harness::Cursor, None, None).args, ["acp"]);
+    assert_eq!(launch_spec(Harness::Cursor, None, None, None).args, ["acp"]);
     assert_eq!(
-        launch_spec(Harness::Cursor, None, Some("yolo")).args,
+        launch_spec(Harness::Cursor, None, Some("yolo"), None).args,
         ["--yolo", "acp"]
     );
     assert_eq!(
-        launch_spec(Harness::Cursor, Some("gpt-5"), Some("auto-review")).args,
+        launch_spec(Harness::Cursor, Some("gpt-5"), Some("auto-review"), None).args,
         ["--model", "gpt-5", "--auto-review", "acp"]
     );
     assert_eq!(
-        launch_spec(Harness::Copilot, Some("gpt-5.4"), None).args,
+        launch_spec(Harness::Copilot, Some("gpt-5.4"), None, None).args,
         ["--acp", "--model", "gpt-5.4"]
     );
-    let oc = launch_spec(Harness::Opencode, Some("ignored"), Some("auto"));
+    assert_eq!(
+        launch_spec(Harness::Copilot, Some("gpt-5.4"), None, Some("reviewer")).args,
+        ["--acp", "--model", "gpt-5.4", "--agent", "reviewer"]
+    );
+    // Only Copilot takes a persona at spawn.
+    assert_eq!(launch_spec(Harness::Cursor, None, None, Some("x")).args, ["acp"]);
+    let oc = launch_spec(Harness::Opencode, Some("ignored"), Some("auto"), None);
     assert_eq!(
         (oc.program.as_str(), oc.args.as_slice()),
         ("opencode", ["--auto".to_owned(), "acp".to_owned()].as_slice())

@@ -44,6 +44,9 @@ pub struct SessionConfig {
     pub opening: Opening,
     /// Model to start with, where the harness takes one at launch.
     pub model: Option<String>,
+    /// Agent persona to start with (Copilot `--agent`); other harnesses
+    /// ignore it.
+    pub agent: Option<String>,
     /// Tag for this client's request ids, unique among clients sharing one
     /// harness process (`[A-Za-z0-9_-]`). Used by Claude, ACP and pi.
     pub client_tag: String,
@@ -58,6 +61,7 @@ impl SessionConfig {
             cwd: cwd.into(),
             opening: Opening::New,
             model: None,
+            agent: None,
             client_tag: "acc".into(),
             sandbox: None,
         }
@@ -94,6 +98,7 @@ impl Session {
             cwd,
             opening,
             model,
+            agent,
             client_tag,
             sandbox,
         } = config;
@@ -139,6 +144,7 @@ impl Session {
                 };
                 let mut cfg = AcpConfig::new(cwd, start);
                 cfg.model = model;
+                cfg.agent = agent;
                 cfg.client_tag = client_tag;
                 let d = AcpDriver::new(harness, cfg);
                 let spec = d.launch(None);
@@ -344,6 +350,18 @@ mod tests {
         cfg.client_tag = "phone-3f2a".into();
         let start = String::from_utf8(Session::new(cfg).start()).expect("utf8");
         assert!(start.contains(r#""request_id":"phone-3f2a-1""#), "{start}");
+    }
+
+    #[test]
+    fn copilot_agent_persona_is_a_spawn_flag() {
+        let mut cfg = SessionConfig::new(Harness::Copilot, "/tmp");
+        cfg.agent = Some("reviewer".into());
+        let s = Session::new(cfg);
+        assert!(
+            s.launch_spec()
+                .args
+                .ends_with(&["--agent".into(), "reviewer".into()])
+        );
     }
 
     #[test]

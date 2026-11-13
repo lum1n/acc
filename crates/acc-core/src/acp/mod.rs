@@ -92,6 +92,10 @@ pub struct AcpConfig {
     /// opencode `--auto`, or Copilot `allow_all` after the session opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<String>,
+    /// Agent persona passed at spawn (Copilot `--agent`): its prompt and
+    /// tools apply from startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl AcpConfig {
@@ -102,6 +106,7 @@ impl AcpConfig {
             client_tag: "acc".into(),
             model: None,
             permission: None,
+            agent: None,
         }
     }
 }
@@ -1661,6 +1666,7 @@ impl Driver for AcpDriver {
             self.harness,
             self.opts.spawn_model.as_deref(),
             self.opts.spawn_permission.as_deref(),
+            self.cfg.agent.as_deref(),
         )
     }
 
