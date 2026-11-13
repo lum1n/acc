@@ -51,6 +51,26 @@ fn states(events: &[Event]) -> Vec<RunState> {
 }
 
 #[test]
+fn launch_names_acc_resume_command_and_can_deny_instead_of_prompting() {
+    let spec = ClaudeDriver::default().launch(None);
+    assert!(
+        spec.env
+            .iter()
+            .any(|(k, v)| { k == "CLAUDE_CODE_RESUME_HINT_COMMAND" && v.starts_with("acc run claude") })
+    );
+    assert!(!spec.args.iter().any(|a| a == "--settings"));
+
+    let d = ClaudeDriver::new(ClaudeConfig {
+        deny_instead_of_prompting: true,
+        ..ClaudeConfig::default()
+    });
+    let args = d.launch(None).args;
+    let i = args.iter().position(|a| a == "--settings").expect("--settings");
+    let v: Value = serde_json::from_str(&args[i + 1]).unwrap();
+    assert_eq!(v["permissions"]["denyInsteadOfPrompting"], true);
+}
+
+#[test]
 fn launch_spec_requests_control_protocol() {
     let d = ClaudeDriver::new(ClaudeConfig {
         model: Some("opus".into()),

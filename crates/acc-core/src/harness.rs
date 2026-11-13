@@ -177,7 +177,14 @@ impl Harness {
                 // Authoritative idle/running/requires_action frames.
                 (
                     a,
-                    vec![("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into())],
+                    vec![
+                        ("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into()),
+                        // The exit hint names ACC's command, not `claude --resume`.
+                        (
+                            "CLAUDE_CODE_RESUME_HINT_COMMAND".into(),
+                            "acc run claude --resume".into(),
+                        ),
+                    ],
                 )
             }
             Harness::Codex => (s(&["app-server"]), vec![]),

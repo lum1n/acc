@@ -515,6 +515,7 @@ mod tests {
     fn launch_attach_feed_round_trip_through_ffi_types() {
         let req = AccLaunchRequest {
             sandbox: None,
+            deny_instead_of_prompting: false,
             harness: AccHarness::Claude,
             cwd: "/w".into(),
             model: None,
@@ -556,6 +557,7 @@ mod tests {
     fn images_cross_as_bytes_and_oversized_ones_are_rejected() {
         let req = AccLaunchRequest {
             sandbox: None,
+            deny_instead_of_prompting: false,
             harness: AccHarness::Claude,
             cwd: "/w".into(),
             model: None,
@@ -608,6 +610,7 @@ mod tests {
         const SUB: &[u8] = include_bytes!("../../acc-core/tests/fixtures/claude/subagents.ndjson");
         let req = AccLaunchRequest {
             sandbox: None,
+            deny_instead_of_prompting: false,
             harness: AccHarness::Claude,
             cwd: "/w".into(),
             model: None,
@@ -654,6 +657,7 @@ mod tests {
         let s = AccSession::launch(
             AccLaunchRequest {
                 sandbox: None,
+                deny_instead_of_prompting: false,
                 harness: AccHarness::Claude,
                 cwd: "/w".into(),
                 model: None,
@@ -694,6 +698,7 @@ mod tests {
         let s = AccSession::launch(
             AccLaunchRequest {
                 sandbox: None,
+                deny_instead_of_prompting: false,
                 harness: AccHarness::Claude,
                 cwd: "/w".into(),
                 model: None,
@@ -735,6 +740,7 @@ mod tests {
         let s = AccSession::launch(
             AccLaunchRequest {
                 sandbox: None,
+                deny_instead_of_prompting: false,
                 harness: AccHarness::Claude,
                 cwd: "/w".into(),
                 model: None,

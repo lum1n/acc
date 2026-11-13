@@ -104,6 +104,11 @@ pub struct ClaudeConfig {
     /// (headless Claude doesn't on its own).
     #[serde(default)]
     pub auto_title: bool,
+    /// `permissions.denyInsteadOfPrompting` at spawn: a tool call that would
+    /// wait on a permission prompt is denied and the turn continues. For
+    /// unattended sessions; ACC then never sees those as requests.
+    #[serde(default)]
+    pub deny_instead_of_prompting: bool,
 }
 
 /// What a control request ACC sent was for, so its reply can be applied.
@@ -1572,6 +1577,12 @@ impl Driver for ClaudeDriver {
         }
         if let Some(mode) = &self.config.permission_mode {
             spec.args.extend(["--permission-mode".to_owned(), mode.clone()]);
+        }
+        if self.config.deny_instead_of_prompting {
+            spec.args.extend([
+                "--settings".to_owned(),
+                json!({"permissions": {"denyInsteadOfPrompting": true}}).to_string(),
+            ]);
         }
         if self.config.fork && resume.is_some() {
             spec.args.push("--fork-session".to_owned());
