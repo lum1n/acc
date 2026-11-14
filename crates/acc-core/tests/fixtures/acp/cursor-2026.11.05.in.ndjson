@@ -1,0 +1,6 @@
+{"id":"cli2605234-0","jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{"elicitation":{"form":{}},"fs":{"readTextFile":false,"writeTextFile":false},"session":{"compaction":{},"configOptions":{"boolean":{}}},"terminal":false},"clientInfo":{"name":"acc","title":"Agent Control Core","version":"0.3.0"},"protocolVersion":1}}
+{"id":"cli2605234-1","jsonrpc":"2.0","method":"session/new","params":{"cwd":"/home/v/proj","mcpServers":[]}}
+{"id":"cli2605234-2","jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"Run echo acc-live-test","type":"text"}],"sessionId":"0060d593-07fb-40f8-a1b3-617721ce1e8e"}}
+{"id":0,"jsonrpc":"2.0","result":{"outcome":{"optionId":"allow-once","outcome":"selected"}}}
+{"id":"cli2605234-3","jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"Use a subagent (the Task tool) to list the files in this directory and report back what it found.","type":"text"}],"sessionId":"0060d593-07fb-40f8-a1b3-617721ce1e8e"}}
+{"error":{"code":-32601,"message":"cursor/task is not supported by ACC"},"id":1,"jsonrpc":"2.0"}
