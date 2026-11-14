@@ -1335,6 +1335,19 @@ mod tests {
     }
 
     #[test]
+    fn codex_permission_splits_into_policy_or_profile() {
+        assert_eq!(codex_permission_split(None), (None, None));
+        assert_eq!(codex_permission_split(Some("  ")), (None, None));
+        for p in ["untrusted", "on-request", "never"] {
+            assert_eq!(codex_permission_split(Some(p)), (Some(p.into()), None));
+        }
+        assert_eq!(
+            codex_permission_split(Some(" :workspace ")),
+            (None, Some(":workspace".into()))
+        );
+    }
+
+    #[test]
     fn launches_inside_the_launcher_and_relaunches_keep_it() {
         let mut r = req(Harness::Claude);
         r.launcher = Some(Launcher {

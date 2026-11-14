@@ -494,6 +494,51 @@ mod tests {
     }
 
     #[test]
+    fn cursor_permission_modes_map_to_flags() {
+        for p in [
+            "yolo",
+            " YOLO ",
+            "force",
+            "unrestricted",
+            "run-everything",
+            "bypass",
+        ] {
+            assert_eq!(cursor_permission_flag(Some(p)), Some("--yolo"), "{p:?}");
+        }
+        for p in ["auto-review", "auto_review", "Auto"] {
+            assert_eq!(cursor_permission_flag(Some(p)), Some("--auto-review"), "{p:?}");
+        }
+        for p in [None, Some(""), Some("default"), Some("nonsense")] {
+            assert_eq!(cursor_permission_flag(p), None, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn opencode_auto_accepts_only_approving_modes() {
+        for p in ["auto", "yolo", "allow_all", "allow-all", "on", "TRUE", " auto "] {
+            assert!(opencode_auto(Some(p)), "{p:?}");
+        }
+        for p in [None, Some(""), Some("default"), Some("off"), Some("auto-review")] {
+            assert!(!opencode_auto(p), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn permission_reaches_the_acp_launch_flags() {
+        let cursor = acp_launch_spec(Harness::Cursor, Some("m"), Some("yolo"));
+        assert_eq!(cursor.args, ["--model", "m", "--yolo", "acp"]);
+        let cursor = acp_launch_spec(Harness::Cursor, None, Some("default"));
+        assert_eq!(cursor.args, ["acp"]);
+        let opencode = acp_launch_spec(Harness::Opencode, None, Some("auto"));
+        assert_eq!(opencode.args, ["--auto", "acp"]);
+        let opencode = acp_launch_spec(Harness::Opencode, None, Some("default"));
+        assert_eq!(opencode.args, ["acp"]);
+        // Copilot takes no spawn flag for permission.
+        let copilot = acp_launch_spec(Harness::Copilot, None, Some("yolo"));
+        assert_eq!(copilot.args, ["--acp"]);
+    }
+
+    #[test]
     fn pi_forces_program_status() {
         let spec = Harness::Pi.launch(None);
         assert!(spec.env.contains(&("PI_PROGRAM_STATUS".into(), "1".into())));
