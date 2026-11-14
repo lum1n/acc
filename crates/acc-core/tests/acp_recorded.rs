@@ -1,6 +1,6 @@
 //! Replays real ACP sessions recorded from Copilot CLI 1.0.95 and opencode
 //! 1.18.35 (`acc acp` against a local mock model) and Cursor Agent 2026.10.01
-//! (its own default model), each one shell tool call that needs approval. `*.out.ndjson` is what the agent wrote, `*.in.ndjson` what
+//! (its own default model; 2026.11.05 adds a subagent turn), each one shell tool call that needs approval. `*.out.ndjson` is what the agent wrote, `*.in.ndjson` what
 //! ACC wrote back. Paths and request-id tags were normalized after recording.
 #![cfg(feature = "drivers")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -18,6 +18,7 @@ const COPILOT_IN: &str = include_str!("fixtures/acp/copilot-1.0.95.in.ndjson");
 const OPENCODE_OUT: &str = include_str!("fixtures/acp/opencode-1.18.35.out.ndjson");
 const OPENCODE_IN: &str = include_str!("fixtures/acp/opencode-1.18.35.in.ndjson");
 const CURSOR_OUT: &str = include_str!("fixtures/acp/cursor-2026.10.01.out.ndjson");
+const CURSOR_NEW_OUT: &str = include_str!("fixtures/acp/cursor-2026.11.05.out.ndjson");
 const CURSOR_IN: &str = include_str!("fixtures/acp/cursor-2026.10.01.in.ndjson");
 
 const PROMPT: &str = "Run echo acc-live-test";
@@ -180,6 +181,70 @@ fn cursor_turn_with_approval() {
     // Cursor reports no usage in ACP.
     assert!(!events.iter().any(|e| matches!(e, Event::Usage(_))));
     assert_eq!(title(&events), Some("Echo Live Test"));
+}
+
+/// Cursor Agent 2026.11.05, two turns in one session: a shell call approved
+/// with `allow-once`, then a `Task` subagent call, which Cursor also announces
+/// with a `cursor/task` request that ACC answers with "method not found".
+#[test]
+fn cursor_2026_11_05_turns_with_approval_and_subagent() {
+    let mut d = AcpDriver::new(Harness::Cursor, AcpConfig::new("/home/v/proj", Start::New));
+    d.handshake();
+    let mut events = Vec::new();
+    let mut written = Vec::new();
+    let mut turns = 0;
+    for line in CURSOR_NEW_OUT.split_inclusive('\n') {
+        for ev in d.on_output(line.as_bytes()) {
+            match &ev {
+                Event::SessionStarted { .. } => {
+                    d.poll_transmit();
+                    d.command(Command::prompt(PROMPT)).unwrap();
+                }
+                Event::PermissionRequested {
+                    request_id, options, ..
+                } => {
+                    d.poll_transmit();
+                    d.command(Command::AnswerPermission {
+                        request_id: request_id.clone(),
+                        option_id: options[0].id.clone(),
+                    })
+                    .unwrap();
+                }
+                Event::TurnCompleted => {
+                    turns += 1;
+                    if turns == 1 {
+                        d.command(Command::prompt("Use a subagent to list the files"))
+                            .unwrap();
+                    }
+                }
+                _ => {}
+            }
+            events.push(ev);
+        }
+        written.extend(d.poll_transmit());
+    }
+    assert_eq!(turns, 2);
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Unrecognized { .. })),
+        "{events:#?}"
+    );
+    assert_eq!(states(&events).last(), Some(&RunState::Done));
+    assert_eq!(title(&events), Some("Echo Live Test"));
+    let perms: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::PermissionRequested { options, .. } => Some(options[0].id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(perms, ["allow-once"]);
+    assert!(events.iter().any(|e| matches!(e,
+        Event::Native { kind, .. } if kind == "cursor/task")));
+    let written = String::from_utf8(written).unwrap();
+    assert!(written.contains("cursor/task is not supported by ACC"));
+    // The `Task` call is a subagent item, not a plain tool call.
+    assert!(events.iter().any(|e| matches!(e,
+        Event::ItemStarted { kind: ItemKind::Subagent, id, .. } if id.starts_with("call-307864fe"))));
 }
 
 #[test]

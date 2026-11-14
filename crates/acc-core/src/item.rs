@@ -956,13 +956,17 @@ fn pi(kind: ItemKind, ext: &Value, text: &str) -> ItemDetail {
 /// Whether an ACP tool call runs another agent: opencode's `task` (input
 /// `subagent_type`/`agent`, `description`, `prompt`; `name` `subagent` or
 /// `task` from 2.2), and agents that name the tool `subagent`, `task` or
-/// `Task` with an agent and a prompt.
+/// `Task` with an agent and a prompt, and Cursor's `_toolName: "task"` input.
 pub(crate) fn acp_is_subagent(update: &Value) -> bool {
     let input = update.get("rawInput").unwrap_or(&Value::Null);
     let title = str_at(update, "title").unwrap_or_default();
     let named = |k: &str| input.get(k).is_some_and(|v| v.is_string());
     let tool = str_at(update, "name").map(str::to_ascii_lowercase);
+    // Cursor 2026.11 titles the call "Task: <description>" and names the tool
+    // in the input.
+    let input_tool = str_at(input, "_toolName").map(str::to_ascii_lowercase);
     matches!(tool.as_deref(), Some("subagent" | "task"))
+        || matches!(input_tool.as_deref(), Some("subagent" | "task"))
         || (named("subagent_type") && (named("prompt") || named("description")))
         || (named("agent") && (named("task") || named("prompt")))
         || matches!(title, "task" | "Task" | "subagent" | "Subagent" | "Agent")
