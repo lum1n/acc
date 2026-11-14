@@ -1961,8 +1961,7 @@ impl AcpDriver {
             self.opts.spawn_model = Some(value.clone());
             self.opts.rebuild(self.harness);
         }
-        if matches!(self.harness, Harness::Cursor | Harness::Opencode) && id == OptionId::Permission
-        {
+        if matches!(self.harness, Harness::Cursor | Harness::Opencode) && id == OptionId::Permission {
             self.opts.spawn_permission = Some(normalize_permission(self.harness, &value));
             self.cfg.permission = self.opts.spawn_permission.clone();
             self.opts.rebuild(self.harness);
