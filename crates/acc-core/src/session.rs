@@ -350,9 +350,7 @@ fn driver_for(spec: &SessionSpec, attach: bool, tag: &str) -> Box<dyn Driver> {
 /// ones). Approval policies are `untrusted`, `on-request`, `never`.
 fn codex_permission_split(permission: Option<&str>) -> (Option<String>, Option<String>) {
     match permission.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) if matches!(p, "untrusted" | "on-request" | "never") => {
-            (Some(p.to_owned()), None)
-        }
+        Some(p) if matches!(p, "untrusted" | "on-request" | "never") => (Some(p.to_owned()), None),
         Some(p) => (None, Some(p.to_owned())),
         None => (None, None),
     }
@@ -423,9 +421,7 @@ impl Session {
         };
         let mut driver = driver_for(&spec, false, client_tag);
         spec.launch = match harness {
-            h if h.native_acp() => {
-                acp_launch(h, spec.model.as_deref(), spec.permission.as_deref())
-            }
+            h if h.native_acp() => acp_launch(h, spec.model.as_deref(), spec.permission.as_deref()),
             Harness::Codex => Harness::Codex.launch(None),
             _ => driver.launch(spec.resume.as_deref()),
         };

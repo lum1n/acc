@@ -978,7 +978,12 @@ fn canonical_commands() -> Vec<CommandEntry> {
     let option = |id| CommandInput::Option { id };
     vec![
         // Models and settings
-        rpc("settings", "Auto-compaction and message queueing", None, "get_state"),
+        rpc(
+            "settings",
+            "Auto-compaction and message queueing",
+            None,
+            "get_state",
+        ),
         rpc("model", "Switch model", Some("<provider/model>"), "set_model")
             .with_input(option(OptionId::Model)),
         rpc(
@@ -994,9 +999,19 @@ fn canonical_commands() -> Vec<CommandEntry> {
         term("llama", "Manage llama.cpp router models", None),
         // Sessions and context
         rpc("new", "Start a new session", None, "new_session"),
-        rpc("resume", "Switch to another saved session", Some("[path|id]"), "switch_session"),
+        rpc(
+            "resume",
+            "Switch to another saved session",
+            Some("[path|id]"),
+            "switch_session",
+        ),
         rpc("name", "Name this session", Some("[name]"), "set_session_name"),
-        rpc("session", "Session info, tokens and cost", None, "get_session_stats"),
+        rpc(
+            "session",
+            "Session info, tokens and cost",
+            None,
+            "get_session_stats",
+        ),
         rpc("tree", "Navigate the session tree", None, "get_tree"),
         rpc(
             "fork",
@@ -1013,13 +1028,27 @@ fn canonical_commands() -> Vec<CommandEntry> {
         ),
         term("import", "Import and resume a JSONL session", Some("<path>")),
         // Export and share
-        rpc("copy", "Copy the last assistant message", None, "get_last_assistant_text"),
-        rpc("export", "Export the session to HTML", Some("[path]"), "export_html"),
+        rpc(
+            "copy",
+            "Copy the last assistant message",
+            None,
+            "get_last_assistant_text",
+        ),
+        rpc(
+            "export",
+            "Export the session to HTML",
+            Some("[path]"),
+            "export_html",
+        ),
         term("share", "Upload the session and return a viewer link", None),
         term("bug", "Prepare a private bug report", Some("[description]")),
         // Runtime and project
         term("trust", "Save a project trust decision", None),
-        term("reload", "Reload keybindings, extensions, skills, templates, themes", None),
+        term(
+            "reload",
+            "Reload keybindings, extensions, skills, templates, themes",
+            None,
+        ),
         term("hotkeys", "Show active keyboard shortcuts", None),
         term("changelog", "Show changelog entries", None),
         term("quit", "Quit pi", None),
@@ -1367,9 +1396,31 @@ mod tests {
         let names: Vec<_> = d.commands().iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"compact") && names.contains(&"mcp"), "{names:?}");
         for need in [
-            "settings", "model", "thinking", "scoped-models", "login", "logout", "llama", "new",
-            "resume", "name", "session", "tree", "fork", "clone", "compact", "import", "copy",
-            "export", "share", "bug", "trust", "reload", "hotkeys", "changelog", "quit",
+            "settings",
+            "model",
+            "thinking",
+            "scoped-models",
+            "login",
+            "logout",
+            "llama",
+            "new",
+            "resume",
+            "name",
+            "session",
+            "tree",
+            "fork",
+            "clone",
+            "compact",
+            "import",
+            "copy",
+            "export",
+            "share",
+            "bug",
+            "trust",
+            "reload",
+            "hotkeys",
+            "changelog",
+            "quit",
         ] {
             assert!(names.contains(&need), "missing built-in /{need} in {names:?}");
         }
